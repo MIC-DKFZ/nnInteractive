@@ -11,7 +11,6 @@ from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
-from pyqtgraph.examples.colorMapsLinearized import previous
 from torch import nn
 from torch._dynamo import OptimizedModule
 from torch.nn.functional import interpolate
@@ -435,7 +434,7 @@ class nnInteractiveInferenceSession():
                 paste_tensor(self.target_buffer, pred, bbox)
                 print('No refinement necessary')
             else:
-                start_refinement = time()
+                # do refinement
 
                 # we need to resize the prediction to the correct shape and place it in a copy of self.interactions[0]
                 # we don't want to place it into self.interactions[0] because we will update self.interactions[0] as
@@ -453,44 +452,7 @@ class nnInteractiveInferenceSession():
                 # place resized coarse segmentation into prediction_with_coarse. Needed for network input
                 paste_tensor(prediction_with_coarse, pred, scaled_bbox)
 
-                if self.has_positive_bbox:
-                    # mask positive bbox channel with current segmentation to avoid bbox nonsense.
-                    # Basically convert bbox to pseudo lasso
-                    pos_bbox_idx = -6
-                    self.interactions[pos_bbox_idx][(~(prediction_with_coarse > 0.5)).cpu()] = 0
-                    self.has_positive_bbox = False
-
-                bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
-                                                         margin=(10, 10, 10), max_depth=3)
-
-                del diff_map
-                empty_cache(self.device)
-
-                if self.verbose:
-                    print(f'Using {len(bboxes_ordered)} bounding boxes for refinement')
-
-                preallocated_input = torch.zeros((8, *self.configuration_manager.patch_size), device=self.device,
-                                                 dtype=torch.float)
-                for nref, refinement_bbox in enumerate(bboxes_ordered):
-                    assert self.pad_mode_data == 'constant'
-                    crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
-                    crop_and_pad_into_buffer(preallocated_input[1], refinement_bbox, prediction_with_coarse)
-                    crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions[1:])
-
-                    pred = self.network(preallocated_input[None])[0].argmax(0).detach().cpu()
-
-                    paste_tensor(self.interactions[0], pred, refinement_bbox)
-                    # place into target buffer
-                    bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
-                            zip(refinement_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-                    paste_tensor(self.target_buffer, pred, bbox)
-                    del pred
-                    preallocated_input.zero_()
-                del preallocated_input
-                empty_cache(self.device)
-                end_refinement = time()
-                print(
-                    f'Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes')
+                self._refine_coarse(diff_map, prediction_with_coarse)
 
         print(f'Done. Total time {round(time() - start_predict, 3)}s')
 
@@ -558,16 +520,17 @@ class nnInteractiveInferenceSession():
 
         input_for_predict = torch.cat((crop_img, crop_interactions))
         del crop_img, crop_interactions
+        empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox
 
-    def _refine_coarse(self, diff_map):
+    def _refine_coarse(self, diff_map, prediction_with_coarse):
         start_refinement = time()
-        # only use the region that was previously looked at. Use last scaled_bbox
+
         if self.has_positive_bbox:
             # mask positive bbox channel with current segmentation to avoid bbox nonsense.
             # Basically convert bbox to pseudo lasso
             pos_bbox_idx = -6
-            self.interactions[pos_bbox_idx][(~(self.interactions[0] > 0.5)).cpu()] = 0
+            self.interactions[pos_bbox_idx][(~(prediction_with_coarse > 0.5)).cpu()] = 0
             self.has_positive_bbox = False
 
         bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
@@ -584,7 +547,8 @@ class nnInteractiveInferenceSession():
         for nref, refinement_bbox in enumerate(bboxes_ordered):
             assert self.pad_mode_data == 'constant'
             crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
-            crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
+            crop_and_pad_into_buffer(preallocated_input[1], refinement_bbox, prediction_with_coarse)
+            crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions[1:])
 
             pred = self.network(preallocated_input[None])[0].argmax(0).detach().cpu()
 
@@ -633,116 +597,6 @@ class nnInteractiveInferenceSession():
                     break
                 del slice_prev, slice_curr, pixels_prev, pixels_current, pixels_diff
         return has_change
-
-    def _zoom_out(self, prediction_center, initial_zoom_out_factor):
-        # this function starts with initial_zoom_out_factor and zooms further out if necessary
-
-        # we need this later.
-        previous_prediction = torch.clone(self.interactions[0])
-
-        if not self.do_autozoom:
-            initial_zoom_out_factor = 1
-
-        initial_zoom_out_factor = min(initial_zoom_out_factor, 4)
-        zoom_out_factor = initial_zoom_out_factor
-        max_zoom_out_factor = initial_zoom_out_factor
-
-        start_autozoom = time()
-        while zoom_out_factor is not None and zoom_out_factor <= 4:
-            print('Performing prediction at zoom out factor', zoom_out_factor)
-            max_zoom_out_factor = max(max_zoom_out_factor, zoom_out_factor)
-            # initial prediction at initial_zoom_out_factor
-            input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
-
-            pred = self.network(input_for_predict[None])[0].argmax(0).detach()
-
-            del input_for_predict
-
-            # detect changes at borders
-            previous_zoom_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox).to(self.device,
-                                                                                             non_blocking=self.device.type == 'cuda')
-            if not all([i == j for i, j in zip(pred.shape, previous_zoom_prediction.shape)]):
-                previous_zoom_prediction = \
-                interpolate(previous_zoom_prediction[None, None].to(float), pred.shape, mode='nearest')[0, 0]
-
-            abs_pxl_change_threshold = 1500
-            rel_pxl_change_threshold = 0.2
-            min_pxl_change_threshold = 100
-            continue_zoom = False
-            if zoom_out_factor < 4 and self.do_autozoom:
-                for dim in range(len(scaled_bbox)):
-                    if continue_zoom:
-                        break
-                    for idx in [0, pred.shape[dim] - 1]:
-                        slice_prev = previous_zoom_prediction.index_select(dim, torch.tensor(idx, device=self.device))
-                        slice_curr = pred.index_select(dim, torch.tensor(idx, device=self.device))
-                        pixels_prev = torch.sum(slice_prev)
-                        pixels_current = torch.sum(slice_curr)
-                        pixels_diff = torch.sum(slice_prev != slice_curr)
-                        rel_change = max(pixels_prev, pixels_current) / max(min(pixels_prev, pixels_current),
-                                                                            1e-5) - 1
-                        if pixels_diff > abs_pxl_change_threshold:
-                            continue_zoom = True
-                            if self.verbose:
-                                print(
-                                    f'continue zooming because change at borders of {pixels_diff} > {abs_pxl_change_threshold}')
-                            break
-                        if pixels_diff > min_pxl_change_threshold and rel_change > rel_pxl_change_threshold:
-                            continue_zoom = True
-                            if self.verbose:
-                                print(
-                                    f'continue zooming because relative change of {rel_change} > {rel_pxl_change_threshold} and n_pixels {pixels_diff} > {min_pxl_change_threshold}')
-                            break
-                        del slice_prev, slice_curr, pixels_prev, pixels_current, pixels_diff
-
-                del previous_zoom_prediction
-
-            # resize prediction to correct size
-            if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
-                pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[0, 0] >= 0.5).to(
-                    torch.uint8)
-
-            # if we do not continue zooming we need a difference map for sampling patches
-            if not continue_zoom and zoom_out_factor > 1:
-                # wow this circus saves ~30ms relative to naive implementation
-                diff_map, has_diff = self._compute_diff_map(pred, previous_prediction, scaled_bbox, scaled_patch_size)
-                del previous_prediction
-            else:
-                has_diff = False
-
-            if zoom_out_factor == 1 or (
-                    not continue_zoom and has_diff):  # rare case where no changes are needed because of useless interaction. Need to check for not continue_zoom because otherwise diff_map wint exist
-                pred = pred.cpu()
-
-                if zoom_out_factor == 1:
-                    paste_tensor(self.interactions[0], pred.half(), scaled_bbox)
-                else:
-                    seen_bbox = [[max(0, i[0]), min(i[1], s)] for i, s in
-                                 zip(scaled_bbox, diff_map.shape)]
-                    bbox_tmp = [[i[0] - s[0], i[1] - s[0]] for i, s in zip(seen_bbox, scaled_bbox)]
-                    bbox_tmp = [[max(0, i[0]), min(i[1], s)] for i, s in zip(bbox_tmp, scaled_patch_size)]
-                    slicer = bounding_box_to_slice(seen_bbox)
-                    slicer2 = bounding_box_to_slice(bbox_tmp)
-                    mask = (diff_map[slicer] > 0).cpu()
-                    self.interactions[0][slicer][mask] = pred[slicer2][mask].half()
-
-                # place into target buffer
-                bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
-                        zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-                paste_tensor(self.target_buffer, pred, bbox)
-
-            del pred
-            empty_cache(self.device)
-
-            if continue_zoom:
-                zoom_out_factor *= 1.5
-                zoom_out_factor = min(4, zoom_out_factor)
-            else:
-                zoom_out_factor = None
-        end = time()
-        print(
-            f'Auto zoom stage took {round(end - start_autozoom, ndigits=3)}s. Max zoom out factor was {max_zoom_out_factor}')
-        return max_zoom_out_factor, has_diff, diff_map
 
     def _compute_diff_map(self, pred, previous_prediction, scaled_bbox, scaled_patch_size):
         """
