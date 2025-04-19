@@ -3,7 +3,7 @@
 # Python backend for `nnInteractive: Redefining 3D Promptable Segmentation`
 
 This repository contains the nnInteractive python backend for our 
-[napari plugin](https://github.com/MIC-DKFZ/napari-nninteractive) and [MITK integration](https://www.mitk.org/wiki/MITK-nnInteractive). It can be used for 
+[napari plugin](https://github.com/MIC-DKFZ/napari-nninteractive), [MITK integration](https://www.mitk.org/wiki/MITK-nnInteractive), and [3D Slicer extension](https://github.com/coendevente/SlicerNNInteractive). It can be used for 
 python-based inference.
 
 
