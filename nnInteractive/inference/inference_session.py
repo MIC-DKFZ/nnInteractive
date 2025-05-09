@@ -349,7 +349,7 @@ class nnInteractiveInferenceSession():
         else:
             del initial_seg
 
-    @torch.inference_mode
+    @torch.inference_mode()
     def _predict(self):
         """
         This function is a smoking mess to read. This is deliberate. Initially it was super pretty and easy to
@@ -453,6 +453,8 @@ class nnInteractiveInferenceSession():
                 paste_tensor(prediction_with_coarse, pred, scaled_bbox)
 
                 self._refine_coarse(diff_map, prediction_with_coarse)
+
+                del prediction_with_coarse
 
         print(f'Done. Total time {round(time() - start_predict, 3)}s')
 
