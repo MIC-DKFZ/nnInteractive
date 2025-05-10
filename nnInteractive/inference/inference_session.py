@@ -349,7 +349,7 @@ class nnInteractiveInferenceSession():
         else:
             del initial_seg
 
-    @torch.inference_mode
+    @torch.inference_mode()
     def _predict(self):
         """
         This function is a smoking mess to read. This is deliberate. Initially it was super pretty and easy to
