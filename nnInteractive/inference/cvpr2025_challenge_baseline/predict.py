@@ -134,9 +134,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_path", required=True, help="Path to write output *.npz")
     return p.parse_args()
 
-# adapt this for the docker!!!
-CHECKPOINT_DIR = '/home/isensee/drives/checkpoints/nnUNet_results_remake_nnInteractive_aliveCheck/Dataset165_nnInteractiveV4/nnInteractiveTrainer_CVPR2025_Challenge_1000ep__nnUNetResEncUNetLPlans_noResampling__3d_fullres_ps192_bs24'
-
+# Adapt this to your checkpoint directory (relative to the script)
+CHECKPOINT_DIR = 'checkpoint_folder'
 
 def main() -> None:
     args = parse_args()

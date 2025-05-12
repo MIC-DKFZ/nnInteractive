@@ -10,15 +10,10 @@
 set -e
 echo "[predict.sh] Starting inference …"
 
-PYTHON_INTERPRETER=${PYTHON_INTERPRETER:-python3}
 INPUT_DIR=/workspace/inputs
 OUTPUT_DIR=/workspace/outputs
 
 # Safety checks --------------------------------------------------------------
-if ! command -v "$PYTHON_INTERPRETER" &> /dev/null ; then
-  echo "[predict.sh] ERROR: $PYTHON_INTERPRETER not found inside container."
-  exit 1
-fi
 if [ ! -d "$INPUT_DIR" ];  then
   echo "[predict.sh] ERROR: $INPUT_DIR does not exist."
   exit 1
@@ -29,7 +24,7 @@ mkdir -p "$OUTPUT_DIR"
 for CASE_PATH in "$INPUT_DIR"/*.npz ; do
   CASE_FILE=$(basename "$CASE_PATH")
   echo "[predict.sh] -> Processing $CASE_FILE"
-  "$PYTHON_INTERPRETER" /workspace/predict.py \
+  python /workspace/predict.py \
       --case_path "$CASE_PATH" \
       --save_path "$OUTPUT_DIR/$CASE_FILE"
 done
