@@ -16,6 +16,14 @@ This repository provides the official Python backend for `nnInteractive`, a stat
 </div>
 
 
+## 📰 News
+
+- **05/2025**: `nnInteractive` presents an **official baseline** at **CVPR 2025** in the _Foundation Models for Interactive 3D Biomedical Image Segmentation Challenge_ ([Codabench link](https://www.codabench.org/competitions/5263/)) → see [`nnInteractive/inference/cvpr2025_challenge_baseline`](nnInteractive/inference/cvpr2025_challenge_baseline)
+- **04/2025**: 🎉 The **community contributed a 3D Slicer integration** – thank you! 👉 [SlicerNNInteractive](https://github.com/coendevente/SlicerNNInteractive)
+- **03/2025**: 🚀 `nnInteractive` **launched** with native support for **napari** and **MITK**
+
+---
+
 
 ## What is nnInteractive?
 
