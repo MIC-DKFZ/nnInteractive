@@ -11,10 +11,10 @@
    A slice is selected along the axial axis. SAM segments a set of visible objects with high confidence (IoU ≥ 92%).
 
 2. **3D Mask Propagation (SAM2):**  
-   A subset of `n` masks are treated as "keyframes" and passed through SAM2's temporal propagation to build 3D objects across slices. `n` can be defined in the `config.yaml`.
+   A subset of `n` masks are treated as "keyframes" and passed through SAM2's temporal propagation to build 3D objects across slices. `n` is defined via `masks_per_image` in the `config.yaml`.
 
 3. **Output:**  
-   `n` variable-sized 2D pseudo-labels stored in a single image file as channels. Can be less if the confidence is not high enough for all masks.
+   A 4D image with the same spatial shape as the input image (e.g. `[H, W, D]`) and `n` additional channels, where each channel represents a pseudo-label for one segmented object. **Note*:* The actual number of output masks can be lower if not enough high-confidence masks are detected.
 
 ---
 
@@ -53,6 +53,8 @@ SuperVoxel_generate \
   -o /path/to/output/folder \
   -c /path/to/config.yaml
 ```
+
+Output: A 4D image with the same spatial size as the input and one dimension for generated pseudo-label. The number of channels depends on the `masks_per_image` setting and may be fewer if confidence thresholds aren't met.
 
 📌 *Input formats supported:*
 - Standard `.nii.gz` (NIfTI) or other formats supported by SimpleITK
