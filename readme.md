@@ -9,15 +9,16 @@ This repository provides the official Python backend for `nnInteractive`, a stat
 
 <div align="center">
 
-| **<div align="center">[napari plugin](https://github.com/MIC-DKFZ/napari-nninteractive)</div>** | **<div align="center">[MITK integration](https://www.mitk.org/wiki/MITK-nnInteractive)</div>** | **<div align="center">[3D Slicer extension](https://github.com/coendevente/SlicerNNInteractive)</div>** |
-|-------------------|----------------------|-------------------------|
-| [<img src="imgs/Logos/napari.jpg" height="200">](https://github.com/MIC-DKFZ/napari-nninteractive) | [<img src="imgs/Logos/mitk.jpg" height="200">](https://www.mitk.org/wiki/MITK-nnInteractive) | [<img src="imgs/Logos/3DSlicer.png" height="200">](https://github.com/coendevente/SlicerNNInteractive) |
+| **<div align="center">[napari plugin](https://github.com/MIC-DKFZ/napari-nninteractive)</div>** | **<div align="center">[MITK integration](https://www.mitk.org/wiki/MITK-nnInteractive)</div>** | **<div align="center">[3D Slicer extension](https://github.com/coendevente/SlicerNNInteractive)</div>** | **<div align="center">[ITK-SNAP extension](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html)</div>** |
+|-------------------|----------------------|-------------------------|-------------------------|
+| [<img src="imgs/Logos/napari.jpg" height="200">](https://github.com/MIC-DKFZ/napari-nninteractive) | [<img src="imgs/Logos/mitk.jpg" height="200">](https://www.mitk.org/wiki/MITK-nnInteractive) | [<img src="imgs/Logos/3DSlicer.png" height="200">](https://github.com/coendevente/SlicerNNInteractive) | [<img src="imgs/Logos/snaplogo_sq.png" height="200">](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html) |
 
 </div>
 
 
 ## 📰 News
 
+- **07/2025**: 🧩 New ITK-SNAP extension released! Try nnInteractive directly in ITK-SNAP 👉 [Quick Start](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html)
 - **06/2025**: 🏆 We’re thrilled to announce that `nnInteractive` **won the 1st place** in the [CVPR 2025 Challenge on Interactive 3D Segmentation](https://www.codabench.org/competitions/5263/). Huge shoutout to the organizers and all contributors!
 - **05/2025**: `nnInteractive` presents an **official baseline** at **CVPR 2025** in the _Foundation Models for Interactive 3D Biomedical Image Segmentation Challenge_ ([Codabench link](https://www.codabench.org/competitions/5263/)) → see [`nnInteractive/inference/cvpr2025_challenge_baseline`](nnInteractive/inference/cvpr2025_challenge_baseline)
 - **04/2025**: 🎉 The **community contributed a 3D Slicer integration** – thank you! 👉 [SlicerNNInteractive](https://github.com/coendevente/SlicerNNInteractive)
