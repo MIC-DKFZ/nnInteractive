@@ -141,40 +141,35 @@ class nnInteractiveInferenceSession():
             (7, *image_torch.shape[1:]),
             device='cpu',
             dtype=torch.float16,
-            pin_memory=(self.device.type == 'cuda' and self.use_pinned_memory)
+            pin_memory=False
         )
 
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
-        image_torch = torch.clone(torch.from_numpy(image))
+        image = torch.from_numpy(image.copy())#.to(self.device)
 
         # Crop to nonzero region.
         if self.verbose:
             print('Cropping input image to nonzero region')
-        nonzero_idx = torch.where(image_torch != 0)
+        nonzero_idx = torch.where(image != 0)
         # Create bounding box: for each dimension, get the min and max (plus one) of the nonzero indices.
         bbox = [[i.min().item(), i.max().item() + 1] for i in nonzero_idx]
         del nonzero_idx
         slicer = bounding_box_to_slice(bbox)  # Assuming this returns a tuple of slices.
-        image_torch = image_torch[slicer].float()
+        image = image[slicer].float()
         if self.verbose:
-            print(f'Cropped image shape: {image_torch.shape}')
+            print(f'Cropped image shape: {image.shape}')
 
         # As soon as we have the target shape, start initializing the interaction tensor in its own thread.
-        self.interactions_future = self.executor.submit(self._initialize_interactions, image_torch)
+        self.interactions_future = self.executor.submit(self._initialize_interactions, image)
 
         # Normalize the cropped image.
         if self.verbose:
             print('Normalizing cropped image')
-        image_torch -= image_torch.mean()
-        image_torch /= image_torch.std()
+        image -= image.mean()
+        image /= image.std()
 
-        self.preprocessed_image = image_torch
-        if self.use_pinned_memory and self.device.type == 'cuda':
-            if self.verbose:
-                print('Pin memory: image')
-            # Note: pin_memory() in PyTorch typically returns a new tensor.
-            self.preprocessed_image = self.preprocessed_image.pin_memory()
+        self.preprocessed_image = image
 
         self.preprocessed_props = {'bbox_used_for_cropping': bbox[1:]}
 
@@ -340,7 +335,7 @@ class nnInteractiveInferenceSession():
 
         # initial seg is written into initial seg buffer
         interaction_channel = -7
-        self.interactions[interaction_channel] = initial_seg
+        self.interactions[interaction_channel] = initial_seg.to(self.interactions.device)
         empty_cache(self.device)
         if run_prediction:
             self._add_patch_for_initial_seg_interaction(initial_seg)
@@ -384,8 +379,8 @@ class nnInteractiveInferenceSession():
             del input_for_predict
 
             # detect changes at border. If there are, we enter autozoom
-            previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox).to(self.device,
-                                                                                             non_blocking=self.device.type == 'cuda')
+            previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox)
+
             if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
                 previous_prediction = \
                 interpolate(previous_prediction[None, None].to(float), pred.shape, mode='nearest')[0, 0]
@@ -411,8 +406,8 @@ class nnInteractiveInferenceSession():
                 del input_for_predict
 
                 # detect changes at border. If there are, we enter autozoom
-                previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox).to(self.device,
-                                                                                                 non_blocking=self.device.type == 'cuda')
+                previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox)
+
                 if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
                     previous_prediction_resized = \
                     interpolate(previous_prediction[None, None].to(float), pred.shape, mode='nearest')[0, 0]
@@ -431,7 +426,7 @@ class nnInteractiveInferenceSession():
                 paste_tensor(self.interactions[0], pred.half(), scaled_bbox)
                 bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                         zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-                paste_tensor(self.target_buffer, pred, bbox)
+                paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
                 print('No refinement necessary')
             else:
                 # do refinement
@@ -439,12 +434,11 @@ class nnInteractiveInferenceSession():
                 # we need to resize the prediction to the correct shape and place it in a copy of self.interactions[0]
                 # we don't want to place it into self.interactions[0] because we will update self.interactions[0] as
                 # part of the refinement. Updating it could cause areas that are not refined to become coarse
-                prediction_with_coarse = self.interactions[0].to(self.device, non_blocking=self.device.type == 'cuda')
+                prediction_with_coarse = self.interactions[0]
 
                 if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
                     pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[
-                                0, 0] >= 0.5).to(
-                        torch.uint8)
+                                0, 0] >= 0.5).to(torch.uint8)
 
                 # compute the difference map
                 diff_map, has_diff = self._compute_diff_map(pred, self.interactions[0], scaled_bbox, scaled_patch_size)
@@ -468,40 +462,27 @@ class nnInteractiveInferenceSession():
 
         # cropping happens on CPU, padding happens on GPU (later)
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
-        crop_img = crop_img.to(self.device, non_blocking=self.device.type == 'cuda')
         crop_interactions, pad_interaction = crop_to_valid(self.interactions, scaled_bbox)
+        crop_img = crop_img.to(self.device, non_blocking=True)
+        crop_interactions = crop_interactions.to(self.device, non_blocking=True)
 
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
         if not all([i == j for i, j in zip(self.configuration_manager.patch_size, scaled_patch_size)]):
-            crop_interactions_resampled_gpu = torch.empty((7, *self.configuration_manager.patch_size),
-                                                          dtype=torch.float16, device=self.device)
-            # previous seg, bbox+, bbox-
-            for i in range(0, 3):
-                if any([x for y in pad_interaction for x in y]):
-                    tmp = pad_cropped(crop_interactions[i].to(self.device, non_blocking=self.device.type == 'cuda'),
-                                      pad_interaction)
-                else:
-                    tmp = crop_interactions[i].to(self.device)
-                # this is area for a reason but I aint telling ya why
-                crop_interactions_resampled_gpu[i] = \
-                    interpolate(tmp[None, None], self.configuration_manager.patch_size, mode='area')[0][0]
-            empty_cache(self.device)
+            if any([x for y in pad_interaction for x in y]):
+                tmp = pad_cropped(crop_interactions, pad_interaction)
+            else:
+                tmp = crop_interactions
+            del crop_interactions
 
             max_pool_ks = round_to_nearest_odd(zoom_out_factor * 2 - 1)
             # point+, point-, scribble+, scribble-
-            for i in range(3, 7):
-                if any([x for y in pad_interaction for x in y]):
-                    tmp = pad_cropped(crop_interactions[i].to(self.device, non_blocking=self.device.type == 'cuda'),
-                                      pad_interaction)
-                else:
-                    tmp = crop_interactions[i].to(self.device, non_blocking=self.device.type == 'cuda')
-                if max_pool_ks > 1:
-                    # dilate to preserve interactions after downsampling
-                    tmp = iterative_3x3_same_padding_pool3d(tmp[None, None], max_pool_ks)[0, 0]
-                # this is 'area' for a reason but I aint telling ya why
-                crop_interactions_resampled_gpu[i] = \
-                    interpolate(tmp[None, None], self.configuration_manager.patch_size, mode='area')[0][0]
+            if max_pool_ks > 1:
+                # dilate to preserve interactions after downsampling
+                for i in range(3, 7):
+                    tmp[i:i+1] = iterative_3x3_same_padding_pool3d(tmp[None, i:i+1], max_pool_ks)[0]
+            crop_interactions_resampled_gpu = interpolate(tmp[None], self.configuration_manager.patch_size, mode='area')[0]
+
             del tmp
 
             # crop_img is already on device
@@ -515,10 +496,7 @@ class nnInteractiveInferenceSession():
         else:
             # crop_img is already on device
             crop_img = pad_cropped(crop_img, pad_image) if any([x for y in pad_interaction for x in y]) else crop_img
-            crop_interactions = pad_cropped(
-                crop_interactions.to(self.device, non_blocking=self.device.type == 'cuda'), pad_interaction) if any(
-                [x for y in pad_interaction for x in y]) else crop_interactions.to(self.device,
-                                                                                   non_blocking=self.device.type == 'cuda')
+            crop_interactions = pad_cropped(crop_interactions, pad_interaction) if any([x for y in pad_interaction for x in y]) else crop_interactions
 
         input_for_predict = torch.cat((crop_img, crop_interactions))
         del crop_img, crop_interactions
@@ -532,7 +510,7 @@ class nnInteractiveInferenceSession():
             # mask positive bbox channel with current segmentation to avoid bbox nonsense.
             # Basically convert bbox to pseudo lasso
             pos_bbox_idx = -6
-            self.interactions[pos_bbox_idx][(~(prediction_with_coarse > 0.5)).cpu()] = 0
+            self.interactions[pos_bbox_idx][(~(prediction_with_coarse > 0.5))] = 0
             self.has_positive_bbox = False
 
         bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
@@ -552,13 +530,13 @@ class nnInteractiveInferenceSession():
             crop_and_pad_into_buffer(preallocated_input[1], refinement_bbox, prediction_with_coarse)
             crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions[1:])
 
-            pred = self.network(preallocated_input[None])[0].argmax(0).detach().cpu()
+            pred = self.network(preallocated_input[None])[0].argmax(0).detach()
 
             paste_tensor(self.interactions[0], pred, refinement_bbox)
             # place into target buffer
             bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                     zip(refinement_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-            paste_tensor(self.target_buffer, pred, bbox)
+            paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
             del pred
             preallocated_input.zero_()
         del preallocated_input
@@ -578,8 +556,8 @@ class nnInteractiveInferenceSession():
             if has_change:
                 break
             for idx in [0, pred.shape[dim] - 1]:
-                slice_prev = prev_pred.index_select(dim, torch.tensor(idx, device=self.device))
-                slice_curr = pred.index_select(dim, torch.tensor(idx, device=self.device))
+                slice_prev = prev_pred.index_select(dim, torch.tensor(idx, device='cpu'))
+                slice_curr = pred.index_select(dim, torch.tensor(idx, device=self.device)).to('cpu')
                 pixels_prev = torch.sum(slice_prev)
                 pixels_current = torch.sum(slice_curr)
                 pixels_diff = torch.sum(slice_prev != slice_curr)
@@ -617,7 +595,7 @@ class nnInteractiveInferenceSession():
         Returns:
 
         """
-        previous_prediction = previous_prediction.to(self.device, non_blocking=self.device.type == 'cuda')
+        previous_prediction = previous_prediction.to(self.device, non_blocking=True)
         seen_bbox = [[max(0, i[0]), min(i[1], s)] for i, s in zip(scaled_bbox, previous_prediction.shape)]
         bbox_tmp = [[i[0] - s[0], i[1] - s[0]] for i, s in zip(seen_bbox, scaled_bbox)]
         bbox_tmp = [[max(0, i[0]), min(i[1], s)] for i, s in zip(bbox_tmp, scaled_patch_size)]
@@ -766,7 +744,7 @@ class nnInteractiveInferenceSession():
         """
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
-        self.network = network
+        self.network = network.to(self.device)
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
         self.label_manager = plans_manager.get_label_manager(dataset_json)
@@ -792,3 +770,6 @@ def transform_coordinates_noresampling(
     return tuple([coords_orig[d] - nnunet_preprocessing_crop_bbox[d][0] for d in range(len(coords_orig))])
 
 
+if __name__ == '__main__':
+    a = torch.zeros((160, 160, 160), device='cpu')
+    a.index_select(0, torch.tensor([0]))
