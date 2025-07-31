@@ -5,7 +5,7 @@ from nnunetv2.utilities.helpers import empty_cache
 from torch.backends import cudnn
 
 
-@torch.inference_mode
+@torch.inference_mode()
 def iterative_3x3_same_padding_pool3d(x, kernel_size: int, use_min_pool: bool = False):
     """
     Applies 3D max pooling with manual asymmetric padding such that
