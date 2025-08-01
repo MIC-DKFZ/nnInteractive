@@ -218,6 +218,16 @@ Link: [![arXiv](https://img.shields.io/badge/arXiv-2503.08373-b31b1b.svg)](https
 # License
 Note that while this repository is available under Apache-2.0 license (see [LICENSE](./LICENSE)), the [model checkpoint](https://huggingface.co/nnInteractive/nnInteractive) is `Creative Commons Attribution Non Commercial Share Alike 4.0`! 
 
+# Changelog
+
+### 1.1.0 - 2025-08-01
+
+- Reworked inference code. It's now well-structured and easier to follow.
+- Fixed bugs that 
+  - sometimes caused blocky predictions
+  - may cause failure to update segmentation map if changes were minor and AutoZoom was triggered
+- ✅ API compatible with 1.0.1
+
 ## Acknowledgments
 
 <p align="left">

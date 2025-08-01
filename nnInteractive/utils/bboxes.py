@@ -22,6 +22,9 @@ def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[
     - List of tuples [(min_coords, max_coords), ...], where min_coords and max_coords are lists [x, y, z] defining each box
       as a half-open interval [min_coords, max_coords).
     """
+    if not torch.any(mask):
+        return []
+
     # Prevent infinite recursion
     if current_depth > max_depth:
         # print('random fallback due to max recursion depth')

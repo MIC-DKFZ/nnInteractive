@@ -347,9 +347,7 @@ class nnInteractiveInferenceSession():
     @torch.inference_mode()
     def _predict(self):
         """
-        This function is a smoking mess to read. This is deliberate. Initially it was super pretty and easy to
-        understand. Then the run time optimization began.
-        If it feels like we are excessively transferring tensors between CPU and GPU, this is deliberate as well.
+        If it feels like we are excessively transferring tensors between CPU and GPU, this is deliberate.
         Our goal is to keep this tool usable even for people with smaller GPUs (8-10GB VRAM). In an ideal world
         everyone would have 24GB+ of VRAM and all tensors would like on GPU all the time.
         The amount of hours spent optimizing this function is substantial. Almost every line was turned and twisted
@@ -394,6 +392,7 @@ class nnInteractiveInferenceSession():
             zoom_out_growth_factor = 1.5
             start_zoomout = time()
             while has_change and self.do_autozoom:
+                print(f'AutoZoom zoom out factor {zoom_out_factor}')
                 # we allow a max zoom out of 4
                 if zoom_out_factor >= 4:
                     break
@@ -417,7 +416,7 @@ class nnInteractiveInferenceSession():
                 has_change = self._detect_change_at_border(pred, previous_prediction_resized)
 
             if zoom_out_factor > 1:
-                print(f'Zoom out took {round(time() - start_zoomout, 3)} s')
+                print(f'Zoom out took {round(time() - start_zoomout, 3)} s, max zoom out factor {zoom_out_factor}')
             else:
                 print('No zoom out necessary')
 
@@ -515,6 +514,13 @@ class nnInteractiveInferenceSession():
 
         bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
                                                  margin=(10, 10, 10), max_depth=3)
+        # if no bounding boxes are returned we basically have almost no changes. Still we should at least perform
+        # refinement in the bounding box where the interaction was as the user evidently wanted something here.
+        if len(bboxes_ordered) == 0:
+            # build one bbox around self.new_interaction_centers[-1]
+            center = self.new_interaction_centers[-1]
+            bboxes_ordered = [[[ci - pi // 2, ci - pi // 2 + pi] for ci, pi in zip(center, self.configuration_manager.patch_size)]]
+            # print('Debug: built dummy bboxes_ordered due to empty diff map')
 
         del diff_map
         empty_cache(self.device)
@@ -680,7 +686,7 @@ class nnInteractiveInferenceSession():
             self.preferred_scribble_thickness = json_content['preferred_scribble_thickness']
             if not isinstance(self.preferred_scribble_thickness, (tuple, list)):
                 self.preferred_scribble_thickness = [self.preferred_scribble_thickness] * 3
-            self.interaction_decay = json_content['interaction_decay'] if 'interaction_decay' in json_content.keys() else 0.9
+            self.interaction_decay = json_content['interaction_decay'] if 'interaction_decay' in json_content.keys() else 0.98
             point_interaction_use_etd = True # so far this is not defined in that file so we stick with default
             self.point_interaction = PointInteraction_stub(point_interaction_radius, point_interaction_use_etd)
             # padding mode for data. See nnInteractiveTrainerV2_nodelete_reflectpad
