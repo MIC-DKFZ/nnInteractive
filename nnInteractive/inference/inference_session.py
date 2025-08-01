@@ -21,6 +21,7 @@ from nnInteractive.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
 from nnInteractive.utils.bboxes import generate_bounding_boxes
 from nnInteractive.utils.crop import crop_and_pad_into_buffer, paste_tensor, pad_cropped, crop_to_valid
 from nnInteractive.utils.erosion_dilation import iterative_3x3_same_padding_pool3d
+from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
 from nnInteractive.utils.rounding import round_to_nearest_odd
 
 
@@ -134,14 +135,16 @@ class nnInteractiveInferenceSession():
         self.has_positive_bbox = False
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
+        # there is a bug in 6.11 that doesn't allow pinning large tensors
+        use_pinned = not is_linux_kernel_6_11() and self.use_pinned_memory
         if self.verbose:
-            print(f'Initialize interactions. Pinned: {self.use_pinned_memory}')
+            print(f'Initialize interactions. Pinned: {use_pinned}')
         # Create the interaction tensor based on the target shape.
         self.interactions = torch.zeros(
             (7, *image_torch.shape[1:]),
             device='cpu',
             dtype=torch.float16,
-            pin_memory=False
+            pin_memory=use_pinned
         )
 
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
