@@ -230,6 +230,11 @@ Note that while this repository is available under Apache-2.0 license (see [LICE
 
 # Changelog
 
+### 1.1.1 - 2025-08-01
+
+- We now detect whether linux kernel 6.11 is used and disable pin_memory in that case. See also [here](https://github.com/MIC-DKFZ/nnInteractive/issues/18)
+- ✅ API compatible with 1.0.1 and 1.1.0
+
 ### 1.1.0 - 2025-08-01
 
 - Reworked inference code. It's now well-structured and easier to follow.
