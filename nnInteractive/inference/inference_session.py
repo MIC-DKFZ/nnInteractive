@@ -136,7 +136,7 @@ class nnInteractiveInferenceSession():
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
         # there is a bug in 6.11 that doesn't allow pinning large tensors
-        use_pinned = not is_linux_kernel_6_11() and self.use_pinned_memory
+        use_pinned = not is_linux_kernel_6_11() and self.use_pinned_memory and self.device.type == 'cuda'
         if self.verbose:
             print(f'Initialize interactions. Pinned: {use_pinned}')
         # Create the interaction tensor based on the target shape.

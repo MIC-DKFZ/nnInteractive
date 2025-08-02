@@ -230,6 +230,11 @@ Note that while this repository is available under Apache-2.0 license (see [LICE
 
 # Changelog
 
+### 1.1.2 - 2025-08-02
+
+- Fixed a bug where `pin_memory` was set to `True` even though no CUDA devices were present (this broke CPU support)
+- ✅ API compatible all the way back to 1.0.1
+
 ### 1.1.1 - 2025-08-01
 
 - We now detect whether linux kernel 6.11 is used and disable pin_memory in that case. See also [here](https://github.com/MIC-DKFZ/nnInteractive/issues/18)
