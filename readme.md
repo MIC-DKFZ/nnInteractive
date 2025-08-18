@@ -130,6 +130,10 @@ model_path = os.path.join(DOWNLOAD_DIR, MODEL_NAME)
 session.initialize_from_trained_model_folder(model_path)
 
 # --- Load Input Image (Example with SimpleITK) ---
+# DO NOT preprocess the image in any way. Give it to nnInteractive as it is! DO NOT apply level window, DO NOT normalize 
+# intensities and never ever convert an image with higher precision (float32, uint16, etc) to uint8!
+# The ONLY instance where some preprocesing makes sense is if your original image is too large to be reasonably used. 
+# This may be the case, for example, for some microCT images. In this case you can consider downsampling.
 input_image = sitk.ReadImage("FILENAME")
 img = sitk.GetArrayFromImage(input_image)[None]  # Ensure shape (1, x, y, z)
 
