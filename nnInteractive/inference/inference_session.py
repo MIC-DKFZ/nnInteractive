@@ -363,6 +363,9 @@ class nnInteractiveInferenceSession():
         """
         assert self.pad_mode_data == 'constant', 'pad modes other than constant are not implemented here'
         assert len(self.new_interaction_centers) == len(self.new_interaction_zoom_out_factors)
+        if len(self.new_interaction_centers) == 0:
+            print('No patch queued for prediction. Nothing to do.')
+            return
 
         if len(self.new_interaction_centers) > 1:
             print('It seems like more than one interaction was added since the last prediction. This is not '
