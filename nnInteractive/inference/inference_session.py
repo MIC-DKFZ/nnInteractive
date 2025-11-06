@@ -343,13 +343,16 @@ class nnInteractiveInferenceSession():
         if run_prediction:
             self._add_patch_for_initial_seg_interaction(initial_seg)
             del initial_seg
-            self._predict()
+            self._predict(force_full_refine=True)
         else:
             del initial_seg
 
     @torch.inference_mode()
-    def _predict(self):
+    def _predict(self, force_full_refine: bool = False):
         """
+        force_full_refine if True we run the refinement over the whole current prediction and not just the diff map.
+        More effort but sometimes needed (refine initial seg)
+
         If it feels like we are excessively transferring tensors between CPU and GPU, this is deliberate.
         Our goal is to keep this tool usable even for people with smaller GPUs (8-10GB VRAM). In an ideal world
         everyone would have 24GB+ of VRAM and all tensors would like on GPU all the time.
@@ -447,6 +450,10 @@ class nnInteractiveInferenceSession():
 
                 # compute the difference map
                 diff_map, has_diff = self._compute_diff_map(pred, self.interactions[0], scaled_bbox, scaled_patch_size)
+
+                if force_full_refine:
+                    print('Forcing full refinement of entire structure')
+                    diff_map[self.interactions[0] > 0] = 1
 
                 # place resized coarse segmentation into prediction_with_coarse. Needed for network input
                 paste_tensor(prediction_with_coarse, pred, scaled_bbox)
