@@ -1,11 +1,14 @@
 <img src="imgs/nnInteractive_header_white.png">
 
-## There seems to be an issue with nninteractive and torch 2.9.0 where inference runs OOM. Please use torch 2.8.0 or lower for the time being! (torch 2.9.0 seems to have some larger issues with 3D Convs, see [here](https://github.com/pytorch/pytorch/issues/166122))
-
 
 # Python backend for `nnInteractive: Redefining 3D Promptable Segmentation`
 
 This repository provides the official Python backend for `nnInteractive`, a state-of-the-art framework for 3D promptable segmentation. It is designed for seamless integration into Python-based workflows—ideal for researchers, developers, and power users working directly with code.
+
+> ⚠️ **Temporary Compatibility Warning**  
+> There is a known issue with **PyTorch 2.9.0** causing **OOM errors during inference** in `nnInteractive` (related to 3D convolutions — see the PyTorch issue [here](https://github.com/pytorch/pytorch/issues/166122)).  
+> **Until this is resolved, please use PyTorch 2.8.0 or earlier.**
+
 
 `nnInteractive` is also available through graphical viewers (GUI) for those who prefer a visual workflow. The napari and MITK integrations are developed and maintained by our team. Thanks to the community for contributing the 3D Slicer extension!
 
