@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import logging
 from os import cpu_count
 from time import time
 from typing import Union, List, Tuple, Optional
@@ -24,6 +25,8 @@ from nnInteractive.utils.erosion_dilation import iterative_3x3_same_padding_pool
 from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
 from nnInteractive.utils.rounding import round_to_nearest_odd
 
+
+logger = logging.getLogger(__name__)
 
 class nnInteractiveInferenceSession():
     def __init__(self,
@@ -210,7 +213,7 @@ class nnInteractiveInferenceSession():
         transformed_bbox_coordinates = [[i, j] for i, j in zip(lbs_transformed, ubs_transformed)]
 
         if self.verbose:
-            print(f'Added bounding box coordinates.\n'
+            logger.info(f'Added bounding box coordinates.\n'
                   f'Raw: {bbox_coords}\n'
                   f'Transformed: {transformed_bbox_coordinates}\n'
                   f"Crop Bbox: {self.preprocessed_props['bbox_used_for_cropping']}")
@@ -235,7 +238,7 @@ class nnInteractiveInferenceSession():
             transformed_bbox_coordinates[dim] = [transformed_start, transformed_end]
 
         if self.verbose:
-            print(f'Bbox coordinates after clip to image boundaries and preventing dim collapse:\n'
+            logger.info(f'Bbox coordinates after clip to image boundaries and preventing dim collapse:\n'
                   f'Bbox: {transformed_bbox_coordinates}\n'
                   f'Internal image shape: {self.preprocessed_image.shape}')
 
@@ -364,11 +367,11 @@ class nnInteractiveInferenceSession():
         assert self.pad_mode_data == 'constant', 'pad modes other than constant are not implemented here'
         assert len(self.new_interaction_centers) == len(self.new_interaction_zoom_out_factors)
         if len(self.new_interaction_centers) == 0:
-            print('No patch queued for prediction. Nothing to do.')
+            logger.info('No patch queued for prediction. Nothing to do.')
             return
 
         if len(self.new_interaction_centers) > 1:
-            print('It seems like more than one interaction was added since the last prediction. This is not '
+            logger.info('It seems like more than one interaction was added since the last prediction. This is not '
                   'recommended and may cause unexpected behavior or inefficient predictions\n'
                   '!!!WE NO LONGER RUN ONE PREDICTION PER CENTER AND ONLY USE THE LAST ADDED INTERACTION AS CENTER!!!')
         prediction_center, zoom_out_factor = self.new_interaction_centers[-1], self.new_interaction_zoom_out_factors[-1]
@@ -393,13 +396,13 @@ class nnInteractiveInferenceSession():
             has_change = self._detect_change_at_border(pred, previous_prediction)
             del previous_prediction
 
-            print(f'Took {round(time() - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}')
+            logger.info(f'Took {round(time() - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}')
 
             # maybe do zoom out
             zoom_out_growth_factor = 1.5
             start_zoomout = time()
             while has_change and self.do_autozoom:
-                print(f'AutoZoom zoom out factor {zoom_out_factor}')
+                logger.info(f'AutoZoom zoom out factor {zoom_out_factor}')
                 # we allow a max zoom out of 4
                 if zoom_out_factor >= 4:
                     break
@@ -423,9 +426,9 @@ class nnInteractiveInferenceSession():
                 has_change = self._detect_change_at_border(pred, previous_prediction_resized)
 
             if zoom_out_factor > 1:
-                print(f'Zoom out took {round(time() - start_zoomout, 3)} s, max zoom out factor {zoom_out_factor}')
+                logger.info(f'Zoom out took {round(time() - start_zoomout, 3)} s, max zoom out factor {zoom_out_factor}')
             else:
-                print('No zoom out necessary')
+                logger.info('No zoom out necessary')
 
             if zoom_out_factor == 1:
                 # simply place pred in self.interactions[0] and target buffer
@@ -433,7 +436,7 @@ class nnInteractiveInferenceSession():
                 bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                         zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
                 paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
-                print('No refinement necessary')
+                logger.info('No refinement necessary')
             else:
                 # do refinement
 
@@ -457,7 +460,7 @@ class nnInteractiveInferenceSession():
 
                 del prediction_with_coarse
 
-        print(f'Done. Total time {round(time() - start_predict, 3)}s')
+        logger.info(f'Done. Total time {round(time() - start_predict, 3)}s')
 
         self.new_interaction_centers = []
         self.new_interaction_zoom_out_factors = []
@@ -535,7 +538,7 @@ class nnInteractiveInferenceSession():
         empty_cache(self.device)
 
         if self.verbose:
-            print(f'Using {len(bboxes_ordered)} bounding boxes for refinement')
+            logger.info(f'Using {len(bboxes_ordered)} bounding boxes for refinement')
 
         preallocated_input = torch.zeros((8, *self.configuration_manager.patch_size), device=self.device,
                                          dtype=torch.float)
@@ -557,7 +560,7 @@ class nnInteractiveInferenceSession():
         del preallocated_input
         empty_cache(self.device)
         end_refinement = time()
-        print(
+        logger.info(
             f'Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes')
 
     def _detect_change_at_border(self,
@@ -582,13 +585,13 @@ class nnInteractiveInferenceSession():
                 if pixels_diff > abs_pxl_change_threshold:
                     has_change = True
                     if self.verbose:
-                        print(
+                        logger.info(
                             f'continue zooming because change at borders of {pixels_diff} > {abs_pxl_change_threshold}')
                     break
                 if pixels_diff > min_pxl_change_threshold and rel_change > rel_pxl_change_threshold:
                     has_change = True
                     if self.verbose:
-                        print(
+                        logger.info(
                             f'continue zooming because relative change of {rel_change} > {rel_pxl_change_threshold} and n_pixels {pixels_diff} > {min_pxl_change_threshold}')
                     break
                 del slice_prev, slice_curr, pixels_prev, pixels_current, pixels_diff
@@ -637,7 +640,7 @@ class nnInteractiveInferenceSession():
     def _add_patch_for_point_interaction(self, coordinates):
         self.new_interaction_zoom_out_factors.append(1)
         self.new_interaction_centers.append(coordinates)
-        print(f'Added new point interaction: center {self.new_interaction_zoom_out_factors[-1]}, scale {self.new_interaction_centers}')
+        logger.info(f'Added new point interaction: center {self.new_interaction_zoom_out_factors[-1]}, scale {self.new_interaction_centers}')
 
     def _add_patch_for_bbox_interaction(self, bbox):
         bbox_center = [round((i[0] + i[1]) / 2) for i in bbox]
@@ -646,7 +649,7 @@ class nnInteractiveInferenceSession():
         requested_size = [i + j // 3 for i, j in zip(bbox_size, self.configuration_manager.patch_size)]
         self.new_interaction_zoom_out_factors.append(max(1, max([i / j for i, j in zip(requested_size, self.configuration_manager.patch_size)])))
         self.new_interaction_centers.append(bbox_center)
-        print(f'Added new bbox interaction: center {self.new_interaction_zoom_out_factors[-1]}, scale {self.new_interaction_centers}')
+        logger.info(f'Added new bbox interaction: center {self.new_interaction_zoom_out_factors[-1]}, scale {self.new_interaction_centers}')
 
     def _add_patch_for_scribble_interaction(self, scribble_image):
         return self._generic_add_patch_from_image(scribble_image)
@@ -659,7 +662,7 @@ class nnInteractiveInferenceSession():
 
     def _generic_add_patch_from_image(self, image: torch.Tensor):
         if not torch.any(image):
-            print('Received empty image prompt. Cannot add patches for prediction')
+            logger.info('Received empty image prompt. Cannot add patches for prediction')
             return
         nonzero_indices = torch.nonzero(image, as_tuple=False)
         mn = torch.min(nonzero_indices, dim=0)[0]
@@ -670,7 +673,7 @@ class nnInteractiveInferenceSession():
         requested_size = [i + j // 3 for i, j in zip(roi_size, self.configuration_manager.patch_size)]
         self.new_interaction_zoom_out_factors.append(max(1, max([i / j for i, j in zip(requested_size, self.configuration_manager.patch_size)])))
         self.new_interaction_centers.append(roi_center)
-        print(f'Added new image interaction: scale {self.new_interaction_zoom_out_factors[-1]}, center {self.new_interaction_centers}')
+        logger.info(f'Added new image interaction: scale {self.new_interaction_zoom_out_factors[-1]}, center {self.new_interaction_centers}')
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_fold: Union[int, str] = None,
@@ -727,9 +730,9 @@ class nnInteractiveInferenceSession():
         trainer_class = recursive_find_python_class(join(nnInteractive.__path__[0], "trainer"),
                                                     trainer_name, 'nnInteractive.trainer')
         if trainer_class is None:
-            print(f'Unable to locate trainer class {trainer_name} in nnInteractive.trainer. '
+            logger.info(f'Unable to locate trainer class {trainer_name} in nnInteractive.trainer. '
                                f'Please place it there (in any .py file)!')
-            print('Attempting to use default nnInteractiveTrainer_stub. If you encounter errors, this is where you need to look!')
+            logger.info('Attempting to use default nnInteractiveTrainer_stub. If you encounter errors, this is where you need to look!')
             trainer_class = nnInteractiveTrainer_stub
 
         network = trainer_class.build_network_architecture(
@@ -749,7 +752,7 @@ class nnInteractiveInferenceSession():
         self.trainer_name = trainer_name
         self.label_manager = plans_manager.get_label_manager(dataset_json)
         if self.use_torch_compile and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
+            logger.info('Using torch.compile')
             self.network = torch.compile(self.network)
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
@@ -766,7 +769,7 @@ class nnInteractiveInferenceSession():
         self.label_manager = plans_manager.get_label_manager(dataset_json)
 
         if self.use_torch_compile and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
+            logger.info('Using torch.compile')
             self.network = torch.compile(self.network)
 
         if not self.use_torch_compile and isinstance(self.network, OptimizedModule):
