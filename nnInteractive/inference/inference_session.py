@@ -376,6 +376,7 @@ class nnInteractiveInferenceSession():
 
         start_predict = time()
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            # on macos, autocast does not have huge performance benefits.
             # make a prediction at zoom_out_factor, remember max_zoom_out_factor
             start_initial_pred = time()
             input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
@@ -441,8 +442,9 @@ class nnInteractiveInferenceSession():
                 # part of the refinement. Updating it could cause areas that are not refined to become coarse
                 prediction_with_coarse = self.interactions[0]
 
+                target_dtype = torch.float32 if self.device == torch.device('mps') else torch.float64
                 if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
-                    pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[
+                    pred = (interpolate(pred[None, None].to(target_dtype), scaled_patch_size, mode='trilinear')[
                                 0, 0] >= 0.5).to(torch.uint8)
 
                 # compute the difference map
@@ -486,7 +488,8 @@ class nnInteractiveInferenceSession():
                 # dilate to preserve interactions after downsampling
                 for i in range(3, 7):
                     tmp[i:i+1] = iterative_3x3_same_padding_pool3d(tmp[None, i:i+1], max_pool_ks)[0]
-            crop_interactions_resampled_gpu = interpolate(tmp[None], self.configuration_manager.patch_size, mode='area')[0]
+            int_crop_mode = 'nearest' if self.device == torch.device('mps') else 'area'
+            crop_interactions_resampled_gpu = interpolate(tmp[None], self.configuration_manager.patch_size, mode=int_crop_mode)[0]
 
             del tmp
 
@@ -569,7 +572,8 @@ class nnInteractiveInferenceSession():
                 break
             for idx in [0, pred.shape[dim] - 1]:
                 slice_prev = prev_pred.index_select(dim, torch.tensor(idx, device='cpu'))
-                slice_curr = pred.index_select(dim, torch.tensor(idx, device=self.device)).to('cpu')
+                slice_curr = pred.index_select(dim, torch.tensor([idx], device=self.device)).to('cpu')  # list needed on MPS
+
                 pixels_prev = torch.sum(slice_prev)
                 pixels_current = torch.sum(slice_curr)
                 pixels_diff = torch.sum(slice_prev != slice_curr)
