@@ -82,6 +82,11 @@ class nnInteractiveInferenceSession():
         self.preprocess_future = None
         self.interactions_future = None
 
+    @staticmethod
+    def _is_official_checkpoint(plans: dict, checkpoint: dict) -> bool:
+        return plans.get('dataset_name') == 'Dataset225_nnInteractiveV2' and \
+            checkpoint.get('init_args', {}).get('configuration') == '3d_fullres_ps192_bs24'
+
     def set_image(self, image: np.ndarray, image_properties: dict = None):
         """
         Image must be 4D to satisfy nnU-Net needs: [c, x, y, z]
@@ -712,6 +717,12 @@ class nnInteractiveInferenceSession():
 
         checkpoint = torch.load(join(model_training_output_dir, fold_folder, checkpoint_name),
                                 map_location=self.device, weights_only=False)
+        if self._is_official_checkpoint(plans, checkpoint):
+            print(
+                'License reminder: The official nnInteractive checkpoint is licensed under '
+                'Creative Commons Attribution Non Commercial Share Alike 4.0 (CC BY-NC-SA 4.0). '
+                'See the license note in readme.md (# License).'
+            )
         trainer_name = checkpoint['trainer_name']
         configuration_name = checkpoint['init_args']['configuration']
 

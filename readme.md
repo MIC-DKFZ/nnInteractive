@@ -108,6 +108,9 @@ import SimpleITK as sitk
 from huggingface_hub import snapshot_download  # Install huggingface_hub if not already installed
 
 # --- Download Trained Model Weights (~400MB) ---
+# License reminder: The official nnInteractive checkpoint is licensed under
+# Creative Commons Attribution Non Commercial Share Alike 4.0 (CC BY-NC-SA 4.0).
+# See the License section of this readme!.
 REPO_ID = "nnInteractive/nnInteractive"
 MODEL_NAME = "nnInteractive_v1.0"  # Updated models may be available in the future
 DOWNLOAD_DIR = "/home/isensee/temp"  # Specify the download directory
