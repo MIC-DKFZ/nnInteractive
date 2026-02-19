@@ -1,6 +1,6 @@
 [project]
 name = "nnInteractive"
-version = "1.1.2"
+version = "1.1.3"
 requires-python = ">=3.10"
 description = "Inference code for nnInteractive"
 readme = "readme.md"
@@ -31,7 +31,7 @@ keywords = [
 ]
 dependencies = [
     "nnunetv2>=2.6",
-    "torch>=2.6",
+    "torch>=2.6,<2.9.0",
     "acvl-utils>=0.2.3,<0.3",  # 0.3 may bring breaking changes. Careful!
     "batchgenerators>=0.25.1",
 ]
