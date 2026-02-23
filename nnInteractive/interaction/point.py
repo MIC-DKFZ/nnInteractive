@@ -76,7 +76,8 @@ class PointInteraction_stub():
                     position: Tuple[int, ...],
                     interaction_map,
                     binarize: bool = False,
-                    channel_idx: Optional[int] = None):
+                    channel_idx: Optional[int] = None,
+                    value_scale: float = 1.0):
         """
         Places a point on the interaction map around the specified position.
 
@@ -87,6 +88,7 @@ class PointInteraction_stub():
                          set channel_idx.
         binarize (bool): If True, inserts a binary mask. If False, may insert smooth values based on distance.
         channel_idx (Optional[int]): Channel index to write to when interaction_map includes a leading channel dim.
+        value_scale (float): Multiply placed values by this factor (used for lazy-decay storage domain writes).
 
         Returns:
         Updated interaction map with the point added.
@@ -116,6 +118,8 @@ class PointInteraction_stub():
         # Calculate where the resized structuring element should be placed within the slices
         structuring_slices = tuple([slice(max(0, -bbox[i][0]), slices[i].stop - slices[i].start + max(0, -bbox[i][0])) for i in range(ndim)])
         strel_sub = strel[structuring_slices]
+        if value_scale != 1.0:
+            strel_sub = strel_sub * value_scale
 
         target_slices = slices if channel_idx is None else (channel_idx, *slices)
 

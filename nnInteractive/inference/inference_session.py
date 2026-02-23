@@ -59,6 +59,7 @@ class nnInteractiveInferenceSession():
         self.device = device
         self.use_torch_compile = use_torch_compile
         self.interaction_decay = None
+        self._interaction_channel_scale = np.ones(7, dtype=np.float32)
 
         # image specific
         self.interactions: Union[torch.Tensor, blosc2.NDArray] = None
@@ -144,6 +145,7 @@ class nnInteractiveInferenceSession():
         empty_cache(self.device)
         self.original_image_shape = None
         self.has_positive_bbox = False
+        self._interaction_channel_scale.fill(1.0)
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
         shape = (7, *image_torch.shape[1:])
@@ -226,13 +228,44 @@ class nnInteractiveInferenceSession():
                 self.target_buffer.zero_()
         empty_cache(self.device)
         self.has_positive_bbox = False
+        self._interaction_channel_scale.fill(1.0)
 
     def _decay_interaction_channels(self, slc):
-        """Apply interaction_decay to the given channels of self.interactions."""
-        self.interactions[slc] *= self.interaction_decay
+        """Apply interaction_decay lazily via per-channel scales (no full-channel materialization)."""
+        self._interaction_channel_scale[slc] *= self.interaction_decay
+        self._maybe_rebase_interaction_scales()
+
+    def _maybe_rebase_interaction_scales(self, min_scale: float = 5e-3):
+        """
+        Rarely fold very small scales back into storage to avoid large stored amplitudes.
+        """
+        rebase_channels = np.where(self._interaction_channel_scale < min_scale)[0]
+        rebase_channels = [int(c) for c in rebase_channels if c != 0]
+        for c in rebase_channels:
+            scale = float(self._interaction_channel_scale[c])
+            if self.use_in_mem_compression:
+                channel = np.asarray(self.interactions[c])
+                channel *= scale
+                self.interactions[c] = channel
+            else:
+                self.interactions[c] *= scale
+            self._interaction_channel_scale[c] = 1.0
+
+    def _apply_channel_scales_inplace(self, tensor: torch.Tensor, channel_offset: int = 0):
+        """Convert stored interaction channels to logical values for model input."""
+        if tensor.ndim < 2:
+            return
+        nch = tensor.shape[0]
+        scales_np = self._interaction_channel_scale[channel_offset:channel_offset + nch]
+        if np.allclose(scales_np, 1.0):
+            return
+        scales = torch.as_tensor(scales_np, dtype=tensor.dtype, device=tensor.device)
+        view_shape = (nch,) + (1,) * (tensor.ndim - 1)
+        tensor.mul_(scales.view(view_shape))
 
     def _interactions_inplace_maximum(self, channel_idx, other):
         """Element-wise maximum between interactions[channel_idx] and other, stored back into interactions."""
+        scale = float(self._interaction_channel_scale[channel_idx])
         if self.use_in_mem_compression:
             if isinstance(other, torch.Tensor):
                 other = other.cpu().numpy()
@@ -244,23 +277,45 @@ class nnInteractiveInferenceSession():
                 slice(int(dim.min()), int(dim.max()) + 1) for dim in nonzero
             )
             current_sub = np.asarray(self.interactions[(channel_idx, *bbox_slices)])
-            other_sub = other[bbox_slices]
+            other_sub = other[bbox_slices].astype(np.float32, copy=False) / scale
+            if other_sub.shape != current_sub.shape:
+                # blosc2 may squeeze singleton slice dimensions; align to the actual storage slice shape
+                if other_sub.size == current_sub.size:
+                    other_sub = other_sub.reshape(current_sub.shape)
+                else:
+                    squeezed = np.squeeze(other_sub)
+                    if squeezed.size == current_sub.size:
+                        other_sub = squeezed.reshape(current_sub.shape)
+                    else:
+                        raise RuntimeError(
+                            f"Shape mismatch in _interactions_inplace_maximum: "
+                            f"current_sub={current_sub.shape}, other_sub={other_sub.shape}"
+                        )
             np.maximum(current_sub, other_sub, out=current_sub)
             self.interactions[(channel_idx, *bbox_slices)] = current_sub
         else:
-            torch.maximum(self.interactions[channel_idx], other.to(self.interactions.device),
+            if isinstance(other, np.ndarray):
+                other = torch.from_numpy(other)
+            other_t = other.to(self.interactions.device, dtype=self.interactions.dtype) / scale
+            torch.maximum(self.interactions[channel_idx], other_t,
                           out=self.interactions[channel_idx])
 
     def _set_interaction_channel(self, channel_idx, value):
         """Set a channel of self.interactions, handling type conversion for blosc2."""
+        scale = float(self._interaction_channel_scale[channel_idx])
         if self.use_in_mem_compression:
             if isinstance(value, torch.Tensor):
                 value = value.cpu().numpy()
+            if scale != 1.0:
+                value = value / scale
             self.interactions[channel_idx] = value
         else:
             if isinstance(value, np.ndarray):
                 value = torch.from_numpy(value)
-            self.interactions[channel_idx] = value.to(self.interactions.device)
+            value = value.to(self.interactions.device, dtype=self.interactions.dtype)
+            if scale != 1.0:
+                value = value / scale
+            self.interactions[channel_idx] = value
 
     def _paste_into_interactions_channel0(self, source, bbox):
         """Paste source into interactions[0] at bbox. Only accesses the needed spatial subregion."""
@@ -372,7 +427,7 @@ class nnInteractiveInferenceSession():
         # place bbox
         slicer = tuple([slice(*i) for i in transformed_bbox_coordinates])
         channel = -6 if include_interaction else -5
-        self.interactions[(channel, *slicer)] = 1
+        self.interactions[(channel, *slicer)] = 1.0 / float(self._interaction_channel_scale[channel])
 
         # forward pass
         if run_prediction:
@@ -390,11 +445,13 @@ class nnInteractiveInferenceSession():
         self._decay_interaction_channels(slice(-4, -2))
 
         interaction_channel = -4 if include_interaction else -3
+        value_scale = 1.0 / float(self._interaction_channel_scale[interaction_channel])
         if self.use_in_mem_compression:
-            self.point_interaction.place_point(transformed_coordinates, self.interactions, channel_idx=interaction_channel)
+            self.point_interaction.place_point(
+                transformed_coordinates, self.interactions, channel_idx=interaction_channel, value_scale=value_scale)
         else:
             self.interactions[interaction_channel] = self.point_interaction.place_point(
-                transformed_coordinates, self.interactions[interaction_channel])
+                transformed_coordinates, self.interactions[interaction_channel], value_scale=value_scale)
         if run_prediction:
             self._predict()
 
@@ -613,6 +670,7 @@ class nnInteractiveInferenceSession():
             crop_interactions = torch.from_numpy(np.asarray(crop_interactions))
         crop_img = crop_img.to(self.device, non_blocking=True)
         crop_interactions = crop_interactions.to(self.device, non_blocking=True)
+        self._apply_channel_scales_inplace(crop_interactions, channel_offset=0)
 
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
@@ -697,6 +755,7 @@ class nnInteractiveInferenceSession():
             # channels upfront. Only the bbox region of channels 1-6 is read.
             crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions,
                                      source_leading_slice=slice(1, None))
+            self._apply_channel_scales_inplace(preallocated_input[2:], channel_offset=1)
 
             pred = self.network(preallocated_input[None])[0].argmax(0).detach()
 
