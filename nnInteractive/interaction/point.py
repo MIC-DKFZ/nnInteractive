@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Tuple, Optional
 
+import blosc2
 import numpy as np
 import torch
 from batchgeneratorsv2.helpers.scalar_type import sample_scalar, RandomScalar
@@ -73,42 +74,70 @@ class PointInteraction_stub():
 
     def place_point(self,
                     position: Tuple[int, ...],
-                    interaction_map: torch.Tensor,
-                    binarize: bool = False) -> torch.Tensor:
+                    interaction_map,
+                    binarize: bool = False,
+                    channel_idx: Optional[int] = None):
         """
         Places a point on the interaction map around the specified position.
 
         Parameters:
         position (Tuple[int, ...]): The (x, y, z) coordinates where the point should be placed.
-        interaction_map (torch.Tensor): A tensor representing the interaction map where the point
-                                        should be placed. The shape should match the volume dimensions.
+        interaction_map: Interaction map where the point should be placed. Can be torch.Tensor,
+                         numpy.ndarray or blosc2.NDArray. If it has a leading channel dimension,
+                         set channel_idx.
         binarize (bool): If True, inserts a binary mask. If False, may insert smooth values based on distance.
+        channel_idx (Optional[int]): Channel index to write to when interaction_map includes a leading channel dim.
 
         Returns:
-        torch.Tensor: Updated interaction map with the point added.
+        Updated interaction map with the point added.
         """
-        ndim = interaction_map.ndim
+        if channel_idx is None:
+            spatial_shape = interaction_map.shape
+        else:
+            spatial_shape = interaction_map.shape[1:]
+        ndim = len(spatial_shape)
 
         # Determine the radius for each dimension
-        radius = tuple([sample_scalar(self.point_radius, d, interaction_map.shape) for d in range(ndim)])
+        radius = tuple([sample_scalar(self.point_radius, d, spatial_shape) for d in range(ndim)])
 
         strel = build_point(radius, self.use_distance_transform, binarize)
 
         # Calculate slice range in each dimension, ensuring it is within the bounds of the interaction map
         bbox = [[position[i] - strel.shape[i] // 2, position[i] + strel.shape[i] // 2 + strel.shape[i] % 2] for i in range(ndim)]
         # detect if bbox is completely outside interaction_map
-        if any([i[1] < 0 for i in bbox]) or any([i[0] > s for i, s in zip(bbox, interaction_map.shape)]):
+        if any([i[1] < 0 for i in bbox]) or any([i[0] > s for i, s in zip(bbox, spatial_shape)]):
             print('Point is outside the interaction map! Ignoring')
             print(f'Position: {position}')
-            print(f'Interaction map shape: {interaction_map.shape}')
+            print(f'Interaction map shape: {spatial_shape}')
             print(f'Point bbox would have been {bbox}')
             return interaction_map
-        slices = tuple(slice(max(0, bbox[i][0]), min(interaction_map.shape[i], bbox[i][1])) for i in range(ndim))
+        slices = tuple(slice(max(0, bbox[i][0]), min(spatial_shape[i], bbox[i][1])) for i in range(ndim))
 
         # Calculate where the resized structuring element should be placed within the slices
         structuring_slices = tuple([slice(max(0, -bbox[i][0]), slices[i].stop - slices[i].start + max(0, -bbox[i][0])) for i in range(ndim)])
+        strel_sub = strel[structuring_slices]
 
-        # Place the resized structuring element into the interaction map
-        torch.maximum(interaction_map[slices], strel[structuring_slices].to(interaction_map.device), out=interaction_map[slices])
+        target_slices = slices if channel_idx is None else (channel_idx, *slices)
+
+        if isinstance(interaction_map, torch.Tensor):
+            current_sub = interaction_map[target_slices]
+            torch.maximum(current_sub, strel_sub.to(current_sub.device), out=current_sub)
+            interaction_map[target_slices] = current_sub
+            return interaction_map
+
+        strel_sub_np = strel_sub.cpu().numpy()
+        if isinstance(interaction_map, np.ndarray):
+            current_sub = interaction_map[target_slices]
+            np.maximum(current_sub, strel_sub_np.astype(current_sub.dtype, copy=False), out=current_sub)
+            interaction_map[target_slices] = current_sub
+            return interaction_map
+
+        if isinstance(interaction_map, blosc2.NDArray):
+            current_sub = np.asarray(interaction_map[target_slices])
+            np.maximum(current_sub, strel_sub_np.astype(current_sub.dtype, copy=False), out=current_sub)
+            interaction_map[target_slices] = current_sub
+            return interaction_map
+
+        raise TypeError(f'Unsupported interaction_map type: {type(interaction_map)}')
+
         return interaction_map
-

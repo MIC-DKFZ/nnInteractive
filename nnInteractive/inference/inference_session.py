@@ -1,8 +1,10 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from os import cpu_count
 from time import time
 from typing import Union, List, Tuple, Optional
 
+import blosc2
 import numpy as np
 import torch
 from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice, crop_and_pad_nd
@@ -33,6 +35,7 @@ class nnInteractiveInferenceSession():
                  torch_n_threads: int = 8,
                  do_autozoom: bool = True,
                  use_pinned_memory: bool = True,
+                 use_in_mem_compression: bool = True,
                  ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
@@ -49,13 +52,16 @@ class nnInteractiveInferenceSession():
         self.trainer_name = None
         self.configuration_manager = None
         self.plans_manager = None
+        self.use_in_mem_compression = use_in_mem_compression
+        if use_in_mem_compression:
+            use_pinned_memory = False
         self.use_pinned_memory = use_pinned_memory
         self.device = device
         self.use_torch_compile = use_torch_compile
         self.interaction_decay = None
 
         # image specific
-        self.interactions: torch.Tensor = None
+        self.interactions: Union[torch.Tensor, blosc2.NDArray] = None
         self.preprocessed_image: torch.Tensor = None
         self.preprocessed_props = None
         self.target_buffer: Union[np.ndarray, torch.Tensor] = None
@@ -140,17 +146,27 @@ class nnInteractiveInferenceSession():
         self.has_positive_bbox = False
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
-        # there is a bug in 6.11 that doesn't allow pinning large tensors
-        use_pinned = not is_linux_kernel_6_11() and self.use_pinned_memory and self.device.type == 'cuda'
-        if self.verbose:
-            print(f'Initialize interactions. Pinned: {use_pinned}')
-        # Create the interaction tensor based on the target shape.
-        self.interactions = torch.zeros(
-            (7, *image_torch.shape[1:]),
-            device='cpu',
-            dtype=torch.float16,
-            pin_memory=use_pinned
-        )
+        shape = (7, *image_torch.shape[1:])
+        if self.use_in_mem_compression:
+            if self.verbose:
+                print('Initialize interactions with blosc2 in-memory compression')
+            self.interactions = blosc2.zeros(
+                shape, dtype=np.float16,
+                chunks=(1, *[min(64, s) for s in shape[1:]]),
+                blocks=(1, *[min(32, s) for s in shape[1:]]),
+                cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': os.cpu_count()},
+                dparams={'nthreads': 4}
+            )
+            self._interactions_blosc2_shape = shape
+        else:
+            # there is a bug in 6.11 that doesn't allow pinning large tensors
+            use_pinned = not is_linux_kernel_6_11() and self.use_pinned_memory and self.device.type == 'cuda'
+            if self.verbose:
+                print(f'Initialize interactions. Pinned: {use_pinned}')
+            # Create the interaction tensor based on the target shape.
+            self.interactions = torch.zeros(
+                shape, device='cpu', dtype=torch.float16, pin_memory=use_pinned
+            )
 
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
@@ -192,7 +208,16 @@ class nnInteractiveInferenceSession():
         segmentation!
         """
         if self.interactions is not None:
-            self.interactions.fill_(0)
+            if self.use_in_mem_compression:
+                del self.interactions
+                self.interactions = blosc2.zeros(
+                    self._interactions_blosc2_shape, dtype=np.float16,
+                    chunks=(1, *[min(64, s) for s in self._interactions_blosc2_shape[1:]]),
+                    blocks=(1, *[min(32, s) for s in self._interactions_blosc2_shape[1:]]),
+                    cparams={'codec': blosc2.Codec.LZ4HC, 'clevel': 5}
+                )
+            else:
+                self.interactions.fill_(0)
 
         if self.target_buffer is not None:
             if isinstance(self.target_buffer, np.ndarray):
@@ -201,6 +226,101 @@ class nnInteractiveInferenceSession():
                 self.target_buffer.zero_()
         empty_cache(self.device)
         self.has_positive_bbox = False
+
+    def _decay_interaction_channels(self, slc):
+        """Apply interaction_decay to the given channels of self.interactions."""
+        self.interactions[slc] *= self.interaction_decay
+
+    def _interactions_inplace_maximum(self, channel_idx, other):
+        """Element-wise maximum between interactions[channel_idx] and other, stored back into interactions."""
+        if self.use_in_mem_compression:
+            if isinstance(other, torch.Tensor):
+                other = other.cpu().numpy()
+            # Only decompress/recompress the subregion containing nonzero values in other
+            nonzero = np.nonzero(other)
+            if len(nonzero[0]) == 0:
+                return
+            bbox_slices = tuple(
+                slice(int(dim.min()), int(dim.max()) + 1) for dim in nonzero
+            )
+            current_sub = np.asarray(self.interactions[(channel_idx, *bbox_slices)])
+            other_sub = other[bbox_slices]
+            np.maximum(current_sub, other_sub, out=current_sub)
+            self.interactions[(channel_idx, *bbox_slices)] = current_sub
+        else:
+            torch.maximum(self.interactions[channel_idx], other.to(self.interactions.device),
+                          out=self.interactions[channel_idx])
+
+    def _set_interaction_channel(self, channel_idx, value):
+        """Set a channel of self.interactions, handling type conversion for blosc2."""
+        if self.use_in_mem_compression:
+            if isinstance(value, torch.Tensor):
+                value = value.cpu().numpy()
+            self.interactions[channel_idx] = value
+        else:
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            self.interactions[channel_idx] = value.to(self.interactions.device)
+
+    def _paste_into_interactions_channel0(self, source, bbox):
+        """Paste source into interactions[0] at bbox. Only accesses the needed spatial subregion."""
+        target_shape = self.interactions.shape[1:]  # spatial dims (D, H, W)
+        target_slices = []
+        source_slices = []
+        for i, (b0, b1) in enumerate(bbox):
+            t_start = max(b0, 0)
+            t_end = min(b1, target_shape[i])
+            if t_start >= t_end:
+                return
+            s_start = t_start - b0
+            s_end = s_start + (t_end - t_start)
+            target_slices.append(slice(t_start, t_end))
+            source_slices.append(slice(s_start, s_end))
+
+        src = source[tuple(source_slices)]
+        if isinstance(src, torch.Tensor):
+            src = src.cpu()
+            if self.use_in_mem_compression:
+                src = src.numpy()
+        self.interactions[(0, *target_slices)] = src
+
+    def _crop_and_pad_interactions_channel0(self, bbox):
+        """Crop interactions[0] to bbox with zero padding, without reading the full channel."""
+        out_shape = tuple(int(i[1] - i[0]) for i in bbox)
+        out = torch.zeros(out_shape, dtype=torch.float16)
+
+        seen_bbox = [[max(0, i[0]), min(i[1], s)] for i, s in zip(bbox, self.interactions.shape[1:])]
+        if any(i[1] <= i[0] for i in seen_bbox):
+            return out
+
+        source_slices = tuple(slice(i[0], i[1]) for i in seen_bbox)
+        target_slices = tuple(slice(i[0] - b[0], i[1] - b[0]) for i, b in zip(seen_bbox, bbox))
+        if self.use_in_mem_compression:
+            sub = np.asarray(self.interactions[(0, *source_slices)])
+            out[target_slices] = torch.from_numpy(sub)
+        else:
+            out[target_slices] = self.interactions[0][source_slices].to('cpu')
+        return out
+
+    def _mask_interaction_channel_with_prediction(self, channel_idx, prediction_with_coarse, chunk_depth: int = 64):
+        """
+        Apply channel[channel > 0] *= (prediction_with_coarse > 0.5) without full-channel materialization for blosc2.
+        """
+        if self.use_in_mem_compression:
+            if isinstance(prediction_with_coarse, torch.Tensor):
+                pred_np = prediction_with_coarse.cpu().numpy() > 0.5
+            else:
+                pred_np = np.asarray(prediction_with_coarse) > 0.5
+
+            depth = pred_np.shape[0]
+            for d0 in range(0, depth, chunk_depth):
+                d1 = min(depth, d0 + chunk_depth)
+                source_slices = (channel_idx, slice(d0, d1), slice(None), slice(None))
+                channel_sub = np.asarray(self.interactions[source_slices])
+                channel_sub[~pred_np[d0:d1]] = 0
+                self.interactions[source_slices] = channel_sub
+        else:
+            self.interactions[channel_idx][(~(prediction_with_coarse > 0.5))] = 0
 
     def add_bbox_interaction(self, bbox_coords, include_interaction: bool, run_prediction: bool = True) -> np.ndarray:
         if include_interaction:
@@ -247,7 +367,7 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_bbox_interaction(transformed_bbox_coordinates)
 
         # decay old interactions
-        self.interactions[-6:-4] *= self.interaction_decay
+        self._decay_interaction_channels(slice(-6, -4))
 
         # place bbox
         slicer = tuple([slice(*i) for i in transformed_bbox_coordinates])
@@ -267,11 +387,14 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_point_interaction(transformed_coordinates)
 
         # decay old interactions
-        self.interactions[-4:-2] *= self.interaction_decay
+        self._decay_interaction_channels(slice(-4, -2))
 
         interaction_channel = -4 if include_interaction else -3
-        self.interactions[interaction_channel] = self.point_interaction.place_point(
-            transformed_coordinates, self.interactions[interaction_channel])
+        if self.use_in_mem_compression:
+            self.point_interaction.place_point(transformed_coordinates, self.interactions, channel_idx=interaction_channel)
+        else:
+            self.interactions[interaction_channel] = self.point_interaction.place_point(
+                transformed_coordinates, self.interactions[interaction_channel])
         if run_prediction:
             self._predict()
 
@@ -287,11 +410,10 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_scribble_interaction(scribble_image)
 
         # decay old interactions
-        self.interactions[-2:] *= self.interaction_decay
+        self._decay_interaction_channels(slice(-2, None))
 
         interaction_channel = -2 if include_interaction else -1
-        torch.maximum(self.interactions[interaction_channel], scribble_image.to(self.interactions.device),
-                      out=self.interactions[interaction_channel])
+        self._interactions_inplace_maximum(interaction_channel, scribble_image)
         del scribble_image
         empty_cache(self.device)
         if run_prediction:
@@ -309,12 +431,11 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_lasso_interaction(lasso_image)
 
         # decay old interactions
-        self.interactions[-6:-4] *= self.interaction_decay
+        self._decay_interaction_channels(slice(-6, -4))
 
         # lasso is written into bbox channel
         interaction_channel = -6 if include_interaction else -5
-        torch.maximum(self.interactions[interaction_channel], lasso_image.to(self.interactions.device),
-                      out=self.interactions[interaction_channel])
+        self._interactions_inplace_maximum(interaction_channel, lasso_image)
         del lasso_image
         empty_cache(self.device)
         if run_prediction:
@@ -343,7 +464,7 @@ class nnInteractiveInferenceSession():
 
         # initial seg is written into initial seg buffer
         interaction_channel = -7
-        self.interactions[interaction_channel] = initial_seg.to(self.interactions.device)
+        self._set_interaction_channel(interaction_channel, initial_seg)
         empty_cache(self.device)
         if run_prediction:
             self._add_patch_for_initial_seg_interaction(initial_seg)
@@ -391,7 +512,7 @@ class nnInteractiveInferenceSession():
             del input_for_predict
 
             # detect changes at border. If there are, we enter autozoom
-            previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox)
+            previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox)
 
             if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
                 previous_prediction = \
@@ -419,7 +540,7 @@ class nnInteractiveInferenceSession():
                 del input_for_predict
 
                 # detect changes at border. If there are, we enter autozoom
-                previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox)
+                previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox)
 
                 if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
                     previous_prediction_resized = \
@@ -436,7 +557,7 @@ class nnInteractiveInferenceSession():
 
             if zoom_out_factor == 1:
                 # simply place pred in self.interactions[0] and target buffer
-                paste_tensor(self.interactions[0], pred.half(), scaled_bbox)
+                self._paste_into_interactions_channel0(pred.half(), scaled_bbox)
                 bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                         zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
                 paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
@@ -447,31 +568,39 @@ class nnInteractiveInferenceSession():
                 # we need to resize the prediction to the correct shape and place it in a copy of self.interactions[0]
                 # we don't want to place it into self.interactions[0] because we will update self.interactions[0] as
                 # part of the refinement. Updating it could cause areas that are not refined to become coarse
+                # For blosc2: self.interactions[0] returns a numpy copy (not a view), which is fine since we
+                # explicitly want a separate copy here.
                 prediction_with_coarse = self.interactions[0]
+                if self.use_in_mem_compression:
+                    prediction_with_coarse_torch = torch.from_numpy(np.asarray(prediction_with_coarse))
+                else:
+                    prediction_with_coarse_torch = prediction_with_coarse
 
                 if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
                     pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[
                                 0, 0] >= 0.5).to(torch.uint8)
 
                 # compute the difference map
-                diff_map, has_diff = self._compute_diff_map(pred, self.interactions[0], scaled_bbox, scaled_patch_size)
+                diff_map, has_diff = self._compute_diff_map(pred, prediction_with_coarse_torch, scaled_bbox, scaled_patch_size)
 
                 if force_full_refine:
                     print('Forcing full refinement of entire structure')
-                    diff_map[self.interactions[0] > 0] = 1
+                    diff_map[prediction_with_coarse_torch > 0] = 1
 
                 # place resized coarse segmentation into prediction_with_coarse. Needed for network input
                 paste_tensor(prediction_with_coarse, pred, scaled_bbox)
 
                 self._refine_coarse(diff_map, prediction_with_coarse)
 
-                del prediction_with_coarse
+                del prediction_with_coarse, prediction_with_coarse_torch
 
-        print(f'Done. Total time {round(time() - start_predict, 3)}s')
+        print(f'Predict done. Total time {round(time() - start_predict, 3)}s')
 
         self.new_interaction_centers = []
         self.new_interaction_zoom_out_factors = []
         empty_cache(self.device)
+        if self.use_in_mem_compression:
+            print('Current compression ratio of interactions:', self.interactions.cratio)
 
     def _build_network_input(self, prediction_center, zoom_out_factor):
         scaled_patch_size = [round(i * zoom_out_factor) for i in self.configuration_manager.patch_size]
@@ -480,6 +609,8 @@ class nnInteractiveInferenceSession():
         # cropping happens on CPU, padding happens on GPU (later)
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
         crop_interactions, pad_interaction = crop_to_valid(self.interactions, scaled_bbox)
+        if not isinstance(crop_interactions, torch.Tensor):
+            crop_interactions = torch.from_numpy(np.asarray(crop_interactions))
         crop_img = crop_img.to(self.device, non_blocking=True)
         crop_interactions = crop_interactions.to(self.device, non_blocking=True)
 
@@ -527,7 +658,10 @@ class nnInteractiveInferenceSession():
             # mask positive bbox channel with current segmentation to avoid bbox nonsense.
             # Basically convert bbox to pseudo lasso
             pos_bbox_idx = -6
-            self.interactions[pos_bbox_idx][(~(prediction_with_coarse > 0.5))] = 0
+            if self.use_in_mem_compression:
+                self._mask_interaction_channel_with_prediction(pos_bbox_idx, prediction_with_coarse)
+            else:
+                self.interactions[pos_bbox_idx][(~(prediction_with_coarse > 0.5))] = 0
             self.has_positive_bbox = False
 
         bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
@@ -548,22 +682,36 @@ class nnInteractiveInferenceSession():
 
         preallocated_input = torch.zeros((8, *self.configuration_manager.patch_size), device=self.device,
                                          dtype=torch.float)
+
+        # For blosc2: prediction_with_coarse is already a full CPU copy; reuse it to avoid an extra full read.
+        if isinstance(prediction_with_coarse, np.ndarray):
+            channel_0 = torch.from_numpy(prediction_with_coarse)
+        else:
+            channel_0 = prediction_with_coarse
+
         for nref, refinement_bbox in enumerate(bboxes_ordered):
             assert self.pad_mode_data == 'constant'
             crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
             crop_and_pad_into_buffer(preallocated_input[1], refinement_bbox, prediction_with_coarse)
-            crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions[1:])
+            # Pass self.interactions directly with source_leading_slice to avoid decompressing all
+            # channels upfront. Only the bbox region of channels 1-6 is read.
+            crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions,
+                                     source_leading_slice=slice(1, None))
 
             pred = self.network(preallocated_input[None])[0].argmax(0).detach()
 
-            paste_tensor(self.interactions[0], pred, refinement_bbox)
+            paste_tensor(channel_0, pred, refinement_bbox)
             # place into target buffer
             bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                     zip(refinement_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
             paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
             del pred
             preallocated_input.zero_()
-        del preallocated_input
+
+        # Write back channel 0 for blosc2
+        if self.use_in_mem_compression:
+            self.interactions[0] = channel_0.numpy()
+        del channel_0, preallocated_input
         empty_cache(self.device)
         end_refinement = time()
         print(
