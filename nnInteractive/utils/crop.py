@@ -1,10 +1,12 @@
-from typing import Sequence
+from typing import Sequence, Union
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
                              bbox: Sequence[Sequence[int]],
-                             source_tensor: torch.Tensor) -> None:
+                             source_tensor,
+                             source_leading_slice: slice = None) -> None:
     """
     Copies a sub-region from source_tensor into target_tensor based on a bounding box.
 
@@ -14,14 +16,17 @@ def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
             that is covered by the bbox. The bbox is defined as [start, end) (half-open interval)
             and may extend outside the source tensor. If source_tensor has more dimensions than
             len(bbox), the leading dimensions will be fully included.
-        source_tensor (torch.Tensor): The tensor to copy data from.
+        source_tensor: The tensor to copy data from (torch.Tensor, numpy array, or blosc2 NDArray).
+        source_leading_slice (slice, optional): If provided, use this slice for the leading
+            dimension(s) of source_tensor instead of slice(None). Useful for selecting a subset
+            of channels from a blosc2 NDArray without decompressing all channels.
 
     Behavior:
         For each dimension that the bbox covers (i.e. the last len(bbox) dims of source_tensor):
             - Compute the overlapping region between the bbox and the source tensor.
             - Determine the corresponding indices in the target tensor where the data will be copied.
         For any extra leading dimensions (i.e. source_tensor.ndim > len(bbox)):
-            - Use slice(None) to include the entire dimension.
+            - Use slice(None) (or source_leading_slice if given) to include the dimension.
         If source_tensor and target_tensor are on different devices, only the overlapping subregion
         is transferred to the device of target_tensor.
     """
@@ -33,9 +38,9 @@ def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
     source_slices = []
     target_slices = []
 
-    # For the leading dimensions, include the entire dimension.
+    # For the leading dimensions, include the entire dimension (or use source_leading_slice).
     for _ in range(leading_dims):
-        source_slices.append(slice(None))
+        source_slices.append(source_leading_slice if source_leading_slice is not None else slice(None))
         target_slices.append(slice(None))
 
     # Process the dimensions covered by the bbox.
@@ -58,6 +63,9 @@ def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
 
     # Extract the overlapping region from the source.
     sub_source = source_tensor[tuple(source_slices)]
+    # Convert to torch if source is numpy (e.g. from blosc2 NDArray slicing)
+    if not isinstance(sub_source, torch.Tensor):
+        sub_source = torch.from_numpy(np.asarray(sub_source))
     # Transfer only this subregion to the target tensor's device.
     sub_source = sub_source.to(target_tensor.device) if isinstance(target_tensor, torch.Tensor) else sub_source.cpu()
     # Write the data into the preallocated target_tensor.
@@ -120,12 +128,14 @@ def paste_tensor(target: torch.Tensor, source: torch.Tensor, bbox):
             source_indices[1][0]:source_indices[1][1],
             source_indices[2][0]:source_indices[2][1]].to(target.device)
     else:
+        src = source[source_indices[0][0]:source_indices[0][1],
+                     source_indices[1][0]:source_indices[1][1],
+                     source_indices[2][0]:source_indices[2][1]]
+        if isinstance(src, torch.Tensor):
+            src = src.cpu().numpy()
         target[target_indices[0][0]:target_indices[0][1],
         target_indices[1][0]:target_indices[1][1],
-        target_indices[2][0]:target_indices[2][1]] = \
-            source[source_indices[0][0]:source_indices[0][1],
-            source_indices[1][0]:source_indices[1][1],
-            source_indices[2][0]:source_indices[2][1]].cpu()
+        target_indices[2][0]:target_indices[2][1]] = src
 
     return target
 

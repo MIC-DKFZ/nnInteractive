@@ -115,3 +115,5 @@ ENV/
 
 !documentation/assets/scribble_example.png
 !imgs/Logos/*
+
+CLAUDE.md
