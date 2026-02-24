@@ -153,7 +153,7 @@ class nnInteractiveInferenceSession():
         return False
 
     def _get_prev_seg_channel(self) -> int:
-        return self._to_positive_channel_index(int(self.channel_mapping['prev_seg']))
+        return int(self.channel_mapping['prev_seg'])
 
     def _get_dilation_channels_for_resample(self) -> List[int]:
         dilation_channels = set()
@@ -165,8 +165,8 @@ class nnInteractiveInferenceSession():
             if key not in self.channel_mapping:
                 continue
             pos_ch, neg_ch = self._parse_channel_pair(key, self.channel_mapping[key])
-            dilation_channels.add(self._to_positive_channel_index(pos_ch))
-            dilation_channels.add(self._to_positive_channel_index(neg_ch))
+            dilation_channels.add(pos_ch)
+            dilation_channels.add(neg_ch)
         # Use a sorted list so execution is deterministic and easier to reason about in debugging/logging.
         return sorted(dilation_channels)
 
@@ -178,6 +178,15 @@ class nnInteractiveInferenceSession():
             warnings.warn(f"{msg} Proceeding because override_capability_checks=True.", RuntimeWarning)
             return
         raise ValueError(msg)
+
+    def _decay_interactions(self):
+        if self.interactions is None:
+            return
+        prev_seg_channel = self._get_prev_seg_channel()
+        channels_to_decay = set(range(self.interactions.shape[0]))
+        channels_to_decay.discard(prev_seg_channel)
+        if channels_to_decay:
+            self.interactions[sorted(channels_to_decay)] *= self.interaction_decay
 
     def _apply_capability(self, capability: dict):
         default_capability = self._legacy_default_capability()
@@ -213,6 +222,17 @@ class nnInteractiveInferenceSession():
                     pos_ch, neg_ch = self._parse_channel_pair(k, v)
                     all_indices.extend([abs(pos_ch), abs(neg_ch)])
             self.num_interaction_channels = max(all_indices) if len(all_indices) > 0 else 7
+
+        # Normalize all channel indices to positive indexing once at load time.
+        self.channel_mapping['prev_seg'] = self._to_positive_channel_index(int(self.channel_mapping['prev_seg']))
+        for k, v in list(self.channel_mapping.items()):
+            if k == 'prev_seg':
+                continue
+            pos_ch, neg_ch = self._parse_channel_pair(k, v)
+            self.channel_mapping[k] = (
+                self._to_positive_channel_index(pos_ch),
+                self._to_positive_channel_index(neg_ch),
+            )
 
     def _validate_capability_version(self, capability: dict):
         current_class = self.__class__.__name__
@@ -411,8 +431,7 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_bbox_interaction(transformed_bbox_coordinates)
 
         # decay old interactions
-        self.interactions[bbox_pos_channel] *= self.interaction_decay
-        self.interactions[bbox_neg_channel] *= self.interaction_decay
+        self._decay_interactions()
 
         # place bbox
         slicer = tuple([slice(*i) for i in transformed_bbox_coordinates])
@@ -435,8 +454,7 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_point_interaction(transformed_coordinates)
 
         # decay old interactions
-        self.interactions[point_pos_channel] *= self.interaction_decay
-        self.interactions[point_neg_channel] *= self.interaction_decay
+        self._decay_interactions()
 
         interaction_channel = point_pos_channel if include_interaction else point_neg_channel
         self.interactions[interaction_channel] = self.point_interaction.place_point(
@@ -459,8 +477,7 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_scribble_interaction(scribble_image)
 
         # decay old interactions
-        self.interactions[scribble_pos_channel] *= self.interaction_decay
-        self.interactions[scribble_neg_channel] *= self.interaction_decay
+        self._decay_interactions()
 
         interaction_channel = scribble_pos_channel if include_interaction else scribble_neg_channel
         torch.maximum(self.interactions[interaction_channel], scribble_image.to(self.interactions.device),
@@ -485,8 +502,7 @@ class nnInteractiveInferenceSession():
         self._add_patch_for_lasso_interaction(lasso_image)
 
         # decay old interactions
-        self.interactions[lasso_pos_channel] *= self.interaction_decay
-        self.interactions[lasso_neg_channel] *= self.interaction_decay
+        self._decay_interactions()
 
         # lasso is written into bbox channel
         interaction_channel = lasso_pos_channel if include_interaction else lasso_neg_channel
