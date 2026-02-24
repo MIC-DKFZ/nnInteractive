@@ -113,12 +113,12 @@ class nnInteractiveInferenceSession():
             'supports_zero_shot_label_refinement': True,
             'interaction_channels': 6,
             'channel_mapping': {
-                'prev_seg': -7,
-                'bbox2d': (-6, -5),
-                'bbox3d': (-6, -5),
-                'lasso': (-6, -5),
-                'points': (-4, -3),
-                'scribble': (-2, -1),
+                'prev_seg': 0,
+                'bbox2d': (1, 2),
+                'bbox3d': (1, 2),
+                'lasso': (1, 2),
+                'points': (3, 4),
+                'scribble': (5, 6),
             },
         }
 
