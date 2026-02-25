@@ -179,6 +179,27 @@ class nnInteractiveInferenceSession():
             return
         raise ValueError(msg)
 
+    @staticmethod
+    def _infer_num_interaction_channels_from_mapping(channel_mapping: dict) -> int:
+        max_positive_index = -1
+        max_negative_magnitude = 0
+
+        for k, v in channel_mapping.items():
+            if k == 'prev_seg':
+                indices = [int(v)]
+            else:
+                pos_ch, neg_ch = nnInteractiveInferenceSession._parse_channel_pair(k, v)
+                indices = [pos_ch, neg_ch]
+
+            for idx in indices:
+                if idx >= 0:
+                    max_positive_index = max(max_positive_index, idx)
+                else:
+                    max_negative_magnitude = max(max_negative_magnitude, abs(idx))
+
+        # Positive indexing is 0-based, while negative indexing is 1-based-from-end.
+        return max(max_positive_index + 1, max_negative_magnitude, 1)
+
     def _decay_interactions(self):
         if self.interactions is None:
             return
@@ -214,14 +235,7 @@ class nnInteractiveInferenceSession():
         if 'interaction_channels' in capability:
             self.num_interaction_channels = int(capability['interaction_channels']) + 1
         else:
-            all_indices = []
-            for k, v in self.channel_mapping.items():
-                if k == 'prev_seg':
-                    all_indices.append(abs(int(v)))
-                else:
-                    pos_ch, neg_ch = self._parse_channel_pair(k, v)
-                    all_indices.extend([abs(pos_ch), abs(neg_ch)])
-            self.num_interaction_channels = max(all_indices) if len(all_indices) > 0 else 7
+            self.num_interaction_channels = self._infer_num_interaction_channels_from_mapping(self.channel_mapping)
 
         # Normalize all channel indices to positive indexing once at load time.
         self.channel_mapping['prev_seg'] = self._to_positive_channel_index(int(self.channel_mapping['prev_seg']))
