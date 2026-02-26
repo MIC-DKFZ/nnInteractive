@@ -519,6 +519,8 @@ class nnInteractiveInferenceSession():
     def add_scribble_interaction(self, scribble_image: np.ndarray, include_interaction: bool, run_prediction: bool = True,
                                  override_capability_checks: bool = False,
                                  interaction_bbox: Optional[List[List[int]]] = None):
+        if True: #self.verbose:
+            print(f'Add new scribble of shape {scribble_image.shape} and bbox {interaction_bbox}')
         self._check_capability_or_warn('scribble', override_capability_checks)
         pos_channel, neg_channel = self._resolve_channel_pair('scribble', override_capability_checks)
         self._add_image_interaction(scribble_image, pos_channel if include_interaction else neg_channel,
@@ -527,6 +529,8 @@ class nnInteractiveInferenceSession():
     def add_lasso_interaction(self, lasso_image: np.ndarray, include_interaction: bool, run_prediction: bool = True,
                               override_capability_checks: bool = False,
                               interaction_bbox: Optional[List[List[int]]] = None):
+        if True: #self.verbose:
+            print(f'Add new lasso of shape {lasso_image.shape} and bbox {interaction_bbox}')
         self._check_capability_or_warn('lasso', override_capability_checks)
         pos_channel, neg_channel = self._resolve_channel_pair('lasso', override_capability_checks)
         self._add_image_interaction(lasso_image, pos_channel if include_interaction else neg_channel,
