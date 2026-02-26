@@ -57,6 +57,10 @@ class nnInteractiveInferenceSession():
         self.device = device
         self.use_torch_compile = use_torch_compile
         self.interaction_decay = None
+        self.current_interaction_intensity: float = 1.0
+        self._fp16_max_value = float(torch.finfo(torch.float16).max)
+        # Keep renormalized interaction magnitudes around 1/10 of fp16 max to preserve headroom.
+        self._interaction_renorm_target = self._fp16_max_value / 10
         self.num_interaction_channels: int = 7
         self.supported_interactions: dict = {}
         self.channel_mapping: dict = {}
@@ -200,14 +204,46 @@ class nnInteractiveInferenceSession():
         # Positive indexing is 0-based, while negative indexing is 1-based-from-end.
         return max(max_positive_index + 1, max_negative_magnitude, 1)
 
-    def _decay_interactions(self):
+    def _get_non_prev_seg_channels(self) -> List[int]:
+        if self.interactions is None:
+            return []
+        prev_seg_channel = self._get_prev_seg_channel()
+        channels = list(range(self.interactions.shape[0]))
+        if prev_seg_channel in channels:
+            channels.remove(prev_seg_channel)
+        return channels
+
+    def _renormalize_interactions_if_needed(self):
         if self.interactions is None:
             return
+        if self.current_interaction_intensity <= self._fp16_max_value:
+            return
+        channels_to_scale = self._get_non_prev_seg_channels()
+        if len(channels_to_scale) == 0:
+            self.current_interaction_intensity = min(self.current_interaction_intensity, self._interaction_renorm_target)
+            return
+        scale = self._interaction_renorm_target / self.current_interaction_intensity
+        self.interactions[channels_to_scale] *= scale
+        self.current_interaction_intensity = self._interaction_renorm_target
+
+    def _prepare_new_interaction_intensity(self):
+        if self.interaction_decay is None:
+            return
+        if not (0 < self.interaction_decay <= 1):
+            raise ValueError(f"interaction_decay must be in (0, 1], got {self.interaction_decay}.")
+        if self.interaction_decay < 1:
+            self.current_interaction_intensity *= (1 / self.interaction_decay)
+            self._renormalize_interactions_if_needed()
+
+    def _normalize_interaction_channels_for_network_(self, interaction_tensor: torch.Tensor):
+        if interaction_tensor is None or self.current_interaction_intensity == 0:
+            return
+        if self.current_interaction_intensity == 1:
+            return
         prev_seg_channel = self._get_prev_seg_channel()
-        channels_to_decay = set(range(self.interactions.shape[0]))
-        channels_to_decay.discard(prev_seg_channel)
-        if channels_to_decay:
-            self.interactions[sorted(channels_to_decay)] *= self.interaction_decay
+        channels_to_normalize = [i for i in range(interaction_tensor.shape[0]) if i != prev_seg_channel]
+        if len(channels_to_normalize) > 0:
+            interaction_tensor[channels_to_normalize] /= self.current_interaction_intensity
 
     def _apply_capability(self, capability: dict):
         default_capability = self._legacy_default_capability()
@@ -314,6 +350,7 @@ class nnInteractiveInferenceSession():
         self.target_buffer = None
         self.interactions = None
         self.preprocessed_props = None
+        self.current_interaction_intensity = 1.0
         empty_cache(self.device)
         self.original_image_shape = None
         self.has_positive_bbox = False
@@ -372,6 +409,7 @@ class nnInteractiveInferenceSession():
         """
         if self.interactions is not None:
             self.interactions.fill_(0)
+        self.current_interaction_intensity = 1.0
 
         if self.target_buffer is not None:
             if isinstance(self.target_buffer, np.ndarray):
@@ -441,13 +479,12 @@ class nnInteractiveInferenceSession():
 
         self._add_patch_for_bbox_interaction(transformed_bbox_coordinates)
 
-        # decay old interactions
-        self._decay_interactions()
+        self._prepare_new_interaction_intensity()
 
         # place bbox
         slicer = tuple([slice(*i) for i in transformed_bbox_coordinates])
         channel = bbox_pos_channel if include_interaction else bbox_neg_channel
-        self.interactions[(channel, *slicer)] = 1
+        self.interactions[(channel, *slicer)] = self.current_interaction_intensity
 
         # forward pass
         if run_prediction:
@@ -464,12 +501,12 @@ class nnInteractiveInferenceSession():
 
         self._add_patch_for_point_interaction(transformed_coordinates)
 
-        # decay old interactions
-        self._decay_interactions()
+        self._prepare_new_interaction_intensity()
 
         interaction_channel = point_pos_channel if include_interaction else point_neg_channel
         self.interactions[interaction_channel] = self.point_interaction.place_point(
-            transformed_coordinates, self.interactions[interaction_channel])
+            transformed_coordinates, self.interactions[interaction_channel],
+            intensity_scale=self.current_interaction_intensity)
         if run_prediction:
             self._predict()
 
@@ -498,7 +535,7 @@ class nnInteractiveInferenceSession():
         image_t = torch.from_numpy(image)
         patch_fn(image_t, offset=lbs_internal)
 
-        self._decay_interactions()
+        self._prepare_new_interaction_intensity()
 
         interaction_shape = self.interactions.shape[1:]
         clipped_lb = [max(0, lb) for lb in lbs_internal]
@@ -507,9 +544,12 @@ class nnInteractiveInferenceSession():
         src_ub = [src_lb[d] + (clipped_ub[d] - clipped_lb[d]) for d in range(3)]
         int_slicer = tuple(slice(a, b) for a, b in zip(clipped_lb, clipped_ub))
         src_slicer = tuple(slice(a, b) for a, b in zip(src_lb, src_ub))
-        torch.maximum(self.interactions[interaction_channel][int_slicer],
-                      image_t[src_slicer].to(self.interactions.device),
+        new_values = image_t[src_slicer].to(self.interactions.device, dtype=self.interactions.dtype)
+        if self.current_interaction_intensity != 1:
+            new_values = new_values * self.current_interaction_intensity
+        torch.maximum(self.interactions[interaction_channel][int_slicer], new_values,
                       out=self.interactions[interaction_channel][int_slicer])
+        del new_values
         del image_t
         empty_cache(self.device)
 
@@ -562,6 +602,7 @@ class nnInteractiveInferenceSession():
         # initial seg is written into initial seg buffer
         interaction_channel = self._get_prev_seg_channel()
         self.interactions[interaction_channel] = initial_seg.to(self.interactions.device)
+
         empty_cache(self.device)
         if run_prediction:
             self._add_patch_for_initial_seg_interaction(initial_seg)
@@ -737,6 +778,7 @@ class nnInteractiveInferenceSession():
             crop_img = pad_cropped(crop_img, pad_image) if any([x for y in pad_interaction for x in y]) else crop_img
             crop_interactions = pad_cropped(crop_interactions, pad_interaction) if any([x for y in pad_interaction for x in y]) else crop_interactions
 
+        self._normalize_interaction_channels_for_network_(crop_interactions)
         input_for_predict = torch.cat((crop_img, crop_interactions))
         del crop_img, crop_interactions
         empty_cache(self.device)
@@ -784,6 +826,7 @@ class nnInteractiveInferenceSession():
             assert self.pad_mode_data == 'constant'
             crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
             crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
+            self._normalize_interaction_channels_for_network_(preallocated_input[1:])
 
             pred = self.network(preallocated_input[None])[0].argmax(0).detach()
 

@@ -74,7 +74,8 @@ class PointInteraction_stub():
     def place_point(self,
                     position: Tuple[int, ...],
                     interaction_map: torch.Tensor,
-                    binarize: bool = False) -> torch.Tensor:
+                    binarize: bool = False,
+                    intensity_scale: float = 1.0) -> torch.Tensor:
         """
         Places a point on the interaction map around the specified position.
 
@@ -93,6 +94,8 @@ class PointInteraction_stub():
         radius = tuple([sample_scalar(self.point_radius, d, interaction_map.shape) for d in range(ndim)])
 
         strel = build_point(radius, self.use_distance_transform, binarize)
+        if intensity_scale != 1.0:
+            strel = strel * intensity_scale
 
         # Calculate slice range in each dimension, ensuring it is within the bounds of the interaction map
         bbox = [[position[i] - strel.shape[i] // 2, position[i] + strel.shape[i] // 2 + strel.shape[i] % 2] for i in range(ndim)]
@@ -111,4 +114,3 @@ class PointInteraction_stub():
         # Place the resized structuring element into the interaction map
         torch.maximum(interaction_map[slices], strel[structuring_slices].to(interaction_map.device), out=interaction_map[slices])
         return interaction_map
-
