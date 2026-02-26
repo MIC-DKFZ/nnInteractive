@@ -382,8 +382,23 @@ class nnInteractiveInferenceSession():
         self.has_positive_bbox = False
 
     def add_bbox_interaction(self, bbox_coords, include_interaction: bool, run_prediction: bool = True,
-                             override_capability_checks: bool = False) -> np.ndarray:
-        self._finish_preprocessing_and_initialize_interactions()
+                             override_capability_checks: bool = False):
+        # sanity check
+        raw_bbox_size = [i[1] - i[0] for i in bbox_coords]
+        if any([i == 0 for i in raw_bbox_size]):
+            raise ValueError(f'Given bounding box size is zero in at least one dimension: {bbox_coords}')
+
+        # capability check
+        dims_with_size_one = sum(i == 1 for i in raw_bbox_size)
+        # if we do not support 3D bboxes we need to reject 3D bboxes!
+        if not self._is_interaction_supported('bbox3d') and dims_with_size_one == 0:
+            raise ValueError(f"The given bounding box {bbox_coords} has size {raw_bbox_size} indicating a 3D "
+                             f"bounding box. This is not supported by the loaded model checkpoint.")
+        # a 2D bounding box is in principle a 3D box as well. Since 2D bboxes work better, we prefer to use a given
+        # bbox as 2d if possible (sized 1 in at least one dim and bbox2d supported)
+        bbox_kind = 'bbox2d' if (dims_with_size_one >= 1 and self._is_interaction_supported('bbox2d')) else 'bbox3d'
+        self._check_capability_or_warn(bbox_kind, override_capability_checks)
+        bbox_pos_channel, bbox_neg_channel = self._resolve_channel_pair(bbox_kind, override_capability_checks)
 
         lbs_transformed = [round(i) for i in transform_coordinates_noresampling([i[0] for i in bbox_coords],
                                                              self.preprocessed_props['bbox_used_for_cropping'])]
@@ -392,7 +407,7 @@ class nnInteractiveInferenceSession():
         transformed_bbox_coordinates = [[i, j] for i, j in zip(lbs_transformed, ubs_transformed)]
 
         if self.verbose:
-            print(f'Added bounding box coordinates.\n'
+            print(f'Adding bounding box coordinates.\n'
                   f'Raw: {bbox_coords}\n'
                   f'Transformed: {transformed_bbox_coordinates}\n'
                   f"Crop Bbox: {self.preprocessed_props['bbox_used_for_cropping']}")
@@ -420,24 +435,6 @@ class nnInteractiveInferenceSession():
             print(f'Bbox coordinates after clip to image boundaries and preventing dim collapse:\n'
                   f'Bbox: {transformed_bbox_coordinates}\n'
                   f'Internal image shape: {self.preprocessed_image.shape}')
-
-        bbox_sizes = [i[1] - i[0] for i in transformed_bbox_coordinates]
-        dims_with_size_one = sum(i == 1 for i in bbox_sizes)
-        if dims_with_size_one >= 1:
-            bbox_kind = 'bbox2d'
-        elif all(i > 0 for i in bbox_sizes):
-            bbox_kind = 'bbox3d'
-        else:
-            raise ValueError(
-                f"Invalid bbox dimensionality for {bbox_sizes}. "
-                f"Expected positive bbox sizes in all dimensions."
-            )
-
-        if bbox_kind == 'bbox2d' and not self._is_interaction_supported('bbox2d'):
-            bbox_kind = 'bbox3d'
-
-        self._check_capability_or_warn(bbox_kind, override_capability_checks)
-        bbox_pos_channel, bbox_neg_channel = self._resolve_channel_pair(bbox_kind, override_capability_checks)
 
         if include_interaction:
             self.has_positive_bbox = True
