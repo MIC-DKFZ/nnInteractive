@@ -473,56 +473,64 @@ class nnInteractiveInferenceSession():
         if run_prediction:
             self._predict()
 
-    def add_scribble_interaction(self, scribble_image: np.ndarray,  include_interaction: bool, run_prediction: bool = True,
-                                 override_capability_checks: bool = False):
+    def _add_image_interaction(self, image: np.ndarray, interaction_channel: int, run_prediction: bool,
+                               interaction_bbox: Optional[List[List[int]]], patch_fn):
+        if interaction_bbox is None:
+            interaction_bbox = [[0, s] for s in self.original_image_shape[1:]]
+
+        assert len(interaction_bbox) == 3
+        bbox_size = [ub - lb for lb, ub in interaction_bbox]
+        assert all(s > 0 for s in bbox_size), \
+            'each dimension of interaction_bbox must have positive size'
+        assert list(image.shape) == bbox_size, \
+            f'image shape {list(image.shape)} must match interaction_bbox size {bbox_size}'
+        assert all(lb >= 0 and ub <= orig_dim
+                   for (lb, ub), orig_dim in zip(interaction_bbox, self.original_image_shape[1:])), \
+            f'interaction_bbox {interaction_bbox} exceeds original image bounds {list(self.original_image_shape[1:])}'
+
+        self._finish_preprocessing_and_initialize_interactions()
+
+        lbs_internal = [round(i) for i in transform_coordinates_noresampling(
+            [ib[0] for ib in interaction_bbox], self.preprocessed_props['bbox_used_for_cropping'])]
+        ubs_internal = [round(i) for i in transform_coordinates_noresampling(
+            [ib[1] for ib in interaction_bbox], self.preprocessed_props['bbox_used_for_cropping'])]
+
+        image_t = torch.from_numpy(image)
+        patch_fn(image_t, offset=lbs_internal)
+
+        self._decay_interactions()
+
+        interaction_shape = self.interactions.shape[1:]
+        clipped_lb = [max(0, lb) for lb in lbs_internal]
+        clipped_ub = [min(ub, s) for ub, s in zip(ubs_internal, interaction_shape)]
+        src_lb = [cl - lb for cl, lb in zip(clipped_lb, lbs_internal)]
+        src_ub = [src_lb[d] + (clipped_ub[d] - clipped_lb[d]) for d in range(3)]
+        int_slicer = tuple(slice(a, b) for a, b in zip(clipped_lb, clipped_ub))
+        src_slicer = tuple(slice(a, b) for a, b in zip(src_lb, src_ub))
+        torch.maximum(self.interactions[interaction_channel][int_slicer],
+                      image_t[src_slicer].to(self.interactions.device),
+                      out=self.interactions[interaction_channel][int_slicer])
+        del image_t
+        empty_cache(self.device)
+
+        if run_prediction:
+            self._predict()
+
+    def add_scribble_interaction(self, scribble_image: np.ndarray, include_interaction: bool, run_prediction: bool = True,
+                                 override_capability_checks: bool = False,
+                                 interaction_bbox: Optional[List[List[int]]] = None):
         self._check_capability_or_warn('scribble', override_capability_checks)
-        scribble_pos_channel, scribble_neg_channel = self._resolve_channel_pair('scribble', override_capability_checks)
-        assert all([i == j for i, j in zip(self.original_image_shape[1:], scribble_image.shape)]), f'Given scribble image must match input image shape. Input image was: {self.original_image_shape[1:]}, given: {scribble_image.shape}'
-        self._finish_preprocessing_and_initialize_interactions()
+        pos_channel, neg_channel = self._resolve_channel_pair('scribble', override_capability_checks)
+        self._add_image_interaction(scribble_image, pos_channel if include_interaction else neg_channel,
+                                    run_prediction, interaction_bbox, self._add_patch_for_scribble_interaction)
 
-        scribble_image = torch.from_numpy(scribble_image)
-
-        # crop (as in preprocessing)
-        scribble_image = crop_and_pad_nd(scribble_image, self.preprocessed_props['bbox_used_for_cropping'])
-
-        self._add_patch_for_scribble_interaction(scribble_image)
-
-        # decay old interactions
-        self._decay_interactions()
-
-        interaction_channel = scribble_pos_channel if include_interaction else scribble_neg_channel
-        torch.maximum(self.interactions[interaction_channel], scribble_image.to(self.interactions.device),
-                      out=self.interactions[interaction_channel])
-        del scribble_image
-        empty_cache(self.device)
-        if run_prediction:
-            self._predict()
-
-    def add_lasso_interaction(self, lasso_image: np.ndarray,  include_interaction: bool, run_prediction: bool = True,
-                              override_capability_checks: bool = False):
+    def add_lasso_interaction(self, lasso_image: np.ndarray, include_interaction: bool, run_prediction: bool = True,
+                              override_capability_checks: bool = False,
+                              interaction_bbox: Optional[List[List[int]]] = None):
         self._check_capability_or_warn('lasso', override_capability_checks)
-        lasso_pos_channel, lasso_neg_channel = self._resolve_channel_pair('lasso', override_capability_checks)
-        assert all([i == j for i, j in zip(self.original_image_shape[1:], lasso_image.shape)]), f'Given lasso image must match input image shape. Input image was: {self.original_image_shape[1:]}, given: {lasso_image.shape}'
-        self._finish_preprocessing_and_initialize_interactions()
-
-        lasso_image = torch.from_numpy(lasso_image)
-
-        # crop (as in preprocessing)
-        lasso_image = crop_and_pad_nd(lasso_image, self.preprocessed_props['bbox_used_for_cropping'])
-
-        self._add_patch_for_lasso_interaction(lasso_image)
-
-        # decay old interactions
-        self._decay_interactions()
-
-        # lasso is written into bbox channel
-        interaction_channel = lasso_pos_channel if include_interaction else lasso_neg_channel
-        torch.maximum(self.interactions[interaction_channel], lasso_image.to(self.interactions.device),
-                      out=self.interactions[interaction_channel])
-        del lasso_image
-        empty_cache(self.device)
-        if run_prediction:
-            self._predict()
+        pos_channel, neg_channel = self._resolve_channel_pair('lasso', override_capability_checks)
+        self._add_image_interaction(lasso_image, pos_channel if include_interaction else neg_channel,
+                                    run_prediction, interaction_bbox, self._add_patch_for_lasso_interaction)
 
     def add_initial_seg_interaction(self, initial_seg: np.ndarray, run_prediction: bool = False,
                                     override_capability_checks: bool = False):
@@ -874,25 +882,27 @@ class nnInteractiveInferenceSession():
         self.new_interaction_centers.append(bbox_center)
         print(f'Added new bbox interaction: center {self.new_interaction_zoom_out_factors[-1]}, scale {self.new_interaction_centers}')
 
-    def _add_patch_for_scribble_interaction(self, scribble_image):
-        return self._generic_add_patch_from_image(scribble_image)
+    def _add_patch_for_scribble_interaction(self, scribble_image, offset=None):
+        return self._generic_add_patch_from_image(scribble_image, offset=offset)
 
-    def _add_patch_for_lasso_interaction(self, lasso_image):
-        return self._generic_add_patch_from_image(lasso_image)
+    def _add_patch_for_lasso_interaction(self, lasso_image, offset=None):
+        return self._generic_add_patch_from_image(lasso_image, offset=offset)
 
     def _add_patch_for_initial_seg_interaction(self, initial_seg):
         return self._generic_add_patch_from_image(initial_seg)
 
-    def _generic_add_patch_from_image(self, image: torch.Tensor):
+    def _generic_add_patch_from_image(self, image: torch.Tensor, offset: Optional[List[int]] = None):
         if not torch.any(image):
             print('Received empty image prompt. Cannot add patches for prediction')
             return
+        if offset is None:
+            offset = [0] * image.ndim
         nonzero_indices = torch.nonzero(image, as_tuple=False)
         mn = torch.min(nonzero_indices, dim=0)[0]
         mx = torch.max(nonzero_indices, dim=0)[0]
-        roi = [[i.item(), x.item() + 1] for i, x in zip(mn, mx)]
+        roi = [[i.item() + off, x.item() + off + 1] for i, x, off in zip(mn, mx, offset)]
         roi_center = [round((i[0] + i[1]) / 2) for i in roi]
-        roi_size = [i[1]- i[0] for i in roi]
+        roi_size = [i[1] - i[0] for i in roi]
         requested_size = [i + j // 3 for i, j in zip(roi_size, self.configuration_manager.patch_size)]
         self.new_interaction_zoom_out_factors.append(max(1, max([i / j for i, j in zip(requested_size, self.configuration_manager.patch_size)])))
         self.new_interaction_centers.append(roi_center)
