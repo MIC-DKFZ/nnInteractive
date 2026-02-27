@@ -1,10 +1,12 @@
-from typing import Sequence
+from typing import Sequence, Optional
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
                              bbox: Sequence[Sequence[int]],
-                             source_tensor: torch.Tensor) -> None:
+                             source_tensor,
+                             source_leading_slice=None) -> None:
     """
     Copies a sub-region from source_tensor into target_tensor based on a bounding box.
 
@@ -14,14 +16,18 @@ def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
             that is covered by the bbox. The bbox is defined as [start, end) (half-open interval)
             and may extend outside the source tensor. If source_tensor has more dimensions than
             len(bbox), the leading dimensions will be fully included.
-        source_tensor (torch.Tensor): The tensor to copy data from.
+        source_tensor: The tensor (or blosc2 NDArray) to copy data from.
+        source_leading_slice: Optional slice to apply to the first leading dimension of the source
+            instead of slice(None). Useful for reading a subset of channels from a blosc2 NDArray
+            without decompressing channel 0.
 
     Behavior:
         For each dimension that the bbox covers (i.e. the last len(bbox) dims of source_tensor):
             - Compute the overlapping region between the bbox and the source tensor.
             - Determine the corresponding indices in the target tensor where the data will be copied.
         For any extra leading dimensions (i.e. source_tensor.ndim > len(bbox)):
-            - Use slice(None) to include the entire dimension.
+            - Use slice(None) to include the entire dimension (or source_leading_slice for the
+              first leading dim when provided).
         If source_tensor and target_tensor are on different devices, only the overlapping subregion
         is transferred to the device of target_tensor.
     """
@@ -34,8 +40,11 @@ def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
     target_slices = []
 
     # For the leading dimensions, include the entire dimension.
-    for _ in range(leading_dims):
-        source_slices.append(slice(None))
+    for d in range(leading_dims):
+        if d == 0 and source_leading_slice is not None:
+            source_slices.append(source_leading_slice)
+        else:
+            source_slices.append(slice(None))
         target_slices.append(slice(None))
 
     # Process the dimensions covered by the bbox.
@@ -58,35 +67,72 @@ def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
 
     # Extract the overlapping region from the source.
     sub_source = source_tensor[tuple(source_slices)]
+    # Convert non-torch (e.g. blosc2 NDArray or numpy) to torch tensor.
+    if not isinstance(sub_source, torch.Tensor):
+        sub_source = torch.from_numpy(np.asarray(sub_source))
     # Transfer only this subregion to the target tensor's device.
     sub_source = sub_source.to(target_tensor.device) if isinstance(target_tensor, torch.Tensor) else sub_source.cpu()
     # Write the data into the preallocated target_tensor.
     target_tensor[tuple(target_slices)] = sub_source
 
 
-def paste_tensor(target: torch.Tensor, source: torch.Tensor, bbox):
+def paste_tensor(target, source, bbox, channel_idx=None):
     """
     Paste a source tensor into a target tensor using a given bounding box.
 
-    Both tensors are assumed to be 3D.
+    Both tensors are assumed to be 3D (or 4D when channel_idx is provided for the target).
     The bounding box is specified in the coordinate system of the target as:
       [[x1, x2], [y1, y2], [z1, z2]]
     and its size is assumed to be equal to the shape of the source tensor.
     The bbox may exceed the boundaries of the target tensor.
 
-    The function computes the valid overlapping region between the bbox and the target,
-    and then adjusts the corresponding region in the source tensor so that only the valid
-    parts are pasted.
-
     Args:
-        target (torch.Tensor): The target tensor of shape (T0, T1, T2).
-        source (torch.Tensor): The source tensor of shape (S0, S1, S2). It must be the same size as
-                               the bbox, i.e. S0 = x2 - x1, etc.
+        target: The target tensor (torch.Tensor of shape (T0, T1, T2)) or blosc2 NDArray of
+                shape (C, T0, T1, T2) when channel_idx is provided.
+        source: The source tensor of shape (S0, S1, S2). It must be the same size as the bbox.
         bbox (list or tuple): List of intervals for each dimension: [[x1, x2], [y1, y2], [z1, z2]].
+        channel_idx (int, optional): If provided, paste into this channel of a 4D target.
+            For torch.Tensor targets, delegates to target[channel_idx]. For blosc2 NDArray
+            targets, performs a numpy read-modify-write on the specified channel.
 
     Returns:
-        torch.Tensor: The target tensor after pasting in the source.
+        The target after pasting in the source (for torch.Tensor targets).
     """
+    # When channel_idx is given and target is a torch Tensor, delegate to the channel view.
+    if channel_idx is not None and isinstance(target, torch.Tensor):
+        return paste_tensor(target[channel_idx], source, bbox)
+
+    if channel_idx is not None:
+        # target is a 4D blosc2 NDArray; write to target[channel_idx] at bbox.
+        target_shape = target.shape[1:]  # spatial dims
+
+        target_indices = []
+        source_indices = []
+
+        for i, (b0, b1) in enumerate(bbox):
+            t_start = max(b0, 0)
+            t_end = min(b1, target_shape[i])
+            if t_start >= t_end:
+                return  # no overlap in this dimension
+            s_start = t_start - b0
+            s_end = s_start + (t_end - t_start)
+            target_indices.append((t_start, t_end))
+            source_indices.append((s_start, s_end))
+
+        src = source[source_indices[0][0]:source_indices[0][1],
+                     source_indices[1][0]:source_indices[1][1],
+                     source_indices[2][0]:source_indices[2][1]]
+        if isinstance(src, torch.Tensor):
+            src = src.cpu().numpy().astype(np.float16)
+        else:
+            src = np.asarray(src).astype(np.float16)
+
+        target[(channel_idx,
+                slice(target_indices[0][0], target_indices[0][1]),
+                slice(target_indices[1][0], target_indices[1][1]),
+                slice(target_indices[2][0], target_indices[2][1]))] = src
+        return
+
     target_shape = target.shape  # (T0, T1, T2)
 
     # For each dimension compute:
@@ -131,19 +177,19 @@ def paste_tensor(target: torch.Tensor, source: torch.Tensor, bbox):
 
 
 
-def crop_to_valid(img: torch.Tensor, bbox):
+def crop_to_valid(img, bbox):
     """
     Crops the image to the part of the bounding box that lies within the image.
     Supports a 4D tensor of shape (C, X, Y, Z). The bounding box is specified as
     [[x1, x2], [y1, y2], [z1, z2]] with half-open intervals.
 
     Args:
-        img (torch.Tensor): Input tensor of shape (C, X, Y, Z).
+        img: Input tensor (or blosc2 NDArray) of shape (C, X, Y, Z).
         bbox (list or tuple): Bounding box as a list of three intervals for spatial dims:
                               [[x1, x2], [y1, y2], [z1, z2]].
 
     Returns:
-        cropped (torch.Tensor): Cropped tensor of shape (C, cropped_x, cropped_y, cropped_z).
+        cropped: Cropped data of shape (C, cropped_x, cropped_y, cropped_z).
         pad (list of tuples): A list [(pad_x_left, pad_x_right),
                                      (pad_y_left, pad_y_right),
                                      (pad_z_left, pad_z_right)]
