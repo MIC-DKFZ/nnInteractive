@@ -241,7 +241,12 @@ class nnInteractiveInferenceSession():
             self.current_interaction_intensity = min(self.current_interaction_intensity, self._interaction_renorm_target)
             return
         scale = self._interaction_renorm_target / self.current_interaction_intensity
-        self.interactions[channels_to_scale] *= scale
+        if self.use_in_mem_compression:
+            # blosc2 NDArray does not support list-based assignment semantics reliably.
+            for ch in channels_to_scale:
+                self.interactions[ch] *= scale
+        else:
+            self.interactions[channels_to_scale] *= scale
         self.current_interaction_intensity = self._interaction_renorm_target
 
     def _crop_and_pad_interactions_channel0(self, bbox) -> torch.Tensor:
@@ -968,13 +973,8 @@ class nnInteractiveInferenceSession():
             assert self.pad_mode_data == 'constant'
             crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
             if self.use_in_mem_compression:
-                assert self._get_prev_seg_channel() == 0, "blosc2 path assumes prev_seg_channel == 0"
-                # Channel 0 (coarse pred already written by _predict): subregion only
-                ch0_crop = self._crop_and_pad_interactions_channel0(refinement_bbox)
-                preallocated_input[1].copy_(ch0_crop.to(self.device))
-                # Channels 1+: subregion only, skipping channel 0
-                crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions,
-                                         source_leading_slice=slice(1, None))
+                # Keep interaction channel order identical to self.interactions regardless of channel mapping.
+                crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
             else:
                 crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
             self._normalize_interaction_channels_for_network_(preallocated_input[1:])
