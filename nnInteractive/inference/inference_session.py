@@ -743,6 +743,9 @@ class nnInteractiveInferenceSession():
         Returns:
 
         """
+        if self.use_in_mem_compression:
+            print('Current cratio', self.interactions.cratio)
+
         assert self.pad_mode_data == 'constant', 'pad modes other than constant are not implemented here'
         assert len(self.new_interaction_centers) == len(self.new_interaction_zoom_out_factors)
         prev_seg_channel = self._get_prev_seg_channel()
