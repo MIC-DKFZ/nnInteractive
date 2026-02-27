@@ -4,7 +4,6 @@ from os import cpu_count
 from time import time
 from typing import Union, List, Tuple, Optional
 import warnings
-import re
 
 try:
     import blosc2
@@ -30,12 +29,20 @@ from nnInteractive.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
 from nnInteractive.utils.bboxes import generate_bounding_boxes
 from nnInteractive.utils.crop import crop_and_pad_into_buffer, paste_tensor, pad_cropped, crop_to_valid
 from nnInteractive.utils.erosion_dilation import iterative_3x3_same_padding_pool3d
+from nnInteractive.utils.inference_helpers import (
+    infer_num_interaction_channels_from_mapping,
+    parse_channel_pair,
+    transform_coordinates_noresampling,
+    version_to_tuple,
+)
 from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
 from nnInteractive.utils.rounding import round_to_nearest_odd
 
 
 class nnInteractiveInferenceSession():
     INFERENCE_SESSION_VERSION = nnInteractive.__version__
+    # Interactions implemented by this inference session.
+    SUPPORTED_INTERACTION_KEYS = ("scribble", "lasso", "points", "bbox2d", "bbox3d")
 
     def __init__(self,
                  device: torch.device = torch.device('cuda'),
@@ -118,10 +125,6 @@ class nnInteractiveInferenceSession():
         return plans.get('dataset_name') == 'Dataset225_nnInteractiveV2' and \
             checkpoint.get('init_args', {}).get('configuration') == '3d_fullres_ps192_bs24'
 
-    @staticmethod
-    def _version_to_tuple(version: str) -> Tuple[int, ...]:
-        return tuple(int(i) for i in re.findall(r'\d+', version))
-
     def _legacy_default_capability(self) -> dict:
         return {
             'supported_interactions': {
@@ -147,17 +150,9 @@ class nnInteractiveInferenceSession():
     def _to_positive_channel_index(self, idx: int) -> int:
         return idx if idx >= 0 else self.num_interaction_channels + idx
 
-    @staticmethod
-    def _parse_channel_pair(channel_name: str, raw_channels) -> Tuple[int, int]:
-        if not isinstance(raw_channels, (tuple, list)) or len(raw_channels) != 2:
-            raise ValueError(
-                f"Invalid channel mapping for '{channel_name}': expected a pair [pos, neg], got {raw_channels}."
-            )
-        return int(raw_channels[0]), int(raw_channels[1])
-
     def _resolve_channel_pair(self, channel_name: str, override_capability_checks: bool) -> Tuple[int, int]:
         if channel_name in self.channel_mapping:
-            return self._parse_channel_pair(channel_name, self.channel_mapping[channel_name])
+            return parse_channel_pair(channel_name, self.channel_mapping[channel_name])
         if override_capability_checks:
             warnings.warn(
                 f"Interaction '{channel_name}' was forced but no channel mapping exists in capability metadata.",
@@ -168,7 +163,7 @@ class nnInteractiveInferenceSession():
         )
 
     def _is_interaction_supported(self, interaction_name: str) -> bool:
-        if interaction_name in ('lasso', 'scribble', 'points', 'bbox2d', 'bbox3d'):
+        if interaction_name in self.SUPPORTED_INTERACTION_KEYS:
             return bool(self.supported_interactions.get(interaction_name, False))
         if interaction_name == 'initial_label':
             return bool(self.supports_initial_label)
@@ -186,7 +181,7 @@ class nnInteractiveInferenceSession():
                 continue
             if key not in self.channel_mapping:
                 continue
-            pos_ch, neg_ch = self._parse_channel_pair(key, self.channel_mapping[key])
+            pos_ch, neg_ch = parse_channel_pair(key, self.channel_mapping[key])
             dilation_channels.add(pos_ch)
             dilation_channels.add(neg_ch)
         # Use a sorted list so execution is deterministic and easier to reason about in debugging/logging.
@@ -200,27 +195,6 @@ class nnInteractiveInferenceSession():
             warnings.warn(f"{msg} Proceeding because override_capability_checks=True.", RuntimeWarning)
             return
         raise ValueError(msg)
-
-    @staticmethod
-    def _infer_num_interaction_channels_from_mapping(channel_mapping: dict) -> int:
-        max_positive_index = -1
-        max_negative_magnitude = 0
-
-        for k, v in channel_mapping.items():
-            if k == 'prev_seg':
-                indices = [int(v)]
-            else:
-                pos_ch, neg_ch = nnInteractiveInferenceSession._parse_channel_pair(k, v)
-                indices = [pos_ch, neg_ch]
-
-            for idx in indices:
-                if idx >= 0:
-                    max_positive_index = max(max_positive_index, idx)
-                else:
-                    max_negative_magnitude = max(max_negative_magnitude, abs(idx))
-
-        # Positive indexing is 0-based, while negative indexing is 1-based-from-end.
-        return max(max_positive_index + 1, max_negative_magnitude, 1)
 
     def _get_non_prev_seg_channels(self) -> List[int]:
         if self.interactions is None:
@@ -330,40 +304,95 @@ class nnInteractiveInferenceSession():
         if len(channels_to_normalize) > 0:
             interaction_tensor[channels_to_normalize] /= self.current_interaction_intensity
 
+    def _load_capability_and_runtime_defaults(self, model_training_output_dir: str):
+        capability_file = join(model_training_output_dir, 'inference_info.json')
+        legacy_file = join(model_training_output_dir, 'inference_session_class.json')
+
+        point_interaction_radius = 4
+        preferred_scribble_thickness = [2, 2, 2]
+        interaction_decay = 0.98
+        pad_mode_data = "constant"
+        capability_content = {}
+
+        # Prefer modern capability metadata; fall back to legacy session metadata for older checkpoints.
+        if isfile(capability_file):
+            capability_content = load_json(capability_file)
+            if not isinstance(capability_content, dict):
+                raise RuntimeError(f"Invalid capability metadata in {capability_file}. Expected a JSON object.")
+            self._validate_capability_version(capability_content)
+            point_interaction_radius = capability_content.get('point_radius', point_interaction_radius)
+            preferred_scribble_thickness = capability_content.get(
+                'preferred_scribble_thickness', preferred_scribble_thickness
+            )
+            interaction_decay = capability_content.get('interaction_decay', interaction_decay)
+            pad_mode_data = capability_content.get('pad_mode_image', pad_mode_data)
+        elif isfile(legacy_file):
+            legacy_content = load_json(legacy_file)
+            if isinstance(legacy_content, str):
+                interaction_decay = 0.9
+            else:
+                point_interaction_radius = legacy_content.get('point_radius', point_interaction_radius)
+                preferred_scribble_thickness = legacy_content.get(
+                    'preferred_scribble_thickness', preferred_scribble_thickness
+                )
+                interaction_decay = legacy_content.get('interaction_decay', interaction_decay)
+                pad_mode_data = legacy_content.get('pad_mode_image', pad_mode_data)
+        else:
+            raise FileNotFoundError(
+                f"Neither capability metadata ({capability_file}) nor legacy metadata ({legacy_file}) was found."
+            )
+
+        # Accept scalar thickness in metadata for backward compatibility.
+        if not isinstance(preferred_scribble_thickness, (tuple, list)):
+            preferred_scribble_thickness = [preferred_scribble_thickness] * 3
+
+        return capability_content, point_interaction_radius, preferred_scribble_thickness, interaction_decay, pad_mode_data
+
     def _apply_capability(self, capability: dict):
         default_capability = self._legacy_default_capability()
         default_supported = default_capability['supported_interactions']
         default_mapping = default_capability['channel_mapping']
-        supported_keys = set(default_supported.keys())
-        mapping_keys = set(default_mapping.keys())
+        supported_keys = set(self.SUPPORTED_INTERACTION_KEYS)
+        mapping_keys = set(self.SUPPORTED_INTERACTION_KEYS).union({'prev_seg'})
 
         raw_supported = capability.get('supported_interactions', {}) if isinstance(capability, dict) else {}
+        unknown_supported = set(raw_supported.keys()) - supported_keys
+        if len(unknown_supported) > 0:
+            raise ValueError(
+                f"Capability requests unsupported interactions: {sorted(unknown_supported)}. "
+                f"Supported: {sorted(supported_keys)}"
+            )
         filtered_supported = {k: bool(v) for k, v in raw_supported.items() if k in supported_keys}
         self.supported_interactions = {**default_supported, **filtered_supported}
         self.supports_initial_label = capability.get('supports_initial_label', True)
         self.supports_zero_shot_label_refinement = capability.get('supports_zero_shot_label_refinement', True)
 
         raw_mapping = capability.get('channel_mapping', {}) if isinstance(capability, dict) else {}
+        unknown_mapping = set(raw_mapping.keys()) - mapping_keys
+        if len(unknown_mapping) > 0:
+            raise ValueError(
+                f"Capability channel_mapping contains unsupported keys: {sorted(unknown_mapping)}. "
+                f"Supported mapping keys: {sorted(mapping_keys)}"
+            )
         self.channel_mapping = dict(default_mapping)
         for k, v in raw_mapping.items():
-            if k not in mapping_keys:
-                continue
             if k == 'prev_seg':
                 self.channel_mapping[k] = int(v)
             else:
-                self.channel_mapping[k] = self._parse_channel_pair(k, v)
+                self.channel_mapping[k] = parse_channel_pair(k, v)
 
         if 'interaction_channels' in capability:
             self.num_interaction_channels = int(capability['interaction_channels']) + 1
         else:
-            self.num_interaction_channels = self._infer_num_interaction_channels_from_mapping(self.channel_mapping)
+            self.num_interaction_channels = infer_num_interaction_channels_from_mapping(self.channel_mapping)
 
-        # Normalize all channel indices to positive indexing once at load time.
+        # Normalize all channel indices to positive indexing once at load time so downstream code can
+        # use direct indexing without handling negative-offset semantics repeatedly.
         self.channel_mapping['prev_seg'] = self._to_positive_channel_index(int(self.channel_mapping['prev_seg']))
         for k, v in list(self.channel_mapping.items()):
             if k == 'prev_seg':
                 continue
-            pos_ch, neg_ch = self._parse_channel_pair(k, v)
+            pos_ch, neg_ch = parse_channel_pair(k, v)
             self.channel_mapping[k] = (
                 self._to_positive_channel_index(pos_ch),
                 self._to_positive_channel_index(neg_ch),
@@ -381,7 +410,7 @@ class nnInteractiveInferenceSession():
         min_version = capability.get('inference_class_min_version')
         if min_version is None:
             return
-        if self._version_to_tuple(min_version) > self._version_to_tuple(self.INFERENCE_SESSION_VERSION):
+        if version_to_tuple(min_version) > version_to_tuple(self.INFERENCE_SESSION_VERSION):
             raise RuntimeError(
                 f"Checkpoint requires nnInteractiveInferenceSession>={min_version}, but current version is "
                 f"{self.INFERENCE_SESSION_VERSION}. Please update nnInteractive."
@@ -529,6 +558,7 @@ class nnInteractiveInferenceSession():
 
     def add_bbox_interaction(self, bbox_coords, include_interaction: bool, run_prediction: bool = True,
                              override_capability_checks: bool = False):
+        self._finish_preprocessing_and_initialize_interactions()
         # sanity check
         raw_bbox_size = [i[1] - i[0] for i in bbox_coords]
         if any([i == 0 for i in raw_bbox_size]):
@@ -546,6 +576,7 @@ class nnInteractiveInferenceSession():
         self._check_capability_or_warn(bbox_kind, override_capability_checks)
         bbox_pos_channel, bbox_neg_channel = self._resolve_channel_pair(bbox_kind, override_capability_checks)
 
+        # Convert user-space coordinates (original image) to the cropped nnU-Net internal space.
         lbs_transformed = [round(i) for i in transform_coordinates_noresampling([i[0] for i in bbox_coords],
                                                              self.preprocessed_props['bbox_used_for_cropping'])]
         ubs_transformed = [round(i) for i in transform_coordinates_noresampling([i[1] for i in bbox_coords],
@@ -558,7 +589,7 @@ class nnInteractiveInferenceSession():
                   f'Transformed: {transformed_bbox_coordinates}\n'
                   f"Crop Bbox: {self.preprocessed_props['bbox_used_for_cropping']}")
 
-        # Prevent collapsed bounding boxes and clip to image shape
+        # Clip bbox to valid interaction volume and guarantee at least one voxel extent per axis.
         image_shape = self.preprocessed_image.shape  # Assuming shape is (C, H, W, D) or similar
 
         for dim in range(len(transformed_bbox_coordinates)):
@@ -594,7 +625,6 @@ class nnInteractiveInferenceSession():
         channel = bbox_pos_channel if include_interaction else bbox_neg_channel
         self.interactions[(channel, *slicer)] = self.current_interaction_intensity
 
-        # forward pass
         if run_prediction:
             self._predict()
 
@@ -653,6 +683,8 @@ class nnInteractiveInferenceSession():
         self._prepare_new_interaction_intensity()
 
         interaction_shape = self.interactions.shape[1:]
+        # Map possibly out-of-bounds transformed bbox to overlapping source/target slices so we only
+        # materialize and write the intersecting subregion.
         clipped_lb = [max(0, lb) for lb in lbs_internal]
         clipped_ub = [min(ub, s) for ub, s in zip(ubs_internal, interaction_shape)]
         src_lb = [cl - lb for cl, lb in zip(clipped_lb, lbs_internal)]
@@ -676,25 +708,32 @@ class nnInteractiveInferenceSession():
         if run_prediction:
             self._predict()
 
+    def _add_mask_interaction(self, interaction_name: str, mask_image: np.ndarray, include_interaction: bool,
+                              run_prediction: bool, override_capability_checks: bool,
+                              interaction_bbox: Optional[List[List[int]]]) -> None:
+        if self.verbose:
+            print(f'Add new {interaction_name} of shape {mask_image.shape} and bbox {interaction_bbox}')
+        self._check_capability_or_warn(interaction_name, override_capability_checks)
+        pos_channel, neg_channel = self._resolve_channel_pair(interaction_name, override_capability_checks)
+        self._add_image_interaction(
+            mask_image,
+            pos_channel if include_interaction else neg_channel,
+            run_prediction,
+            interaction_bbox,
+            self._generic_add_patch_from_image,
+        )
+
     def add_scribble_interaction(self, scribble_image: np.ndarray, include_interaction: bool, run_prediction: bool = True,
                                  override_capability_checks: bool = False,
                                  interaction_bbox: Optional[List[List[int]]] = None):
-        if True: #self.verbose:
-            print(f'Add new scribble of shape {scribble_image.shape} and bbox {interaction_bbox}')
-        self._check_capability_or_warn('scribble', override_capability_checks)
-        pos_channel, neg_channel = self._resolve_channel_pair('scribble', override_capability_checks)
-        self._add_image_interaction(scribble_image, pos_channel if include_interaction else neg_channel,
-                                    run_prediction, interaction_bbox, self._add_patch_for_scribble_interaction)
+        self._add_mask_interaction('scribble', scribble_image, include_interaction,
+                                   run_prediction, override_capability_checks, interaction_bbox)
 
     def add_lasso_interaction(self, lasso_image: np.ndarray, include_interaction: bool, run_prediction: bool = True,
                               override_capability_checks: bool = False,
                               interaction_bbox: Optional[List[List[int]]] = None):
-        if True: #self.verbose:
-            print(f'Add new lasso of shape {lasso_image.shape} and bbox {interaction_bbox}')
-        self._check_capability_or_warn('lasso', override_capability_checks)
-        pos_channel, neg_channel = self._resolve_channel_pair('lasso', override_capability_checks)
-        self._add_image_interaction(lasso_image, pos_channel if include_interaction else neg_channel,
-                                    run_prediction, interaction_bbox, self._add_patch_for_lasso_interaction)
+        self._add_mask_interaction('lasso', lasso_image, include_interaction,
+                                   run_prediction, override_capability_checks, interaction_bbox)
 
     def add_initial_seg_interaction(self, initial_seg: np.ndarray, run_prediction: bool = False,
                                     override_capability_checks: bool = False):
@@ -825,7 +864,11 @@ class nnInteractiveInferenceSession():
                     paste_tensor(self.interactions[prev_seg_channel], pred.half(), scaled_bbox)
                 bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                         zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-                paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
+                if isinstance(self.target_buffer, torch.Tensor):
+                    pred_for_target = pred.to(self.target_buffer.device)
+                else:
+                    pred_for_target = pred.to('cpu')
+                paste_tensor(self.target_buffer, pred_for_target, bbox)
                 print('No refinement necessary')
             else:
                 # do refinement
@@ -855,6 +898,7 @@ class nnInteractiveInferenceSession():
                     print('Forcing full refinement of entire structure')
                     if self.use_in_mem_compression:
                         chunk_depth = 64
+                        # Iterate depth-wise chunks to avoid decompressing the full prev_seg channel at once.
                         for d0 in range(0, self.interactions.shape[1], chunk_depth):
                             d1 = min(self.interactions.shape[1], d0 + chunk_depth)
                             ch0_chunk = torch.from_numpy(np.asarray(
@@ -912,7 +956,8 @@ class nnInteractiveInferenceSession():
 
             del tmp
 
-            # crop_img is already on device
+            # Keep image and interaction tensors in identical spatial frames before concatenation.
+            # Interactions use area downsampling (with selective dilation beforehand), image uses trilinear.
             crop_img = interpolate(
                 pad_cropped(crop_img, pad_image)[None] if any([x for y in pad_interaction for x in y]) else crop_img[
                     None], self.configuration_manager.patch_size, mode='trilinear')[0]
@@ -939,12 +984,12 @@ class nnInteractiveInferenceSession():
             # Only do bbox->pseudo-lasso masking if lasso is available, and only on channels that are shared
             # between bbox positive channels and the positive lasso channel.
             if self.supported_interactions.get('lasso', False) and 'lasso' in self.channel_mapping:
-                lasso_positive_channel, _ = self._parse_channel_pair('lasso', self.channel_mapping['lasso'])
+                lasso_positive_channel, _ = parse_channel_pair('lasso', self.channel_mapping['lasso'])
                 positive_bbox_channels = set()
                 for bbox_key in ('bbox2d', 'bbox3d'):
                     if bbox_key not in self.channel_mapping:
                         continue
-                    pos_ch, _ = self._parse_channel_pair(bbox_key, self.channel_mapping[bbox_key])
+                    pos_ch, _ = parse_channel_pair(bbox_key, self.channel_mapping[bbox_key])
                     positive_bbox_channels.add(pos_ch)
 
                 for ch in positive_bbox_channels.intersection({lasso_positive_channel}):
@@ -971,12 +1016,10 @@ class nnInteractiveInferenceSession():
                                          dtype=torch.float)
         for nref, refinement_bbox in enumerate(bboxes_ordered):
             assert self.pad_mode_data == 'constant'
+            # Reuse one preallocated tensor per refinement step to keep allocations/VRAM churn low.
             crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
-            if self.use_in_mem_compression:
-                # Keep interaction channel order identical to self.interactions regardless of channel mapping.
-                crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
-            else:
-                crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
+            # Keep interaction channel order identical to self.interactions regardless of storage backend.
+            crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
             self._normalize_interaction_channels_for_network_(preallocated_input[1:])
 
             pred = self.network(preallocated_input[None])[0].argmax(0).detach()
@@ -985,10 +1028,13 @@ class nnInteractiveInferenceSession():
                 paste_tensor(self.interactions, pred, refinement_bbox, channel_idx=prev_seg_channel)
             else:
                 paste_tensor(self.interactions[prev_seg_channel], pred, refinement_bbox)
-            # place into target buffer
             bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
                     zip(refinement_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-            paste_tensor(self.target_buffer, pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'), bbox)
+            if isinstance(self.target_buffer, torch.Tensor):
+                pred_for_target = pred.to(self.target_buffer.device)
+            else:
+                pred_for_target = pred.to('cpu')
+            paste_tensor(self.target_buffer, pred_for_target, bbox)
             del pred
             preallocated_input.zero_()
         del preallocated_input
@@ -1058,6 +1104,8 @@ class nnInteractiveInferenceSession():
             seen_bbox = [[max(0, i[0]), min(i[1], s)]
                          for i, s in zip(scaled_bbox, previous_prediction.shape)]
 
+        # bbox_tmp remaps the visible region (seen_bbox in interaction space) into coordinates of the
+        # local patch prediction tensor `pred`.
         bbox_tmp = [[i[0] - s[0], i[1] - s[0]] for i, s in zip(seen_bbox, scaled_bbox)]
         bbox_tmp = [[max(0, i[0]), min(i[1], s)] for i, s in zip(bbox_tmp, scaled_patch_size)]
         slicer = bounding_box_to_slice(seen_bbox)
@@ -1098,12 +1146,6 @@ class nnInteractiveInferenceSession():
         self.new_interaction_centers.append(bbox_center)
         print(f'Added new bbox interaction: center {self.new_interaction_zoom_out_factors[-1]}, scale {self.new_interaction_centers}')
 
-    def _add_patch_for_scribble_interaction(self, scribble_image, offset=None):
-        return self._generic_add_patch_from_image(scribble_image, offset=offset)
-
-    def _add_patch_for_lasso_interaction(self, lasso_image, offset=None):
-        return self._generic_add_patch_from_image(lasso_image, offset=offset)
-
     def _add_patch_for_initial_seg_interaction(self, initial_seg):
         return self._generic_add_patch_from_image(initial_seg)
 
@@ -1130,45 +1172,12 @@ class nnInteractiveInferenceSession():
         """
         This is used when making predictions with a trained model
         """
-        capability_file = join(model_training_output_dir, 'inference_info.json')
-        legacy_file = join(model_training_output_dir, 'inference_session_class.json')
-
-        point_interaction_radius = 4
         point_interaction_use_etd = True
-        self.preferred_scribble_thickness = [2, 2, 2]
-        self.pad_mode_data = "constant"
-        self.interaction_decay = 0.98
-        capability_content = {}
-
-        if isfile(capability_file):
-            capability_content = load_json(capability_file)
-            if not isinstance(capability_content, dict):
-                raise RuntimeError(f"Invalid capability metadata in {capability_file}. Expected a JSON object.")
-            self._validate_capability_version(capability_content)
-            point_interaction_radius = capability_content.get('point_radius', point_interaction_radius)
-            self.preferred_scribble_thickness = capability_content.get(
-                'preferred_scribble_thickness', self.preferred_scribble_thickness
-            )
-            self.interaction_decay = capability_content.get('interaction_decay', self.interaction_decay)
-            self.pad_mode_data = capability_content.get('pad_mode_image', self.pad_mode_data)
-        elif isfile(legacy_file):
-            legacy_content = load_json(legacy_file)
-            if isinstance(legacy_content, str):
-                self.interaction_decay = 0.9
-            else:
-                point_interaction_radius = legacy_content.get('point_radius', point_interaction_radius)
-                self.preferred_scribble_thickness = legacy_content.get(
-                    'preferred_scribble_thickness', self.preferred_scribble_thickness
-                )
-                self.interaction_decay = legacy_content.get('interaction_decay', self.interaction_decay)
-                self.pad_mode_data = legacy_content.get('pad_mode_image', self.pad_mode_data)
-        else:
-            raise FileNotFoundError(
-                f"Neither capability metadata ({capability_file}) nor legacy metadata ({legacy_file}) was found."
-            )
-
-        if not isinstance(self.preferred_scribble_thickness, (tuple, list)):
-            self.preferred_scribble_thickness = [self.preferred_scribble_thickness] * 3
+        (capability_content,
+         point_interaction_radius,
+         self.preferred_scribble_thickness,
+         self.interaction_decay,
+         self.pad_mode_data) = self._load_capability_and_runtime_defaults(model_training_output_dir)
 
         self.point_interaction = PointInteraction_stub(point_interaction_radius, point_interaction_use_etd)
         self._apply_capability(capability_content)
@@ -1250,18 +1259,6 @@ class nnInteractiveInferenceSession():
             self.network = self.network._orig_mod
 
         self.network = self.network.to(self.device)
-
-
-def transform_coordinates_noresampling(
-        coords_orig: Union[List[int], Tuple[int, ...]],
-        nnunet_preprocessing_crop_bbox: List[Tuple[int, int]]
-) -> Tuple[int, ...]:
-    """
-    converts coordinates in the original uncropped image to the internal cropped representation. Man I really hate
-    nnU-Net's crop to nonzero!
-    """
-    return tuple([coords_orig[d] - nnunet_preprocessing_crop_bbox[d][0] for d in range(len(coords_orig))])
-
 
 if __name__ == '__main__':
     a = torch.zeros((160, 160, 160), device='cpu')
