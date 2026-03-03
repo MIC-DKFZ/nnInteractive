@@ -56,6 +56,7 @@ class nnInteractiveInferenceSession():
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
         """
+        print('session initialized')
         if use_in_mem_compression:
             if not _BLOSC2_AVAILABLE:
                 raise ImportError(
@@ -495,9 +496,10 @@ class nnInteractiveInferenceSession():
                 pin_memory=use_pinned
             )
 
+    @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
-        image = torch.from_numpy(image.copy())#.to(self.device)
+        image = torch.from_numpy(image).to(self.device)
 
         # Crop to nonzero region.
         if self.verbose:
@@ -520,7 +522,7 @@ class nnInteractiveInferenceSession():
         image -= image.mean()
         image /= image.std()
 
-        self.preprocessed_image = image
+        self.preprocessed_image = image.to('cpu')
 
         self.preprocessed_props = {'bbox_used_for_cropping': bbox[1:]}
 
