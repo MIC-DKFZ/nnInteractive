@@ -504,10 +504,27 @@ class nnInteractiveInferenceSession():
         # Crop to nonzero region.
         if self.verbose:
             print('Cropping input image to nonzero region')
-        nonzero_idx = torch.where(image != 0)
-        # Create bounding box: for each dimension, get the min and max (plus one) of the nonzero indices.
-        bbox = [[i.min().item(), i.max().item() + 1] for i in nonzero_idx]
-        del nonzero_idx
+        # torch.where eats RAM / VRAM for breakfast. Avoid!!!
+        # nonzero_idx = torch.where(image != 0)
+        # # Create bounding box: for each dimension, get the min and max (plus one) of the nonzero indices.
+        # bbox = [[i.min().item(), i.max().item() + 1] for i in nonzero_idx]
+        # del nonzero_idx
+        # instead we sum dimensions
+        s_x = image.sum(axis=(2, 3), dtype=torch.float)[0]
+        wh_x = torch.where(s_x != 0)[0]
+        bbox_x = [wh_x.min().item(), wh_x.max().item() + 1]
+        del s_x, wh_x
+        s_y = image.sum(axis=(1, 3), dtype=torch.float)[0]
+        wh_y = torch.where(s_y != 0)[0]
+        bbox_y = [wh_y.min().item(), wh_y.max().item() + 1]
+        del s_y, wh_y
+        s_z = image.sum(axis=(1, 2), dtype=torch.float)[0]
+        wh_z = torch.where(s_z != 0)[0]
+        bbox_z = [wh_z.min().item(), wh_z.max().item() + 1]
+        del s_z, wh_z
+        bbox = [[0, 1], bbox_x, bbox_y, bbox_z]
+        empty_cache(self.device)
+
         slicer = bounding_box_to_slice(bbox)  # Assuming this returns a tuple of slices.
         image = image[slicer].float()
         if self.verbose:
