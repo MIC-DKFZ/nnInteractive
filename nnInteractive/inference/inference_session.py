@@ -1228,7 +1228,7 @@ class nnInteractiveInferenceSession():
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
-        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
+        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json) + self.num_interaction_channels
         trainer_class = recursive_find_python_class(join(nnInteractive.__path__[0], "trainer"),
                                                     trainer_name, 'nnInteractive.trainer')
         if trainer_class is None:
@@ -1278,6 +1278,11 @@ class nnInteractiveInferenceSession():
             self.network = self.network._orig_mod
 
         self.network = self.network.to(self.device)
+
+    def __del__(self):
+        self._finish_preprocessing_and_initialize_interactions()
+        self.executor.shutdown()
+
 
 if __name__ == '__main__':
     a = torch.zeros((160, 160, 160), device='cpu')

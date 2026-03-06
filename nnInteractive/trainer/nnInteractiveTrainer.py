@@ -19,7 +19,7 @@ class nnInteractiveTrainer_stub():
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
-            num_input_channels + 7,
+            num_input_channels,
             2,  # nnunet handles one class segmentation still as CE so we need 2 outputs.
             enable_deep_supervision
         )
