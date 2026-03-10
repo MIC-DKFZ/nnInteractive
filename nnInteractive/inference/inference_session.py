@@ -87,7 +87,7 @@ class nnInteractiveInferenceSession():
         self._fp16_max_value = float(torch.finfo(torch.float16).max)
         # Keep renormalized interaction magnitudes around 1/10 of fp16 max to preserve headroom.
         self._interaction_renorm_target = self._fp16_max_value / 10
-        self.num_interaction_channels: int = 7
+        self.num_interaction_channels: int = None
         self.supported_interactions: dict = {}
         self.channel_mapping: dict = {}
         self.supports_initial_label: bool = True
@@ -948,50 +948,57 @@ class nnInteractiveInferenceSession():
 
         # cropping happens on CPU, padding happens on GPU (later)
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
-        crop_interactions, pad_interaction = crop_to_valid(self.interactions, scaled_bbox)
-        crop_img = crop_img.to(self.device, non_blocking=True)
-        # For blosc2, crop_to_valid returns a numpy array; convert to torch first.
-        if not isinstance(crop_interactions, torch.Tensor):
-            crop_interactions = torch.from_numpy(np.asarray(crop_interactions))
-        crop_interactions = crop_interactions.to(self.device, non_blocking=True)
+        interactions_tensor, pad_interaction = crop_to_valid(self.interactions, scaled_bbox)
+        # For blosc2, crop_to_valid returns a numpy array; convert to torch (still on CPU).
+        if not isinstance(interactions_tensor, torch.Tensor):
+            interactions_tensor = torch.from_numpy(np.asarray(interactions_tensor))
 
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
         if not all([i == j for i, j in zip(self.configuration_manager.patch_size, scaled_patch_size)]):
-            if any([x for y in pad_interaction for x in y]):
-                tmp = pad_cropped(crop_interactions, pad_interaction)
-            else:
-                tmp = crop_interactions
-            del crop_interactions
-
+            patch_size = self.configuration_manager.patch_size
             max_pool_ks = round_to_nearest_odd(zoom_out_factor * 2 - 1)
-            # point+, point-, scribble+, scribble-
-            if max_pool_ks > 1:
-                # dilate to preserve interactions after downsampling
-                for i in self._get_dilation_channels_for_resample():
-                    if 0 <= i < tmp.shape[0]:
-                        tmp[i:i+1] = iterative_3x3_same_padding_pool3d(tmp[None, i:i+1], max_pool_ks)[0]
-            crop_interactions_resampled_gpu = interpolate(tmp[None], self.configuration_manager.patch_size, mode='area')[0]
+            dilation_channels = set(self._get_dilation_channels_for_resample()) if max_pool_ks > 1 else set()
+            needs_pad_interaction = any(x for pair in pad_interaction for x in pair)
 
-            del tmp
+            # Process interaction channels one at a time to avoid materialising the full
+            # [num_ch, scaled_patch_size³] tensor on GPU. Peak VRAM ≈ one channel at scaled size.
+            num_interaction_ch = interactions_tensor.shape[0]
+            interactions_out = torch.empty(
+                [num_interaction_ch, *patch_size],
+                dtype=interactions_tensor.dtype, device=self.device
+            )
+            for i in range(num_interaction_ch):
+                ch = interactions_tensor[i:i+1].to(self.device, non_blocking=True)
+                if needs_pad_interaction:
+                    ch = pad_cropped(ch, pad_interaction)
+                if i in dilation_channels:
+                    ch = iterative_3x3_same_padding_pool3d(ch[None], max_pool_ks)[0]
+                interactions_out[i:i+1] = interpolate(ch[None], patch_size, mode='area')[0]
+                del ch
+            del interactions_tensor
+            interactions_tensor = interactions_out
 
             # Keep image and interaction tensors in identical spatial frames before concatenation.
             # Interactions use area downsampling (with selective dilation beforehand), image uses trilinear.
-            crop_img = interpolate(
-                pad_cropped(crop_img, pad_image)[None] if any([x for y in pad_interaction for x in y]) else crop_img[
-                    None], self.configuration_manager.patch_size, mode='trilinear')[0]
-            crop_interactions = crop_interactions_resampled_gpu
+            crop_img = crop_img.to(self.device, non_blocking=True)
+            if any(x for pair in pad_image for x in pair):
+                crop_img = pad_cropped(crop_img, pad_image)
+            crop_img = interpolate(crop_img[None], patch_size, mode='trilinear')[0]
 
-            del crop_interactions_resampled_gpu
             empty_cache(self.device)
         else:
-            # crop_img is already on device
-            crop_img = pad_cropped(crop_img, pad_image) if any([x for y in pad_interaction for x in y]) else crop_img
-            crop_interactions = pad_cropped(crop_interactions, pad_interaction) if any([x for y in pad_interaction for x in y]) else crop_interactions
+            # zoom_out_factor == 1: transfer both tensors to GPU, then pad if needed
+            crop_img = crop_img.to(self.device, non_blocking=True)
+            interactions_tensor = interactions_tensor.to(self.device, non_blocking=True)
+            if any(x for pair in pad_image for x in pair):
+                crop_img = pad_cropped(crop_img, pad_image)
+            if any(x for pair in pad_interaction for x in pair):
+                interactions_tensor = pad_cropped(interactions_tensor, pad_interaction)
 
-        self._normalize_interaction_channels_for_network_(crop_interactions)
-        input_for_predict = torch.cat((crop_img, crop_interactions))
-        del crop_img, crop_interactions
+        self._normalize_interaction_channels_for_network_(interactions_tensor)
+        input_for_predict = torch.cat((crop_img, interactions_tensor))
+        del crop_img, interactions_tensor
         empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox
 
