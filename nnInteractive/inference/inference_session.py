@@ -1310,7 +1310,7 @@ class nnInteractiveInferenceSession():
             self._mark_prev_seg_in_local_diff(diff_local, planning_bbox)
 
         local_bboxes = generate_bounding_boxes(
-            diff_local, self.configuration_manager.patch_size, stride='auto', margin=(10, 10, 10), max_depth=3
+            diff_local, self.configuration_manager.patch_size, stride='auto', margin=(24, 24, 24), max_depth=3
         )
         del diff_local
         empty_cache(self.device)

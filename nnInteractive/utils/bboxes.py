@@ -128,9 +128,9 @@ def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[
 
     # Step 5: Recursively cover remaining voxels using uncovered as the mask
     if uncovered.any():
-        if uncovered.sum() < np.prod([i // 3 for i in bbox_size]):
+        if True: #uncovered.sum() < np.prod([i // 3 for i in bbox_size]):
             # print('random fallback')
-            bboxes.extend(random_sampling_fallback(uncovered, bbox_size, margin, 25))
+            bboxes.extend(random_sampling_fallback(uncovered, bbox_size, margin, 10))
         else:
             remaining_bboxes = generate_bounding_boxes(
                 uncovered, bbox_size, [max(1, s // 2) for s in stride], margin, max_depth, current_depth + 1
