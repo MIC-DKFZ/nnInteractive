@@ -112,7 +112,7 @@ class nnInteractiveInferenceSession():
 
         self.new_interaction_zoom_out_factors: List[float] = []
         self.new_interaction_centers = []
-        self.has_positive_bbox = False
+        self._pending_positive_bbox_pseudo_lasso_bboxes: List[List[List[int]]] = []
 
         # Create a thread pool executor for background tasks.
         # this only takes care of preprocessing and interaction memory initialization so there is no need to give it
@@ -257,22 +257,42 @@ class nnInteractiveInferenceSession():
             torch.maximum(self.interactions[channel_idx][int_slicer], new_values,
                           out=self.interactions[channel_idx][int_slicer])
 
-    def _mask_interaction_channel_with_prediction(self, ch: int, prediction_with_coarse) -> None:
-        """Zero out channel ch where prediction_with_coarse <= 0.5."""
+    def _mask_interaction_channel_with_prev_seg(self, ch: int, bbox: List[List[int]]) -> None:
+        """Zero out channel ch inside bbox where the current prev_seg channel is <= 0.5."""
+        prev_seg_ch = self._get_prev_seg_channel()
+        int_slicer = tuple(slice(*i) for i in bbox)
         if self.use_in_mem_compression:
-            prev_seg_ch = self._get_prev_seg_channel()
-            if prediction_with_coarse is None:
-                # Read from blosc2 directly when no numpy copy is available.
-                mask = np.asarray(self.interactions[prev_seg_ch]) > 0.5
-            elif isinstance(prediction_with_coarse, torch.Tensor):
-                mask = prediction_with_coarse.numpy() > 0.5
-            else:
-                mask = np.asarray(prediction_with_coarse) > 0.5
-            ch_data = np.asarray(self.interactions[ch])
+            mask = np.asarray(self.interactions[(prev_seg_ch, *int_slicer)]) > 0.5
+            ch_data = np.asarray(self.interactions[(ch, *int_slicer)])
             ch_data[~mask] = 0
-            self.interactions[ch] = ch_data.astype(np.float16)
+            self.interactions[(ch, *int_slicer)] = ch_data.astype(np.float16)
         else:
-            self.interactions[ch][(~(prediction_with_coarse > 0.5))] = 0
+            self.interactions[(ch, *int_slicer)][~(self.interactions[(prev_seg_ch, *int_slicer)] > 0.5)] = 0
+
+    def _apply_pending_positive_bbox_pseudo_lasso_mask(self) -> None:
+        """Convert a pending positive bbox into a pseudo-lasso constrained by the current prev_seg."""
+        if len(self._pending_positive_bbox_pseudo_lasso_bboxes) == 0:
+            return
+
+        try:
+            # Only do bbox->pseudo-lasso masking if lasso is available, and only on channels that are shared
+            # between bbox positive channels and the positive lasso channel.
+            if not self.supported_interactions.get('lasso', False) or 'lasso' not in self.channel_mapping:
+                return
+
+            lasso_positive_channel, _ = parse_channel_pair('lasso', self.channel_mapping['lasso'])
+            positive_bbox_channels = set()
+            for bbox_key in ('bbox2d', 'bbox3d'):
+                if bbox_key not in self.channel_mapping:
+                    continue
+                pos_ch, _ = parse_channel_pair(bbox_key, self.channel_mapping[bbox_key])
+                positive_bbox_channels.add(pos_ch)
+
+            for bbox in self._pending_positive_bbox_pseudo_lasso_bboxes:
+                for ch in positive_bbox_channels.intersection({lasso_positive_channel}):
+                    self._mask_interaction_channel_with_prev_seg(ch, bbox)
+        finally:
+            self._pending_positive_bbox_pseudo_lasso_bboxes = []
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
@@ -468,7 +488,7 @@ class nnInteractiveInferenceSession():
         self.current_interaction_intensity = 1.0
         empty_cache(self.device)
         self.original_image_shape = None
-        self.has_positive_bbox = False
+        self._pending_positive_bbox_pseudo_lasso_bboxes = []
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
         shape = (self.num_interaction_channels, *image_torch.shape[1:])
@@ -510,15 +530,15 @@ class nnInteractiveInferenceSession():
         # bbox = [[i.min().item(), i.max().item() + 1] for i in nonzero_idx]
         # del nonzero_idx
         # instead we sum dimensions
-        s_x = image.sum(axis=(2, 3), dtype=torch.float)[0]
+        s_x = image.sum(axis=(0, 2, 3), dtype=torch.float)
         wh_x = torch.where(s_x != 0)[0]
         bbox_x = [wh_x.min().item(), wh_x.max().item() + 1]
         del s_x, wh_x
-        s_y = image.sum(axis=(1, 3), dtype=torch.float)[0]
+        s_y = image.sum(axis=(0, 1, 3), dtype=torch.float)
         wh_y = torch.where(s_y != 0)[0]
         bbox_y = [wh_y.min().item(), wh_y.max().item() + 1]
         del s_y, wh_y
-        s_z = image.sum(axis=(1, 2), dtype=torch.float)[0]
+        s_z = image.sum(axis=(0, 1, 2), dtype=torch.float)
         wh_z = torch.where(s_z != 0)[0]
         bbox_z = [wh_z.min().item(), wh_z.max().item() + 1]
         del s_z, wh_z
@@ -573,7 +593,7 @@ class nnInteractiveInferenceSession():
             elif isinstance(self.target_buffer, torch.Tensor):
                 self.target_buffer.zero_()
         empty_cache(self.device)
-        self.has_positive_bbox = False
+        self._pending_positive_bbox_pseudo_lasso_bboxes = []
 
     def add_bbox_interaction(self, bbox_coords, include_interaction: bool, run_prediction: bool = True,
                              override_capability_checks: bool = False):
@@ -633,7 +653,9 @@ class nnInteractiveInferenceSession():
                   f'Internal image shape: {self.preprocessed_image.shape}')
 
         if include_interaction:
-            self.has_positive_bbox = True
+            self._pending_positive_bbox_pseudo_lasso_bboxes.append(
+                [coords.copy() for coords in transformed_bbox_coordinates]
+            )
 
         self._add_patch_for_bbox_interaction(transformed_bbox_coordinates)
 
@@ -832,14 +854,15 @@ class nnInteractiveInferenceSession():
             del input_for_predict
 
             # detect changes at border. If there are, we enter autozoom
-            previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox)
+            previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox).to(self.device)
 
             if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
                 previous_prediction = \
-                interpolate(previous_prediction[None, None].to(float), pred.shape, mode='nearest')[0, 0]
+                interpolate(previous_prediction[None, None], pred.shape, mode='nearest')[0, 0]
 
             has_change = self._detect_change_at_border(pred, previous_prediction)
             del previous_prediction
+            empty_cache(self.device)
 
             print(f'Took {round(time() - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}')
 
@@ -858,15 +881,17 @@ class nnInteractiveInferenceSession():
                 input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
                 pred = self.network(input_for_predict[None])[0].argmax(0).detach()
                 del input_for_predict
+                empty_cache(self.device)
 
                 # detect changes at border. If there are, we enter autozoom
-                previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox)
+                previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox).to(self.device)
 
                 if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
                     previous_prediction_resized = \
-                    interpolate(previous_prediction[None, None].to(float), pred.shape, mode='nearest')[0, 0]
+                    interpolate(previous_prediction[None, None], pred.shape, mode='nearest')[0, 0]
                 else:
                     previous_prediction_resized = previous_prediction
+                del previous_prediction
 
                 has_change = self._detect_change_at_border(pred, previous_prediction_resized)
 
@@ -876,7 +901,7 @@ class nnInteractiveInferenceSession():
                 print('No zoom out necessary')
 
             if zoom_out_factor == 1:
-                # simply place pred in self.interactions[0] and target buffer
+                # simply place pred in the prev_seg channel and target buffer
                 if self.use_in_mem_compression:
                     paste_tensor(self.interactions, pred.half(), scaled_bbox, channel_idx=prev_seg_channel)
                 else:
@@ -888,25 +913,17 @@ class nnInteractiveInferenceSession():
                 else:
                     pred_for_target = pred.to('cpu')
                 paste_tensor(self.target_buffer, pred_for_target, bbox)
+                self._apply_pending_positive_bbox_pseudo_lasso_mask()
                 print('No refinement necessary')
             else:
                 # do refinement
-
-                # we need to resize the prediction to the correct shape and place it in a copy of self.interactions[0]
-                # we don't want to place it into self.interactions[0] because we will update self.interactions[0] as
-                # part of the refinement. Updating it could cause areas that are not refined to become coarse.
-                # For blosc2: prediction_with_coarse is set to None here; it will be read from blosc2 in
-                # _refine_coarse as needed (bbox masking reads from blosc2 directly when None).
-                if self.use_in_mem_compression:
-                    prediction_with_coarse = None
-                else:
-                    prediction_with_coarse = self.interactions[prev_seg_channel]
 
                 if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
                     pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[
                                 0, 0] >= 0.5).to(torch.uint8)
 
                 # compute the difference map
+                # diff_map has the same shape as the image and is located on self.device. This seems wasteful.
                 diff_map = self._compute_diff_map(
                     pred,
                     None if self.use_in_mem_compression else self.interactions[prev_seg_channel],
@@ -926,15 +943,15 @@ class nnInteractiveInferenceSession():
                     else:
                         diff_map[self.interactions[prev_seg_channel] > 0] = 1
 
-                # place resized coarse segmentation into interactions channel 0. Needed for network input
+                # Place the coarse segmentation into prev_seg before masking/refinement so follow-up
+                # network inputs see the same state regardless of backend.
                 if self.use_in_mem_compression:
                     paste_tensor(self.interactions, pred, scaled_bbox, channel_idx=prev_seg_channel)
                 else:
-                    paste_tensor(prediction_with_coarse, pred, scaled_bbox)
+                    paste_tensor(self.interactions[prev_seg_channel], pred, scaled_bbox)
 
-                self._refine_coarse(diff_map, prediction_with_coarse)
-
-                del prediction_with_coarse
+                self._apply_pending_positive_bbox_pseudo_lasso_mask()
+                self._refine_coarse(diff_map)
 
         print(f'Done. Total time {round(time() - start_predict, 3)}s')
 
@@ -1002,25 +1019,9 @@ class nnInteractiveInferenceSession():
         empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox
 
-    def _refine_coarse(self, diff_map, prediction_with_coarse):
+    def _refine_coarse(self, diff_map):
         start_refinement = time()
         prev_seg_channel = self._get_prev_seg_channel()
-
-        if self.has_positive_bbox:
-            # Only do bbox->pseudo-lasso masking if lasso is available, and only on channels that are shared
-            # between bbox positive channels and the positive lasso channel.
-            if self.supported_interactions.get('lasso', False) and 'lasso' in self.channel_mapping:
-                lasso_positive_channel, _ = parse_channel_pair('lasso', self.channel_mapping['lasso'])
-                positive_bbox_channels = set()
-                for bbox_key in ('bbox2d', 'bbox3d'):
-                    if bbox_key not in self.channel_mapping:
-                        continue
-                    pos_ch, _ = parse_channel_pair(bbox_key, self.channel_mapping[bbox_key])
-                    positive_bbox_channels.add(pos_ch)
-
-                for ch in positive_bbox_channels.intersection({lasso_positive_channel}):
-                    self._mask_interaction_channel_with_prediction(ch, prediction_with_coarse)
-            self.has_positive_bbox = False
 
         bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
                                                  margin=(10, 10, 10), max_depth=3)
@@ -1080,8 +1081,8 @@ class nnInteractiveInferenceSession():
             if has_change:
                 break
             for idx in [0, pred.shape[dim] - 1]:
-                slice_prev = prev_pred.index_select(dim, torch.tensor(idx, device='cpu'))
-                slice_curr = pred.index_select(dim, torch.tensor(idx, device=self.device)).to('cpu')
+                slice_prev = prev_pred.index_select(dim, torch.tensor(idx, device=prev_pred.device))
+                slice_curr = pred.index_select(dim, torch.tensor(idx, device=self.device)).to(prev_pred.device)
                 pixels_prev = torch.sum(slice_prev)
                 pixels_current = torch.sum(slice_curr)
                 pixels_diff = torch.sum(slice_prev != slice_curr)
@@ -1138,9 +1139,7 @@ class nnInteractiveInferenceSession():
         slicer2 = bounding_box_to_slice(bbox_tmp)
 
         if self.use_in_mem_compression:
-            prev_sub = torch.from_numpy(np.asarray(
-                self.interactions[(prev_seg_ch, *[slice(sb[0], sb[1]) for sb in seen_bbox])]
-            )).to(self.device)
+            prev_sub = torch.from_numpy(self.interactions[(prev_seg_ch, *[slice(sb[0], sb[1]) for sb in seen_bbox])]).to(self.device)
             diff = pred[slicer2] != prev_sub
             diff_map = torch.zeros(interactions_shape, device=self.device, dtype=torch.float16)
         else:
