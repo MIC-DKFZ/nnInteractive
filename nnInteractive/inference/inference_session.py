@@ -173,6 +173,77 @@ class nnInteractiveInferenceSession():
     def _get_prev_seg_channel(self) -> int:
         return int(self.channel_mapping['prev_seg'])
 
+    @staticmethod
+    def _clip_bbox_to_shape(bbox: List[List[int]], spatial_shape: Tuple[int, ...]) -> Optional[List[List[int]]]:
+        clipped = [[max(0, int(lb)), min(int(ub), int(s))] for (lb, ub), s in zip(bbox, spatial_shape)]
+        if any(ub <= lb for lb, ub in clipped):
+            return None
+        return clipped
+
+    @staticmethod
+    def _bbox_size(bbox: List[List[int]]) -> List[int]:
+        return [int(ub - lb) for lb, ub in bbox]
+
+    @staticmethod
+    def _union_bboxes(*bboxes: Optional[List[List[int]]]) -> Optional[List[List[int]]]:
+        valid_bboxes = [bbox for bbox in bboxes if bbox is not None]
+        if len(valid_bboxes) == 0:
+            return None
+        return [
+            [min(bbox[dim][0] for bbox in valid_bboxes), max(bbox[dim][1] for bbox in valid_bboxes)]
+            for dim in range(len(valid_bboxes[0]))
+        ]
+
+    @staticmethod
+    def _offset_bboxes(local_bboxes: List[List[List[int]]], offset_bbox: List[List[int]]) -> List[List[List[int]]]:
+        return [
+            [[lb + offset_bbox[dim][0], ub + offset_bbox[dim][0]] for dim, (lb, ub) in enumerate(bbox)]
+            for bbox in local_bboxes
+        ]
+
+    def _compute_prev_seg_positive_bbox(self) -> Optional[List[List[int]]]:
+        prev_seg_ch = self._get_prev_seg_channel()
+        spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
+
+        if self.use_in_mem_compression:
+            occupancy_x = np.zeros(spatial_shape[0], dtype=bool)
+            occupancy_y = np.zeros(spatial_shape[1], dtype=bool)
+            occupancy_z = np.zeros(spatial_shape[2], dtype=bool)
+            chunk_depth = 64
+            for d0 in range(0, spatial_shape[0], chunk_depth):
+                d1 = min(spatial_shape[0], d0 + chunk_depth)
+                slab = np.asarray(
+                    self.interactions[(prev_seg_ch, slice(d0, d1), slice(None), slice(None))]
+                ) > 0.5
+                if not slab.any():
+                    continue
+                occupancy_x[d0:d1] |= np.any(slab, axis=(1, 2))
+                occupancy_y |= np.any(slab, axis=(0, 2))
+                occupancy_z |= np.any(slab, axis=(0, 1))
+
+            occupancies = (occupancy_x, occupancy_y, occupancy_z)
+            bbox = []
+            for occ in occupancies:
+                indices = np.flatnonzero(occ)
+                if len(indices) == 0:
+                    return None
+                bbox.append([int(indices[0]), int(indices[-1]) + 1])
+            return bbox
+
+        prev_seg = self.interactions[prev_seg_ch] > 0.5
+        occupancies = (
+            prev_seg.sum(dim=(1, 2), dtype=torch.int32) != 0,
+            prev_seg.sum(dim=(0, 2), dtype=torch.int32) != 0,
+            prev_seg.sum(dim=(0, 1), dtype=torch.int32) != 0,
+        )
+        bbox = []
+        for occ in occupancies:
+            indices = torch.where(occ)[0]
+            if len(indices) == 0:
+                return None
+            bbox.append([int(indices[0].item()), int(indices[-1].item()) + 1])
+        return bbox
+
     def _get_dilation_channels_for_resample(self) -> List[int]:
         dilation_channels = set()
         # During zoom-out, point/scribble signals can disappear when area interpolation averages tiny sparse
@@ -519,7 +590,7 @@ class nnInteractiveInferenceSession():
     @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
-        image = torch.from_numpy(image).to(self.device)
+        image = torch.from_numpy(image.copy())
 
         # Crop to nonzero region.
         if self.verbose:
@@ -922,26 +993,7 @@ class nnInteractiveInferenceSession():
                     pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[
                                 0, 0] >= 0.5).to(torch.uint8)
 
-                # compute the difference map
-                # diff_map has the same shape as the image and is located on self.device. This seems wasteful.
-                diff_map = self._compute_diff_map(
-                    pred,
-                    None if self.use_in_mem_compression else self.interactions[prev_seg_channel],
-                    scaled_bbox, scaled_patch_size
-                )
-
-                if force_full_refine:
-                    print('Forcing full refinement of entire structure')
-                    if self.use_in_mem_compression:
-                        chunk_depth = 64
-                        # Iterate depth-wise chunks to avoid decompressing the full prev_seg channel at once.
-                        for d0 in range(0, self.interactions.shape[1], chunk_depth):
-                            d1 = min(self.interactions.shape[1], d0 + chunk_depth)
-                            ch0_chunk = torch.from_numpy(np.asarray(
-                                self.interactions[(prev_seg_channel, slice(d0, d1), slice(None), slice(None))]))
-                            diff_map[d0:d1][ch0_chunk > 0] = 1
-                    else:
-                        diff_map[self.interactions[prev_seg_channel] > 0] = 1
+                refinement_bboxes = self._plan_refinement_bboxes(pred, scaled_bbox, force_full_refine)
 
                 # Place the coarse segmentation into prev_seg before masking/refinement so follow-up
                 # network inputs see the same state regardless of backend.
@@ -951,7 +1003,7 @@ class nnInteractiveInferenceSession():
                     paste_tensor(self.interactions[prev_seg_channel], pred, scaled_bbox)
 
                 self._apply_pending_positive_bbox_pseudo_lasso_mask()
-                self._refine_coarse(diff_map)
+                self._refine_coarse(refinement_bboxes)
 
         print(f'Done. Total time {round(time() - start_predict, 3)}s')
 
@@ -1019,22 +1071,9 @@ class nnInteractiveInferenceSession():
         empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox
 
-    def _refine_coarse(self, diff_map):
+    def _refine_coarse(self, bboxes_ordered: List[List[List[int]]]):
         start_refinement = time()
         prev_seg_channel = self._get_prev_seg_channel()
-
-        bboxes_ordered = generate_bounding_boxes(diff_map, self.configuration_manager.patch_size, stride='auto',
-                                                 margin=(10, 10, 10), max_depth=3)
-        # if no bounding boxes are returned we basically have almost no changes. Still we should at least perform
-        # refinement in the bounding box where the interaction was as the user evidently wanted something here.
-        if len(bboxes_ordered) == 0:
-            # build one bbox around self.new_interaction_centers[-1]
-            center = self.new_interaction_centers[-1]
-            bboxes_ordered = [[[ci - pi // 2, ci - pi // 2 + pi] for ci, pi in zip(center, self.configuration_manager.patch_size)]]
-            # print('Debug: built dummy bboxes_ordered due to empty diff map')
-
-        del diff_map
-        empty_cache(self.device)
 
         if self.verbose:
             print(f'Using {len(bboxes_ordered)} bounding boxes for refinement')
@@ -1103,59 +1142,106 @@ class nnInteractiveInferenceSession():
                 del slice_prev, slice_curr, pixels_prev, pixels_current, pixels_diff
         return has_change
 
-    def _compute_diff_map(self, pred, previous_prediction, scaled_bbox, scaled_patch_size):
+    def _compute_local_diff_map(self,
+                                pred: torch.Tensor,
+                                scaled_bbox: List[List[int]],
+                                planning_bbox: List[List[int]]) -> torch.Tensor:
         """
-        pred is expected to have shape scaled_bbox, previous_prediction is expected to have shape of self.interactions
-        (or None when use_in_mem_compression=True, in which case we read from blosc2 directly).
+        Compute a local diff map inside planning_bbox only.
 
-        pred is expected to be on device already
-
-        diff map has the same shape as self.interactions[1:] (spatial dims) and will be on self.device
-
-        Args:
-            pred:
-            previous_prediction: torch.Tensor (3D, shape of interactions spatial dims) or None for blosc2.
-            scaled_bbox:
-            scaled_patch_size:
-
-        Returns:
-
+        pred is expected to be the coarse prediction resized to match scaled_bbox.
+        planning_bbox is in global interaction coordinates and may be larger than scaled_bbox when
+        force_full_refine expands the refinement planning ROI.
         """
         prev_seg_ch = self._get_prev_seg_channel()
+        spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
+        seen_bbox = self._clip_bbox_to_shape(scaled_bbox, spatial_shape)
+        planning_bbox = self._clip_bbox_to_shape(planning_bbox, spatial_shape)
+        if seen_bbox is None or planning_bbox is None:
+            return torch.zeros((0, 0, 0), device=self.device, dtype=torch.uint8)
+
+        local_shape = self._bbox_size(planning_bbox)
+        diff_local = torch.zeros(local_shape, device=self.device, dtype=torch.float16)
+
+        pred_bbox = [
+            [seen_dim[0] - scaled_dim[0], seen_dim[1] - scaled_dim[0]]
+            for seen_dim, scaled_dim in zip(seen_bbox, scaled_bbox)
+        ]
+        pred_bbox = [
+            [max(0, lb), min(ub, int(pred.shape[dim]))]
+            for dim, (lb, ub) in enumerate(pred_bbox)
+        ]
+        local_seen_bbox = [
+            [seen_dim[0] - planning_dim[0], seen_dim[1] - planning_dim[0]]
+            for seen_dim, planning_dim in zip(seen_bbox, planning_bbox)
+        ]
+
+        seen_slicer = tuple(slice(lb, ub) for lb, ub in seen_bbox)
+        pred_slicer = tuple(slice(lb, ub) for lb, ub in pred_bbox)
+        local_slicer = tuple(slice(lb, ub) for lb, ub in local_seen_bbox)
+
         if self.use_in_mem_compression:
-            interactions_shape = self.interactions.shape[1:]
-            seen_bbox = [[max(0, i[0]), min(i[1], s)]
-                         for i, s in zip(scaled_bbox, interactions_shape)]
+            prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *seen_slicer)])).to(self.device)
         else:
-            previous_prediction = previous_prediction.to(self.device, non_blocking=True)
-            seen_bbox = [[max(0, i[0]), min(i[1], s)]
-                         for i, s in zip(scaled_bbox, previous_prediction.shape)]
+            prev_sub = self.interactions[(prev_seg_ch, *seen_slicer)].to(self.device, non_blocking=True)
 
-        # bbox_tmp remaps the visible region (seen_bbox in interaction space) into coordinates of the
-        # local patch prediction tensor `pred`.
-        bbox_tmp = [[i[0] - s[0], i[1] - s[0]] for i, s in zip(seen_bbox, scaled_bbox)]
-        bbox_tmp = [[max(0, i[0]), min(i[1], s)] for i, s in zip(bbox_tmp, scaled_patch_size)]
-        slicer = bounding_box_to_slice(seen_bbox)
-        slicer2 = bounding_box_to_slice(bbox_tmp)
+        diff_local[local_slicer] = (pred[pred_slicer] != prev_sub).to(diff_local.dtype)
+        del prev_sub
 
+        # Open/close the local difference map to reduce the number of refinement patches without materializing
+        # a full-image planning tensor.
+        diff_local[local_slicer] = iterative_3x3_same_padding_pool3d(
+            diff_local[local_slicer][None, None], kernel_size=5, use_min_pool=True
+        )[0, 0]
+        diff_local[local_slicer] = iterative_3x3_same_padding_pool3d(
+            diff_local[local_slicer][None, None], kernel_size=5, use_min_pool=False
+        )[0, 0]
+
+        return diff_local.to(torch.uint8)
+
+    def _mark_prev_seg_in_local_diff(self, diff_local: torch.Tensor, planning_bbox: List[List[int]]) -> None:
+        prev_seg_ch = self._get_prev_seg_channel()
+        planning_slicer = tuple(slice(lb, ub) for lb, ub in planning_bbox)
         if self.use_in_mem_compression:
-            prev_sub = torch.from_numpy(self.interactions[(prev_seg_ch, *[slice(sb[0], sb[1]) for sb in seen_bbox])]).to(self.device)
-            diff = pred[slicer2] != prev_sub
-            diff_map = torch.zeros(interactions_shape, device=self.device, dtype=torch.float16)
+            prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *planning_slicer)])).to(self.device)
         else:
-            diff = pred[slicer2] != previous_prediction[slicer]
-            diff_map = torch.zeros_like(previous_prediction, device=self.device)
+            prev_sub = self.interactions[(prev_seg_ch, *planning_slicer)].to(self.device, non_blocking=True)
+        diff_local[prev_sub > 0.5] = 1
+        del prev_sub
 
-        diff_map[slicer] = diff
+    def _plan_refinement_bboxes(self,
+                                pred: torch.Tensor,
+                                scaled_bbox: List[List[int]],
+                                force_full_refine: bool) -> List[List[List[int]]]:
+        spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
+        planning_bbox = self._clip_bbox_to_shape(scaled_bbox, spatial_shape)
 
-        # open the difference map to keep computational load in check (fewer refinement boxes)
-        # open distance map
-        diff_map[slicer] = \
-            iterative_3x3_same_padding_pool3d(diff_map[slicer][None, None], kernel_size=5, use_min_pool=True)[0, 0]
-        diff_map[slicer] = \
-            iterative_3x3_same_padding_pool3d(diff_map[slicer][None, None], kernel_size=5, use_min_pool=False)[0, 0]
+        if force_full_refine:
+            print('Forcing full refinement of entire structure')
+            prev_seg_bbox = self._compute_prev_seg_positive_bbox()
+            planning_bbox = self._union_bboxes(planning_bbox, prev_seg_bbox)
 
-        return diff_map.to(torch.uint8)
+        if planning_bbox is None:
+            center = self.new_interaction_centers[-1]
+            return [[[ci - pi // 2, ci - pi // 2 + pi] for ci, pi in zip(center, self.configuration_manager.patch_size)]]
+
+        diff_local = self._compute_local_diff_map(pred, scaled_bbox, planning_bbox)
+        if force_full_refine:
+            self._mark_prev_seg_in_local_diff(diff_local, planning_bbox)
+
+        local_bboxes = generate_bounding_boxes(
+            diff_local, self.configuration_manager.patch_size, stride='auto', margin=(10, 10, 10), max_depth=3
+        )
+        del diff_local
+        empty_cache(self.device)
+
+        # If no bounding boxes are returned we basically have almost no changes. Still we should at least perform
+        # refinement in the bounding box where the interaction was as the user evidently wanted something here.
+        if len(local_bboxes) == 0:
+            center = self.new_interaction_centers[-1]
+            return [[[ci - pi // 2, ci - pi // 2 + pi] for ci, pi in zip(center, self.configuration_manager.patch_size)]]
+
+        return self._offset_bboxes(local_bboxes, planning_bbox)
 
     def _add_patch_for_point_interaction(self, coordinates):
         self.new_interaction_zoom_out_factors.append(1)
