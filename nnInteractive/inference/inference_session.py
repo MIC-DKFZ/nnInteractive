@@ -41,6 +41,7 @@ from nnInteractive.utils.rounding import round_to_nearest_odd
 
 class nnInteractiveInferenceSession():
     INFERENCE_SESSION_VERSION = nnInteractive.__version__
+    REFINEMENT_CACHE_GPU_HEADROOM_BYTES = 4 * 1024 ** 3
     # Interactions implemented by this inference session.
     SUPPORTED_INTERACTION_KEYS = ("scribble", "lasso", "points", "bbox2d", "bbox3d")
 
@@ -200,6 +201,10 @@ class nnInteractiveInferenceSession():
             [[lb + offset_bbox[dim][0], ub + offset_bbox[dim][0]] for dim, (lb, ub) in enumerate(bbox)]
             for bbox in local_bboxes
         ]
+
+    def _interaction_bbox_to_target_bbox(self, bbox: List[List[int]]) -> List[List[int]]:
+        return [[i[0] + bbc[0], i[1] + bbc[0]]
+                for i, bbc in zip(bbox, self.preprocessed_props['bbox_used_for_cropping'])]
 
     def _compute_prev_seg_positive_bbox(self) -> Optional[List[List[int]]]:
         prev_seg_ch = self._get_prev_seg_channel()
@@ -376,6 +381,54 @@ class nnInteractiveInferenceSession():
                 value = torch.from_numpy(value)
             self.interactions[channel_idx] = value.to(
                 self.interactions.device, dtype=self.interactions.dtype)
+
+    def _paste_prediction_to_target_buffer(self, prediction: torch.Tensor, bbox: List[List[int]]) -> None:
+        target_bbox = self._interaction_bbox_to_target_bbox(bbox)
+        if isinstance(self.target_buffer, torch.Tensor):
+            pred_for_target = prediction.to(self.target_buffer.device)
+        else:
+            pred_for_target = prediction.to('cpu')
+        paste_tensor(self.target_buffer, pred_for_target, target_bbox)
+
+    def _estimate_refinement_cache_nbytes(self, cache_bbox: List[List[int]]) -> int:
+        cache_voxels = int(np.prod(self._bbox_size(cache_bbox), dtype=np.int64))
+        image_nbytes = cache_voxels * torch.empty((), dtype=self.preprocessed_image.dtype).element_size()
+        interactions_nbytes = cache_voxels * self.num_interaction_channels * torch.empty((), dtype=torch.float16).element_size()
+        return int(image_nbytes + interactions_nbytes)
+
+    def _select_refinement_cache_device(self, cache_bbox: List[List[int]]) -> torch.device:
+        if self.device.type != 'cuda':
+            return torch.device('cpu')
+
+        cache_nbytes = self._estimate_refinement_cache_nbytes(cache_bbox)
+        try:
+            free_mem, _ = torch.cuda.mem_get_info(self.device)
+            if free_mem - cache_nbytes >= self.REFINEMENT_CACHE_GPU_HEADROOM_BYTES:
+                return self.device
+        except Exception:
+            pass
+
+        return torch.device('cpu')
+
+    def _build_refinement_local_cache(self,
+                                      bboxes_ordered: List[List[List[int]]]):
+        cache_bbox = self._union_bboxes(*bboxes_ordered)
+        cache_device = self._select_refinement_cache_device(cache_bbox)
+        cache_shape = self._bbox_size(cache_bbox)
+        pin_cache = cache_device.type == 'cpu' and self.device.type == 'cuda'
+
+        cache_kwargs = {'device': cache_device}
+        if pin_cache:
+            cache_kwargs['pin_memory'] = True
+
+        cache_image = torch.zeros(cache_shape, dtype=self.preprocessed_image.dtype, **cache_kwargs)
+        cache_interactions = torch.zeros((self.num_interaction_channels, *cache_shape),
+                                         dtype=torch.float16, **cache_kwargs)
+
+        crop_and_pad_into_buffer(cache_image, cache_bbox, self.preprocessed_image[0])
+        crop_and_pad_into_buffer(cache_interactions, cache_bbox, self.interactions)
+        self._normalize_interaction_channels_for_network_(cache_interactions)
+        return cache_bbox, cache_image, cache_interactions
 
     def _prepare_new_interaction_intensity(self):
         if self.interaction_decay is None:
@@ -977,13 +1030,7 @@ class nnInteractiveInferenceSession():
                     paste_tensor(self.interactions, pred.half(), scaled_bbox, channel_idx=prev_seg_channel)
                 else:
                     paste_tensor(self.interactions[prev_seg_channel], pred.half(), scaled_bbox)
-                bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
-                        zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-                if isinstance(self.target_buffer, torch.Tensor):
-                    pred_for_target = pred.to(self.target_buffer.device)
-                else:
-                    pred_for_target = pred.to('cpu')
-                paste_tensor(self.target_buffer, pred_for_target, bbox)
+                self._paste_prediction_to_target_buffer(pred, scaled_bbox)
                 self._apply_pending_positive_bbox_pseudo_lasso_mask()
                 print('No refinement necessary')
             else:
@@ -1078,6 +1125,13 @@ class nnInteractiveInferenceSession():
         if self.verbose:
             print(f'Using {len(bboxes_ordered)} bounding boxes for refinement')
 
+        if self.use_in_mem_compression:
+            self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel)
+            end_refinement = time()
+            print(
+                f'Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes')
+            return
+
         preallocated_input = torch.zeros((1 + self.num_interaction_channels, *self.configuration_manager.patch_size), device=self.device,
                                          dtype=torch.float)
         for nref, refinement_bbox in enumerate(bboxes_ordered):
@@ -1094,13 +1148,7 @@ class nnInteractiveInferenceSession():
                 paste_tensor(self.interactions, pred, refinement_bbox, channel_idx=prev_seg_channel)
             else:
                 paste_tensor(self.interactions[prev_seg_channel], pred, refinement_bbox)
-            bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
-                    zip(refinement_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
-            if isinstance(self.target_buffer, torch.Tensor):
-                pred_for_target = pred.to(self.target_buffer.device)
-            else:
-                pred_for_target = pred.to('cpu')
-            paste_tensor(self.target_buffer, pred_for_target, bbox)
+            self._paste_prediction_to_target_buffer(pred, refinement_bbox)
             del pred
             preallocated_input.zero_()
         del preallocated_input
@@ -1108,6 +1156,38 @@ class nnInteractiveInferenceSession():
         end_refinement = time()
         print(
             f'Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes')
+
+    def _refine_coarse_with_local_cache(self,
+                                        bboxes_ordered: List[List[List[int]]],
+                                        prev_seg_channel: int) -> None:
+        cache_bbox, cache_image, cache_interactions = self._build_refinement_local_cache(bboxes_ordered)
+
+        for refinement_bbox in bboxes_ordered:
+            local_bbox = [[lb - cache_dim[0], ub - cache_dim[0]]
+                          for (lb, ub), cache_dim in zip(refinement_bbox, cache_bbox)]
+            spatial_slicer = tuple(slice(lb, ub) for lb, ub in local_bbox)
+            image_patch = cache_image[spatial_slicer][None]
+            interactions_patch = cache_interactions[(slice(None), *spatial_slicer)]
+            if cache_image.device == self.device:
+                patch = torch.cat((image_patch, interactions_patch), dim=0)
+            else:
+                patch = torch.cat((
+                    image_patch.to(self.device, non_blocking=(self.device.type == 'cuda')),
+                    interactions_patch.to(self.device, non_blocking=(self.device.type == 'cuda'))
+                ), dim=0)
+
+            pred = self.network(patch[None])[0].argmax(0).detach()
+            paste_tensor(cache_interactions, pred.to(cache_interactions.device, dtype=cache_interactions.dtype),
+                         local_bbox, channel_idx=prev_seg_channel)
+            del image_patch, interactions_patch, patch
+            del pred
+
+        final_prev_seg = cache_interactions[prev_seg_channel]
+        paste_tensor(self.interactions, final_prev_seg, cache_bbox, channel_idx=prev_seg_channel)
+        self._paste_prediction_to_target_buffer(final_prev_seg, cache_bbox)
+
+        del cache_image, cache_interactions, final_prev_seg
+        empty_cache(self.device)
 
     def _detect_change_at_border(self,
                                  pred: torch.Tensor,
