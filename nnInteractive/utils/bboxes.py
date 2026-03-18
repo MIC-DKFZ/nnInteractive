@@ -158,7 +158,7 @@ def random_sampling_fallback(mask: torch.Tensor, bbox_size=(192, 192, 192), marg
         for i in range(n_samples):
             idx = np.random.choice(len(indices))
             center = indices[idx]
-            c_x, c_y, c_z = center
+            c_x, c_y, c_z = [int(i.item()) for i in center]
             x_start = max(0, c_x - half_size[0] + margin[0])
             x_end = min(mask.shape[0], c_x + end_offset[0] - margin[0])  # Use end_offset for odd sizes
             y_start = max(0, c_y - half_size[1] + margin[1])
@@ -177,7 +177,7 @@ def random_sampling_fallback(mask: torch.Tensor, bbox_size=(192, 192, 192), marg
                 best_bounds = (x_start, x_end, y_start, y_end, z_start, z_end)
 
         # Add the best bounding box
-        c_x, c_y, c_z = best_center
+        c_x, c_y, c_z = [int(i.item()) for i in best_center]
         bboxes.append([
             [c_x - half_size[0], c_x + end_offset[0]],
             [c_y - half_size[1], c_y + end_offset[1]],
