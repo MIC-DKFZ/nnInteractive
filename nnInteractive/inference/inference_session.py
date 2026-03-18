@@ -973,17 +973,12 @@ class nnInteractiveInferenceSession():
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             # make a prediction at zoom_out_factor, remember max_zoom_out_factor
             start_initial_pred = time()
-            input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
+            input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction = \
+                self._build_network_input(prediction_center, zoom_out_factor)
             pred = self.network(input_for_predict[None])[0].argmax(0).detach()
             del input_for_predict
 
             # detect changes at border. If there are, we enter autozoom
-            previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox).to(self.device)
-
-            if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
-                previous_prediction = \
-                interpolate(previous_prediction[None, None], pred.shape, mode='nearest')[0, 0]
-
             has_change = self._detect_change_at_border(pred, previous_prediction)
             del previous_prediction
             empty_cache(self.device)
@@ -1002,20 +997,11 @@ class nnInteractiveInferenceSession():
                     zoom_out_factor *= zoom_out_growth_factor
                     zoom_out_factor = min(4, zoom_out_factor)
 
-                input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
+                input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction_resized = \
+                    self._build_network_input(prediction_center, zoom_out_factor)
                 pred = self.network(input_for_predict[None])[0].argmax(0).detach()
                 del input_for_predict
                 empty_cache(self.device)
-
-                # detect changes at border. If there are, we enter autozoom
-                previous_prediction = self._crop_and_pad_interactions_channel0(scaled_bbox).to(self.device)
-
-                if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
-                    previous_prediction_resized = \
-                    interpolate(previous_prediction[None, None], pred.shape, mode='nearest')[0, 0]
-                else:
-                    previous_prediction_resized = previous_prediction
-                del previous_prediction
 
                 has_change = self._detect_change_at_border(pred, previous_prediction_resized)
 
@@ -1061,6 +1047,7 @@ class nnInteractiveInferenceSession():
     def _build_network_input(self, prediction_center, zoom_out_factor):
         scaled_patch_size = [round(i * zoom_out_factor) for i in self.configuration_manager.patch_size]
         scaled_bbox = [[c - p // 2, c + p // 2 + p % 2] for c, p in zip(prediction_center, scaled_patch_size)]
+        prev_seg_channel = self._get_prev_seg_channel()
 
         # cropping happens on CPU, padding happens on GPU (later)
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
@@ -1069,6 +1056,8 @@ class nnInteractiveInferenceSession():
         if not isinstance(interactions_tensor, torch.Tensor):
             interactions_tensor = torch.from_numpy(np.asarray(interactions_tensor))
 
+        previous_prediction = interactions_tensor[prev_seg_channel:prev_seg_channel + 1]
+
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
         if not all([i == j for i, j in zip(self.configuration_manager.patch_size, scaled_patch_size)]):
@@ -1076,6 +1065,11 @@ class nnInteractiveInferenceSession():
             max_pool_ks = round_to_nearest_odd(zoom_out_factor * 2 - 1)
             dilation_channels = set(self._get_dilation_channels_for_resample()) if max_pool_ks > 1 else set()
             needs_pad_interaction = any(x for pair in pad_interaction for x in pair)
+
+            previous_prediction = previous_prediction.to(self.device, non_blocking=True)
+            if needs_pad_interaction:
+                previous_prediction = pad_cropped(previous_prediction, pad_interaction)
+            previous_prediction = interpolate(previous_prediction[None], patch_size, mode='nearest')[0, 0]
 
             # Process interaction channels one at a time to avoid materialising the full
             # [num_ch, scaled_patch_size³] tensor on GPU. Peak VRAM ≈ one channel at scaled size.
@@ -1107,16 +1101,19 @@ class nnInteractiveInferenceSession():
             # zoom_out_factor == 1: transfer both tensors to GPU, then pad if needed
             crop_img = crop_img.to(self.device, non_blocking=True)
             interactions_tensor = interactions_tensor.to(self.device, non_blocking=True)
+            previous_prediction = previous_prediction.to(self.device, non_blocking=True)
             if any(x for pair in pad_image for x in pair):
                 crop_img = pad_cropped(crop_img, pad_image)
             if any(x for pair in pad_interaction for x in pair):
                 interactions_tensor = pad_cropped(interactions_tensor, pad_interaction)
+                previous_prediction = pad_cropped(previous_prediction, pad_interaction)
+            previous_prediction = previous_prediction[0]
 
         self._normalize_interaction_channels_for_network_(interactions_tensor)
         input_for_predict = torch.cat((crop_img, interactions_tensor))
         del crop_img, interactions_tensor
         empty_cache(self.device)
-        return input_for_predict, scaled_patch_size, scaled_bbox
+        return input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction
 
     def _refine_coarse(self, bboxes_ordered: List[List[List[int]]]):
         start_refinement = time()
