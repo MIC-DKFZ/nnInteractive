@@ -54,7 +54,7 @@ class nnInteractiveInferenceSession():
                  use_bbox_pseudo_lasso: bool = True,
                  use_negative_bbox_pseudo_lasso: bool = False,
                  use_pinned_memory: bool = True,
-                 use_in_mem_compression: bool = False,
+                 use_in_mem_compression: bool = True,
                  ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
@@ -311,26 +311,6 @@ class nnInteractiveInferenceSession():
         self._scale_bbox_interaction_history(scale)
         self.current_interaction_intensity = self._interaction_renorm_target
 
-    def _crop_and_pad_interactions_channel0(self, bbox) -> torch.Tensor:
-        """Read interactions[prev_seg_channel] at bbox with zero padding.
-        For blosc2: decompresses only the needed chunks, not the full channel."""
-        prev_seg_ch = self._get_prev_seg_channel()
-        out_shape = tuple(int(i[1] - i[0]) for i in bbox)
-        out = torch.zeros(out_shape, dtype=torch.float16)
-        seen_bbox = [[max(0, i[0]), min(i[1], s)]
-                     for i, s in zip(bbox, self.interactions.shape[1:])]
-        if any(i[1] <= i[0] for i in seen_bbox):
-            return out
-        source_slices = tuple(slice(i[0], i[1]) for i in seen_bbox)
-        target_slices = tuple(slice(i[0] - b[0], i[1] - b[0])
-                              for i, b in zip(seen_bbox, bbox))
-        if self.use_in_mem_compression:
-            sub = np.asarray(self.interactions[(prev_seg_ch, *source_slices)])
-            out[target_slices] = torch.from_numpy(sub)
-        else:
-            out[target_slices] = self.interactions[prev_seg_ch][source_slices].cpu()
-        return out
-
     def _interactions_inplace_maximum(self, channel_idx: int, int_slicer, new_values) -> None:
         """In-place element-wise maximum for a subregion of a channel."""
         if self.use_in_mem_compression:
@@ -381,13 +361,6 @@ class nnInteractiveInferenceSession():
 
         for bbox_entry in self._bbox_interaction_history:
             self._place_bbox_as_pseudo_lasso(bbox_entry)
-
-        # np.save('/home/isensee/temp/0_before_ch1.npy', self.interactions[1])
-        # np.save('/home/isensee/temp/0_before_ch2.npy', self.interactions[2])
-        # np.save('/home/isensee/temp/0_before_ch0.npy', self.interactions[0])
-        # np.save('/home/isensee/temp/0_after_ch1.npy', self.interactions[1])
-        # np.save('/home/isensee/temp/0_after_ch2.npy', self.interactions[2])
-        # np.save('/home/isensee/temp/0_after_ch0.npy', self.interactions[0])
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
