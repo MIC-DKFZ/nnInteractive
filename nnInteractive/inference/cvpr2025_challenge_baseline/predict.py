@@ -71,7 +71,6 @@ def run_inference(
         verbose=False,
         torch_n_threads=os.cpu_count(),
         do_autozoom=True,
-        use_pinned_memory=True
     )
     session.initialize_from_trained_model_folder(
         model_training_output_dir=CHECKPOINT_DIR,

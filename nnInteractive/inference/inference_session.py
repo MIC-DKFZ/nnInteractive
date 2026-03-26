@@ -5,11 +5,7 @@ from time import time
 from typing import Union, List, Tuple, Optional
 import warnings
 
-try:
-    import blosc2
-    _BLOSC2_AVAILABLE = True
-except ImportError:
-    _BLOSC2_AVAILABLE = False
+import blosc2
 
 import numpy as np
 import torch
@@ -35,7 +31,6 @@ from nnInteractive.utils.inference_helpers import (
     transform_coordinates_noresampling,
     version_to_tuple,
 )
-from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
 from nnInteractive.utils.rounding import round_to_nearest_odd
 
 
@@ -51,36 +46,22 @@ class nnInteractiveInferenceSession():
                  verbose: bool = False,
                  torch_n_threads: int = 8,
                  do_autozoom: bool = True,
-                 use_pinned_memory: bool = True,
-                 use_in_mem_compression: bool = True,
                  ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
         """
         print('session initialized')
-        if use_in_mem_compression:
-            if not _BLOSC2_AVAILABLE:
-                raise ImportError(
-                    "blosc2 is required for use_in_mem_compression=True. "
-                    "Install with: pip install blosc2"
-                )
-            use_pinned_memory = False  # blosc2 and pinned memory are incompatible
 
         # set as part of initialization
-        assert use_torch_compile is False, ('This implementation places the preprocessed image and the interactions '
-                                            'into pinned memory for speed reasons. This is incompatible with '
-                                            'torch.compile because of inconsistent strides in the memory layout. '
-                                            'Note to self: .contiguous() on GPU could be a solution. Unclear whether '
-                                            'that will yield a benefit though.')
+        assert use_torch_compile is False, ('torch.compile is not supported. The blosc2-backed interaction tensor '
+                                            'requires numpy↔torch round-trips that break compile tracing.')
         self.network = None
         self.label_manager = None
         self.dataset_json = None
         self.trainer_name = None
         self.configuration_manager = None
         self.plans_manager = None
-        self.use_pinned_memory = use_pinned_memory
-        self.use_in_mem_compression = use_in_mem_compression
-        self._interactions_blosc2_shape = None
+        self._interactions_shape = None
         self.device = device
         self.use_torch_compile = use_torch_compile
         self.interaction_decay = None
@@ -95,7 +76,7 @@ class nnInteractiveInferenceSession():
         self.supports_zero_shot_label_refinement: bool = True
 
         # image specific
-        self.interactions: torch.Tensor = None
+        self.interactions = None  # blosc2.NDArray once initialized
         self.preprocessed_image: torch.Tensor = None
         self.preprocessed_props = None
         self.target_buffer: Union[np.ndarray, torch.Tensor] = None
@@ -208,43 +189,28 @@ class nnInteractiveInferenceSession():
         prev_seg_ch = self._get_prev_seg_channel()
         spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
 
-        if self.use_in_mem_compression:
-            occupancy_x = np.zeros(spatial_shape[0], dtype=bool)
-            occupancy_y = np.zeros(spatial_shape[1], dtype=bool)
-            occupancy_z = np.zeros(spatial_shape[2], dtype=bool)
-            chunk_depth = 64
-            for d0 in range(0, spatial_shape[0], chunk_depth):
-                d1 = min(spatial_shape[0], d0 + chunk_depth)
-                slab = np.asarray(
-                    self.interactions[(prev_seg_ch, slice(d0, d1), slice(None), slice(None))]
-                ) > 0.5
-                if not slab.any():
-                    continue
-                occupancy_x[d0:d1] |= np.any(slab, axis=(1, 2))
-                occupancy_y |= np.any(slab, axis=(0, 2))
-                occupancy_z |= np.any(slab, axis=(0, 1))
+        occupancy_x = np.zeros(spatial_shape[0], dtype=bool)
+        occupancy_y = np.zeros(spatial_shape[1], dtype=bool)
+        occupancy_z = np.zeros(spatial_shape[2], dtype=bool)
+        chunk_depth = 64
+        for d0 in range(0, spatial_shape[0], chunk_depth):
+            d1 = min(spatial_shape[0], d0 + chunk_depth)
+            slab = np.asarray(
+                self.interactions[(prev_seg_ch, slice(d0, d1), slice(None), slice(None))]
+            ) > 0.5
+            if not slab.any():
+                continue
+            occupancy_x[d0:d1] |= np.any(slab, axis=(1, 2))
+            occupancy_y |= np.any(slab, axis=(0, 2))
+            occupancy_z |= np.any(slab, axis=(0, 1))
 
-            occupancies = (occupancy_x, occupancy_y, occupancy_z)
-            bbox = []
-            for occ in occupancies:
-                indices = np.flatnonzero(occ)
-                if len(indices) == 0:
-                    return None
-                bbox.append([int(indices[0]), int(indices[-1]) + 1])
-            return bbox
-
-        prev_seg = self.interactions[prev_seg_ch] > 0.5
-        occupancies = (
-            prev_seg.sum(dim=(1, 2), dtype=torch.int32) != 0,
-            prev_seg.sum(dim=(0, 2), dtype=torch.int32) != 0,
-            prev_seg.sum(dim=(0, 1), dtype=torch.int32) != 0,
-        )
+        occupancies = (occupancy_x, occupancy_y, occupancy_z)
         bbox = []
         for occ in occupancies:
-            indices = torch.where(occ)[0]
+            indices = np.flatnonzero(occ)
             if len(indices) == 0:
                 return None
-            bbox.append([int(indices[0].item()), int(indices[-1].item()) + 1])
+            bbox.append([int(indices[0]), int(indices[-1]) + 1])
         return bbox
 
     def _get_dilation_channels_for_resample(self) -> List[int]:
@@ -290,38 +256,24 @@ class nnInteractiveInferenceSession():
             self.current_interaction_intensity = min(self.current_interaction_intensity, self._interaction_renorm_target)
             return
         scale = self._interaction_renorm_target / self.current_interaction_intensity
-        if self.use_in_mem_compression:
-            # blosc2 NDArray does not support list-based assignment semantics reliably.
-            for ch in channels_to_scale:
-                self.interactions[ch] *= scale
-        else:
-            self.interactions[channels_to_scale] *= scale
+        for ch in channels_to_scale:
+            self.interactions[ch] *= scale
         self.current_interaction_intensity = self._interaction_renorm_target
 
     def _interactions_inplace_maximum(self, channel_idx: int, int_slicer, new_values) -> None:
         """In-place element-wise maximum for a subregion of a channel."""
-        if self.use_in_mem_compression:
-            if isinstance(new_values, torch.Tensor):
-                new_values = new_values.cpu().numpy().astype(np.float16)
-            full_slicer = (channel_idx, *int_slicer)
-            current_sub = np.asarray(self.interactions[full_slicer])
-            np.maximum(current_sub, new_values, out=current_sub)
-            self.interactions[full_slicer] = current_sub
-        else:
-            torch.maximum(self.interactions[channel_idx][int_slicer], new_values,
-                          out=self.interactions[channel_idx][int_slicer])
+        if isinstance(new_values, torch.Tensor):
+            new_values = new_values.cpu().numpy().astype(np.float16)
+        full_slicer = (channel_idx, *int_slicer)
+        current_sub = np.asarray(self.interactions[full_slicer])
+        np.maximum(current_sub, new_values, out=current_sub)
+        self.interactions[full_slicer] = current_sub
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
-        if self.use_in_mem_compression:
-            if isinstance(value, torch.Tensor):
-                value = value.cpu().numpy().astype(np.float16)
-            self.interactions[channel_idx] = value
-        else:
-            if isinstance(value, np.ndarray):
-                value = torch.from_numpy(value)
-            self.interactions[channel_idx] = value.to(
-                self.interactions.device, dtype=self.interactions.dtype)
+        if isinstance(value, torch.Tensor):
+            value = value.cpu().numpy().astype(np.float16)
+        self.interactions[channel_idx] = value
 
     def _paste_prediction_to_target_buffer(self, prediction: torch.Tensor, bbox: List[List[int]]) -> None:
         target_bbox = self._interaction_bbox_to_target_bbox(bbox)
@@ -556,29 +508,16 @@ class nnInteractiveInferenceSession():
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
         shape = (self.num_interaction_channels, *image_torch.shape[1:])
-        if self.use_in_mem_compression:
-            if self.verbose:
-                print('Initialize interactions with blosc2 in-memory compression')
-            self.interactions = blosc2.zeros(
-                shape, dtype=np.float16,
-                chunks=(1, *[min(64, s) for s in shape[1:]]),
-                blocks=(1, *[min(32, s) for s in shape[1:]]),
-                cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': os.cpu_count()},
-                dparams={'nthreads': 4}
-            )
-            self._interactions_blosc2_shape = shape
-        else:
-            # there is a bug in 6.11 that doesn't allow pinning large tensors
-            use_pinned = not is_linux_kernel_6_11() and self.use_pinned_memory and self.device.type == 'cuda'
-            if self.verbose:
-                print(f'Initialize interactions. Pinned: {use_pinned}')
-            # Create the interaction tensor based on the target shape.
-            self.interactions = torch.zeros(
-                shape,
-                device='cpu',
-                dtype=torch.float16,
-                pin_memory=use_pinned
-            )
+        if self.verbose:
+            print('Initialize interactions with blosc2 in-memory compression')
+        self.interactions = blosc2.zeros(
+            shape, dtype=np.float16,
+            chunks=(1, *[min(64, s) for s in shape[1:]]),
+            blocks=(1, *[min(32, s) for s in shape[1:]]),
+            cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': os.cpu_count()},
+            dparams={'nthreads': 4}
+        )
+        self._interactions_shape = shape
 
     @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
@@ -638,17 +577,14 @@ class nnInteractiveInferenceSession():
         segmentation!
         """
         if self.interactions is not None:
-            if self.use_in_mem_compression:
-                del self.interactions
-                self.interactions = blosc2.zeros(
-                    self._interactions_blosc2_shape, dtype=np.float16,
-                    chunks=(1, *[min(64, s) for s in self._interactions_blosc2_shape[1:]]),
-                    blocks=(1, *[min(32, s) for s in self._interactions_blosc2_shape[1:]]),
-                    cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': os.cpu_count()},
-                    dparams={'nthreads': 4}
-                )
-            else:
-                self.interactions.fill_(0)
+            del self.interactions
+            self.interactions = blosc2.zeros(
+                self._interactions_shape, dtype=np.float16,
+                chunks=(1, *[min(64, s) for s in self._interactions_shape[1:]]),
+                blocks=(1, *[min(32, s) for s in self._interactions_shape[1:]]),
+                cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': os.cpu_count()},
+                dparams={'nthreads': 4}
+            )
         self.current_interaction_intensity = 1.0
 
         if self.target_buffer is not None:
@@ -741,16 +677,10 @@ class nnInteractiveInferenceSession():
         self._prepare_new_interaction_intensity()
 
         interaction_channel = point_pos_channel if include_interaction else point_neg_channel
-        if self.use_in_mem_compression:
-            # place_point reads/writes only the structuring element subregion via channel_idx
-            self.point_interaction.place_point(
-                transformed_coordinates, self.interactions,
-                channel_idx=interaction_channel,
-                intensity_scale=self.current_interaction_intensity)
-        else:
-            self.interactions[interaction_channel] = self.point_interaction.place_point(
-                transformed_coordinates, self.interactions[interaction_channel],
-                intensity_scale=self.current_interaction_intensity)
+        self.point_interaction.place_point(
+            transformed_coordinates, self.interactions,
+            channel_idx=interaction_channel,
+            intensity_scale=self.current_interaction_intensity)
         if run_prediction:
             self._predict()
 
@@ -790,15 +720,10 @@ class nnInteractiveInferenceSession():
         src_ub = [src_lb[d] + (clipped_ub[d] - clipped_lb[d]) for d in range(3)]
         int_slicer = tuple(slice(a, b) for a, b in zip(clipped_lb, clipped_ub))
         src_slicer = tuple(slice(a, b) for a, b in zip(src_lb, src_ub))
-        if self.use_in_mem_compression:
-            new_values = image_t[src_slicer].cpu().numpy()
-            if self.current_interaction_intensity != 1:
-                new_values = new_values * self.current_interaction_intensity
-            new_values = new_values.astype(np.float16)
-        else:
-            new_values = image_t[src_slicer].to(self.interactions.device, dtype=self.interactions.dtype)
-            if self.current_interaction_intensity != 1:
-                new_values = new_values * self.current_interaction_intensity
+        new_values = image_t[src_slicer].cpu().numpy()
+        if self.current_interaction_intensity != 1:
+            new_values = new_values * self.current_interaction_intensity
+        new_values = new_values.astype(np.float16)
         self._interactions_inplace_maximum(interaction_channel, int_slicer, new_values)
         del new_values
         del image_t
@@ -886,8 +811,7 @@ class nnInteractiveInferenceSession():
         Returns:
 
         """
-        if self.use_in_mem_compression:
-            print('Current cratio', self.interactions.cratio)
+        print('Current cratio', self.interactions.cratio)
 
         assert self.pad_mode_data == 'constant', 'pad modes other than constant are not implemented here'
         assert len(self.new_interaction_centers) == len(self.new_interaction_zoom_out_factors)
@@ -946,10 +870,7 @@ class nnInteractiveInferenceSession():
 
             if zoom_out_factor == 1:
                 # simply place pred in the prev_seg channel and target buffer
-                if self.use_in_mem_compression:
-                    paste_tensor(self.interactions, pred.half(), scaled_bbox, channel_idx=prev_seg_channel)
-                else:
-                    paste_tensor(self.interactions[prev_seg_channel], pred.half(), scaled_bbox)
+                paste_tensor(self.interactions, pred.half(), scaled_bbox, channel_idx=prev_seg_channel)
                 self._paste_prediction_to_target_buffer(pred, scaled_bbox)
                 print('No refinement necessary')
             else:
@@ -961,12 +882,8 @@ class nnInteractiveInferenceSession():
 
                 refinement_bboxes = self._plan_refinement_bboxes(pred, scaled_bbox, force_full_refine)
 
-                # Place the coarse segmentation into prev_seg before masking/refinement so follow-up
-                # network inputs see the same state regardless of backend.
-                if self.use_in_mem_compression:
-                    paste_tensor(self.interactions, pred, scaled_bbox, channel_idx=prev_seg_channel)
-                else:
-                    paste_tensor(self.interactions[prev_seg_channel], pred, scaled_bbox)
+                # Place the coarse segmentation into prev_seg before refinement
+                paste_tensor(self.interactions, pred, scaled_bbox, channel_idx=prev_seg_channel)
 
                 self._refine_coarse(refinement_bboxes)
 
@@ -1054,34 +971,7 @@ class nnInteractiveInferenceSession():
         if self.verbose:
             print(f'Using {len(bboxes_ordered)} bounding boxes for refinement')
 
-        if self.use_in_mem_compression:
-            self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel)
-            end_refinement = time()
-            print(
-                f'Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes')
-            return
-
-        preallocated_input = torch.zeros((1 + self.num_interaction_channels, *self.configuration_manager.patch_size), device=self.device,
-                                         dtype=torch.float)
-        for nref, refinement_bbox in enumerate(bboxes_ordered):
-            assert self.pad_mode_data == 'constant'
-            # Reuse one preallocated tensor per refinement step to keep allocations/VRAM churn low.
-            crop_and_pad_into_buffer(preallocated_input[0], refinement_bbox, self.preprocessed_image[0])
-            # Keep interaction channel order identical to self.interactions regardless of storage backend.
-            crop_and_pad_into_buffer(preallocated_input[1:], refinement_bbox, self.interactions)
-            self._normalize_interaction_channels_for_network_(preallocated_input[1:])
-
-            pred = self.network(preallocated_input[None])[0].argmax(0).detach()
-
-            if self.use_in_mem_compression:
-                paste_tensor(self.interactions, pred, refinement_bbox, channel_idx=prev_seg_channel)
-            else:
-                paste_tensor(self.interactions[prev_seg_channel], pred, refinement_bbox)
-            self._paste_prediction_to_target_buffer(pred, refinement_bbox)
-            del pred
-            preallocated_input.zero_()
-        del preallocated_input
-        empty_cache(self.device)
+        self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel)
         end_refinement = time()
         print(
             f'Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes')
@@ -1189,10 +1079,7 @@ class nnInteractiveInferenceSession():
         pred_slicer = tuple(slice(lb, ub) for lb, ub in pred_bbox)
         local_slicer = tuple(slice(lb, ub) for lb, ub in local_seen_bbox)
 
-        if self.use_in_mem_compression:
-            prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *seen_slicer)])).to(self.device)
-        else:
-            prev_sub = self.interactions[(prev_seg_ch, *seen_slicer)].to(self.device, non_blocking=True)
+        prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *seen_slicer)])).to(self.device)
 
         diff_local[local_slicer] = (pred[pred_slicer] != prev_sub).to(diff_local.dtype)
         del prev_sub
@@ -1211,10 +1098,7 @@ class nnInteractiveInferenceSession():
     def _mark_prev_seg_in_local_diff(self, diff_local: torch.Tensor, planning_bbox: List[List[int]]) -> None:
         prev_seg_ch = self._get_prev_seg_channel()
         planning_slicer = tuple(slice(lb, ub) for lb, ub in planning_bbox)
-        if self.use_in_mem_compression:
-            prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *planning_slicer)])).to(self.device)
-        else:
-            prev_sub = self.interactions[(prev_seg_ch, *planning_slicer)].to(self.device, non_blocking=True)
+        prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *planning_slicer)])).to(self.device)
         diff_local[prev_sub > 0.5] = 1
         del prev_sub
 
