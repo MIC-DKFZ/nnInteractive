@@ -51,7 +51,7 @@ class nnInteractiveInferenceSession():
                  verbose: bool = False,
                  torch_n_threads: int = 8,
                  do_autozoom: bool = True,
-                 use_bbox_pseudo_lasso: bool = True,
+                 use_bbox_pseudo_lasso: bool = False,
                  use_negative_bbox_pseudo_lasso: bool = False,
                  use_pinned_memory: bool = True,
                  use_in_mem_compression: bool = True,
