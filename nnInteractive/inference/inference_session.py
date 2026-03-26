@@ -51,8 +51,6 @@ class nnInteractiveInferenceSession():
                  verbose: bool = False,
                  torch_n_threads: int = 8,
                  do_autozoom: bool = True,
-                 use_bbox_pseudo_lasso: bool = False,
-                 use_negative_bbox_pseudo_lasso: bool = False,
                  use_pinned_memory: bool = True,
                  use_in_mem_compression: bool = True,
                  ):
@@ -82,8 +80,6 @@ class nnInteractiveInferenceSession():
         self.plans_manager = None
         self.use_pinned_memory = use_pinned_memory
         self.use_in_mem_compression = use_in_mem_compression
-        self.use_bbox_pseudo_lasso = use_bbox_pseudo_lasso
-        self.use_negative_bbox_pseudo_lasso = use_negative_bbox_pseudo_lasso
         self._interactions_blosc2_shape = None
         self.device = device
         self.use_torch_compile = use_torch_compile
@@ -117,8 +113,6 @@ class nnInteractiveInferenceSession():
 
         self.new_interaction_zoom_out_factors: List[float] = []
         self.new_interaction_centers = []
-        self._bbox_interaction_history: List[dict] = []
-
         # Create a thread pool executor for background tasks.
         # this only takes care of preprocessing and interaction memory initialization so there is no need to give it
         # more than 2 workers
@@ -286,12 +280,6 @@ class nnInteractiveInferenceSession():
             channels.remove(prev_seg_channel)
         return channels
 
-    def _scale_bbox_interaction_history(self, scale: float) -> None:
-        if scale == 1:
-            return
-        for bbox_entry in self._bbox_interaction_history:
-            bbox_entry['intensity'] *= scale
-
     def _renormalize_interactions_if_needed(self):
         if self.interactions is None:
             return
@@ -308,7 +296,6 @@ class nnInteractiveInferenceSession():
                 self.interactions[ch] *= scale
         else:
             self.interactions[channels_to_scale] *= scale
-        self._scale_bbox_interaction_history(scale)
         self.current_interaction_intensity = self._interaction_renorm_target
 
     def _interactions_inplace_maximum(self, channel_idx: int, int_slicer, new_values) -> None:
@@ -323,44 +310,6 @@ class nnInteractiveInferenceSession():
         else:
             torch.maximum(self.interactions[channel_idx][int_slicer], new_values,
                           out=self.interactions[channel_idx][int_slicer])
-
-    def _clear_bbox_interaction_region(self, channel_idx: int, bbox: List[List[int]]) -> None:
-        int_slicer = tuple(slice(*i) for i in bbox)
-        self.interactions[(channel_idx, *int_slicer)] = 0
-
-    def _place_bbox_as_pseudo_lasso(self, bbox_entry: dict) -> None:
-        prev_seg_ch = self._get_prev_seg_channel()
-        channel_idx = int(bbox_entry['channel'])
-        bbox = bbox_entry['bbox']
-        intensity = float(bbox_entry['intensity'])
-        include_interaction = bool(bbox_entry['include_interaction'])
-        if not include_interaction and not self.use_negative_bbox_pseudo_lasso:
-            return
-        int_slicer = tuple(slice(*i) for i in bbox)
-
-        prev_seg_mask = self.interactions[(prev_seg_ch, *int_slicer)] > 0.5
-        new_values = np.full(prev_seg_mask.shape, intensity, dtype=np.float16) if self.use_in_mem_compression \
-            else self.interactions[(channel_idx, *int_slicer)].new_full(prev_seg_mask.shape, intensity)
-        if include_interaction:
-            new_values[~prev_seg_mask] = 0
-        else:
-            new_values[prev_seg_mask] = 0
-        self.interactions[(channel_idx, *int_slicer)] = new_values
-
-    def _rebuild_bbox_interactions_as_pseudo_lasso(self) -> None:
-        """Rebuild bbox interactions from history, masked against the current prev_seg."""
-        if not self.use_bbox_pseudo_lasso:
-            return
-        if len(self._bbox_interaction_history) == 0:
-            return
-
-        for bbox_entry in self._bbox_interaction_history:
-            if (not bbox_entry['include_interaction']) and (not self.use_negative_bbox_pseudo_lasso):
-                continue
-            self._clear_bbox_interaction_region(int(bbox_entry['channel']), bbox_entry['bbox'])
-
-        for bbox_entry in self._bbox_interaction_history:
-            self._place_bbox_as_pseudo_lasso(bbox_entry)
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
@@ -604,7 +553,6 @@ class nnInteractiveInferenceSession():
         self.current_interaction_intensity = 1.0
         empty_cache(self.device)
         self.original_image_shape = None
-        self._bbox_interaction_history = []
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
         shape = (self.num_interaction_channels, *image_torch.shape[1:])
@@ -709,7 +657,6 @@ class nnInteractiveInferenceSession():
             elif isinstance(self.target_buffer, torch.Tensor):
                 self.target_buffer.zero_()
         empty_cache(self.device)
-        self._bbox_interaction_history = []
 
     def add_bbox_interaction(self, bbox_coords, include_interaction: bool, run_prediction: bool = True,
                              override_capability_checks: bool = False):
@@ -775,12 +722,6 @@ class nnInteractiveInferenceSession():
         # place bbox
         slicer = tuple([slice(*i) for i in transformed_bbox_coordinates])
         channel = bbox_pos_channel if include_interaction else bbox_neg_channel
-        self._bbox_interaction_history.append({
-            'bbox': [coords.copy() for coords in transformed_bbox_coordinates],
-            'channel': channel,
-            'include_interaction': include_interaction,
-            'intensity': self.current_interaction_intensity,
-        })
         self.interactions[(channel, *slicer)] = self.current_interaction_intensity
 
         if run_prediction:
@@ -1010,7 +951,6 @@ class nnInteractiveInferenceSession():
                 else:
                     paste_tensor(self.interactions[prev_seg_channel], pred.half(), scaled_bbox)
                 self._paste_prediction_to_target_buffer(pred, scaled_bbox)
-                self._rebuild_bbox_interactions_as_pseudo_lasso()
                 print('No refinement necessary')
             else:
                 # do refinement
@@ -1028,9 +968,7 @@ class nnInteractiveInferenceSession():
                 else:
                     paste_tensor(self.interactions[prev_seg_channel], pred, scaled_bbox)
 
-                self._rebuild_bbox_interactions_as_pseudo_lasso()
                 self._refine_coarse(refinement_bboxes)
-                self._rebuild_bbox_interactions_as_pseudo_lasso()
 
         print(f'Done. Total time {round(time() - start_predict, 3)}s')
 
