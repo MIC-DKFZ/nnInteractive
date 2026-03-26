@@ -89,6 +89,7 @@ class nnInteractiveInferenceSession():
         self.do_autozoom: bool = do_autozoom
 
         torch.set_num_threads(min(torch_n_threads, cpu_count()))
+        self.torch_n_threads = torch_n_threads
 
         self.original_image_shape = None
 
@@ -514,7 +515,7 @@ class nnInteractiveInferenceSession():
             shape, dtype=np.float16,
             chunks=(1, *[min(64, s) for s in shape[1:]]),
             blocks=(1, *[min(32, s) for s in shape[1:]]),
-            cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': os.cpu_count()},
+            cparams={'codec': blosc2.Codec.LZ4, 'clevel': 5, 'nthreads': min(self.torch_n_threads, os.cpu_count())},
             dparams={'nthreads': 4}
         )
         self._interactions_shape = shape
