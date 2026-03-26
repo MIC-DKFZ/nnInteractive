@@ -439,6 +439,7 @@ class nnInteractiveInferenceSession():
         prev_seg_channel = self._get_prev_seg_channel()
         channels_to_normalize = [i for i in range(interaction_tensor.shape[0]) if i != prev_seg_channel]
         if len(channels_to_normalize) > 0:
+            print(f'Normalize interactions tensor channels {channels_to_normalize} with current interaction intensity {self.current_interaction_intensity}')
             interaction_tensor[channels_to_normalize] /= self.current_interaction_intensity
 
     def _load_capability_and_runtime_defaults(self, model_training_output_dir: str):
@@ -1016,7 +1017,7 @@ class nnInteractiveInferenceSession():
                 # do refinement
 
                 if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
-                    pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[
+                    pred = (interpolate(pred[None, None].to(torch.float32), scaled_patch_size, mode='trilinear')[
                                 0, 0] >= 0.5).to(torch.uint8)
 
                 refinement_bboxes = self._plan_refinement_bboxes(pred, scaled_bbox, force_full_refine)
