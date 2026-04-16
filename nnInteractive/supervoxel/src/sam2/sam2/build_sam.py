@@ -156,9 +156,7 @@ def build_sam2_hf(model_id, **kwargs):
 
 def build_sam2_video_predictor_hf(model_id, **kwargs):
     config_name, ckpt_path = _hf_download(model_id)
-    return build_sam2_video_predictor(
-        config_file=config_name, ckpt_path=ckpt_path, **kwargs
-    )
+    return build_sam2_video_predictor(config_file=config_name, ckpt_path=ckpt_path, **kwargs)
 
 
 def _load_checkpoint(model, ckpt_path):

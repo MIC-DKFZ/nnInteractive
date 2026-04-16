@@ -3,10 +3,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-def crop_and_pad_into_buffer(target_tensor: torch.Tensor,
-                             bbox: Sequence[Sequence[int]],
-                             source_tensor,
-                             source_leading_slice=None) -> None:
+
+def crop_and_pad_into_buffer(
+    target_tensor: torch.Tensor, bbox: Sequence[Sequence[int]], source_tensor, source_leading_slice=None
+) -> None:
     """
     Copies a sub-region from source_tensor into target_tensor based on a bounding box.
 
@@ -119,18 +119,24 @@ def paste_tensor(target, source, bbox, channel_idx=None):
             target_indices.append((t_start, t_end))
             source_indices.append((s_start, s_end))
 
-        src = source[source_indices[0][0]:source_indices[0][1],
-                     source_indices[1][0]:source_indices[1][1],
-                     source_indices[2][0]:source_indices[2][1]]
+        src = source[
+            source_indices[0][0] : source_indices[0][1],
+            source_indices[1][0] : source_indices[1][1],
+            source_indices[2][0] : source_indices[2][1],
+        ]
         if isinstance(src, torch.Tensor):
             src = src.cpu().numpy().astype(np.float16)
         else:
             src = np.asarray(src).astype(np.float16)
 
-        target[(channel_idx,
+        target[
+            (
+                channel_idx,
                 slice(target_indices[0][0], target_indices[0][1]),
                 slice(target_indices[1][0], target_indices[1][1]),
-                slice(target_indices[2][0], target_indices[2][1]))] = src
+                slice(target_indices[2][0], target_indices[2][1]),
+            )
+        ] = src
         return
 
     target_shape = target.shape  # (T0, T1, T2)
@@ -159,22 +165,29 @@ def paste_tensor(target, source, bbox, channel_idx=None):
 
     # Paste the corresponding region from source into target.
     if isinstance(target, torch.Tensor):
-        target[target_indices[0][0]:target_indices[0][1],
-        target_indices[1][0]:target_indices[1][1],
-        target_indices[2][0]:target_indices[2][1]] = \
-            source[source_indices[0][0]:source_indices[0][1],
-            source_indices[1][0]:source_indices[1][1],
-            source_indices[2][0]:source_indices[2][1]].to(target.device)
+        target[
+            target_indices[0][0] : target_indices[0][1],
+            target_indices[1][0] : target_indices[1][1],
+            target_indices[2][0] : target_indices[2][1],
+        ] = source[
+            source_indices[0][0] : source_indices[0][1],
+            source_indices[1][0] : source_indices[1][1],
+            source_indices[2][0] : source_indices[2][1],
+        ].to(
+            target.device
+        )
     else:
-        target[target_indices[0][0]:target_indices[0][1],
-        target_indices[1][0]:target_indices[1][1],
-        target_indices[2][0]:target_indices[2][1]] = \
-            source[source_indices[0][0]:source_indices[0][1],
-            source_indices[1][0]:source_indices[1][1],
-            source_indices[2][0]:source_indices[2][1]].cpu()
+        target[
+            target_indices[0][0] : target_indices[0][1],
+            target_indices[1][0] : target_indices[1][1],
+            target_indices[2][0] : target_indices[2][1],
+        ] = source[
+            source_indices[0][0] : source_indices[0][1],
+            source_indices[1][0] : source_indices[1][1],
+            source_indices[2][0] : source_indices[2][1],
+        ].cpu()
 
     return target
-
 
 
 def crop_to_valid(img, bbox):
@@ -212,10 +225,12 @@ def crop_to_valid(img, bbox):
         pad.append((pad_left, pad_right))
 
     # Crop the image on spatial dimensions, leaving the channel dimension intact.
-    cropped = img[:,
-                  crop_indices[0][0]:crop_indices[0][1],
-                  crop_indices[1][0]:crop_indices[1][1],
-                  crop_indices[2][0]:crop_indices[2][1]]
+    cropped = img[
+        :,
+        crop_indices[0][0] : crop_indices[0][1],
+        crop_indices[1][0] : crop_indices[1][1],
+        crop_indices[2][0] : crop_indices[2][1],
+    ]
     return cropped, pad
 
 
@@ -239,7 +254,7 @@ def pad_cropped(cropped: torch.Tensor, pad):
     """
     # F.pad for 3D data expects a 5D input (N, C, X, Y, Z) and a pad tuple of length 6:
     # (pad_z_left, pad_z_right, pad_y_left, pad_y_right, pad_x_left, pad_x_right)
-    need_unsqueeze = (cropped.dim() == 4)
+    need_unsqueeze = cropped.dim() == 4
     if need_unsqueeze:
         cropped = cropped.unsqueeze(0)  # Now shape is (1, C, X, Y, Z)
 

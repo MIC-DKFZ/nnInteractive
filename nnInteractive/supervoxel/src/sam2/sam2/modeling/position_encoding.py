@@ -61,12 +61,8 @@ class PositionEmbeddingSine(nn.Module):
 
         pos_x = x_embed[:, None] / dim_t
         pos_y = y_embed[:, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2
-        ).flatten(1)
-        pos_y = torch.stack(
-            (pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2
-        ).flatten(1)
+        pos_x = torch.stack((pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2).flatten(1)
+        pos_y = torch.stack((pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2).flatten(1)
         return pos_x, pos_y
 
     @torch.no_grad()
@@ -92,16 +88,8 @@ class PositionEmbeddingSine(nn.Module):
         if cache_key in self.cache:
             return self.cache[cache_key].to(device)[None].repeat(B, 1, 1, 1)
 
-        y_embed = (
-            torch.arange(1, H + 1, dtype=torch.float32, device=device)
-            .view(1, -1, 1)
-            .repeat(B, 1, W)
-        )
-        x_embed = (
-            torch.arange(1, W + 1, dtype=torch.float32, device=device)
-            .view(1, 1, -1)
-            .repeat(B, H, 1)
-        )
+        y_embed = torch.arange(1, H + 1, dtype=torch.float32, device=device).view(1, -1, 1).repeat(B, 1, W)
+        x_embed = torch.arange(1, W + 1, dtype=torch.float32, device=device).view(1, 1, -1).repeat(B, H, 1)
 
         if self.normalize:
             eps = 1e-6
@@ -113,12 +101,8 @@ class PositionEmbeddingSine(nn.Module):
 
         pos_x = x_embed[:, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4
-        ).flatten(3)
-        pos_y = torch.stack(
-            (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
-        ).flatten(3)
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         self.cache[cache_key] = pos[0]
         return pos
@@ -166,9 +150,7 @@ class PositionEmbeddingRandom(nn.Module):
         pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
         return pe.permute(2, 0, 1)  # C x H x W
 
-    def forward_with_coords(
-        self, coords_input: torch.Tensor, image_size: Tuple[int, int]
-    ) -> torch.Tensor:
+    def forward_with_coords(self, coords_input: torch.Tensor, image_size: Tuple[int, int]) -> torch.Tensor:
         """Positionally encode points that are not normalized to [0,1]."""
         coords = coords_input.clone()
         coords[:, :, 0] = coords[:, :, 0] / image_size[1]
@@ -216,11 +198,7 @@ def apply_rotary_enc(
     repeat_freqs_k: bool = False,
 ):
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = (
-        torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        if xk.shape[-2] != 0
-        else None
-    )
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)) if xk.shape[-2] != 0 else None
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     if xk_ is None:

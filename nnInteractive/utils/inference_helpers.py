@@ -42,6 +42,4 @@ def transform_coordinates_noresampling(
     """
     Converts coordinates in the original uncropped image to the internal cropped representation.
     """
-    return tuple(
-        coords_orig[d] - nnunet_preprocessing_crop_bbox[d][0] for d in range(len(coords_orig))
-    )
+    return tuple(coords_orig[d] - nnunet_preprocessing_crop_bbox[d][0] for d in range(len(coords_orig)))

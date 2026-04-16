@@ -37,9 +37,7 @@ def unix_pattern_to_parameter_names(
     parameter_names = []
     for param_name in constraints:
         matching_parameters = set(fnmatch.filter(all_parameter_names, param_name))
-        assert (
-            len(matching_parameters) > 0
-        ), f"param_names {param_name} don't match any param in the given names."
+        assert len(matching_parameters) > 0, f"param_names {param_name} don't match any param in the given names."
         parameter_names.append(matching_parameters)
     return set.union(*parameter_names)
 
@@ -105,24 +103,14 @@ def assert_skipped_parameters_are_frozen(model: nn.Module, patterns: List[str]):
     if not patterns:
         return
 
-    frozen_state_dict = filter_params_matching_unix_pattern(
-        patterns=patterns, state_dict=model.state_dict()
-    )
-    non_frozen_keys = {
-        n
-        for n, p in model.named_parameters()
-        if n in frozen_state_dict and p.requires_grad
-    }
+    frozen_state_dict = filter_params_matching_unix_pattern(patterns=patterns, state_dict=model.state_dict())
+    non_frozen_keys = {n for n, p in model.named_parameters() if n in frozen_state_dict and p.requires_grad}
     if non_frozen_keys:
-        raise ValueError(
-            f"Parameters excluded with `skip_saving_parameters` should be frozen: {non_frozen_keys}"
-        )
+        raise ValueError(f"Parameters excluded with `skip_saving_parameters` should be frozen: {non_frozen_keys}")
 
 
 @contextlib.contextmanager
-def with_check_parameter_frozen(
-    model: nn.Module, patterns: List[str], disabled: bool = True
-):
+def with_check_parameter_frozen(model: nn.Module, patterns: List[str], disabled: bool = True):
     """
     Context manager that inspects a model surrounding a piece of code
     and verifies if the model has been updated by this piece of code
@@ -139,16 +127,12 @@ def with_check_parameter_frozen(
         yield
         return
 
-    frozen_state_dict = filter_params_matching_unix_pattern(
-        patterns=patterns, state_dict=model.state_dict()
-    )
+    frozen_state_dict = filter_params_matching_unix_pattern(patterns=patterns, state_dict=model.state_dict())
     summary_before = _get_state_dict_summary(frozen_state_dict)
 
     yield
 
-    frozen_state_dict = filter_params_matching_unix_pattern(
-        patterns=patterns, state_dict=model.state_dict()
-    )
+    frozen_state_dict = filter_params_matching_unix_pattern(patterns=patterns, state_dict=model.state_dict())
     summary_after = _get_state_dict_summary(frozen_state_dict)
 
     if not np.allclose(summary_before, summary_after, atol=1e-6):
@@ -180,9 +164,7 @@ class CkptExcludeKernel:
         """
         if len(self.key_pattern) == 0:
             return state_dict
-        exclude_keys = unix_pattern_to_parameter_names(
-            self.key_pattern, state_dict.keys()
-        )
+        exclude_keys = unix_pattern_to_parameter_names(self.key_pattern, state_dict.keys())
         return {k: v for k, v in state_dict.items() if k not in exclude_keys}
 
 
@@ -233,13 +215,8 @@ def get_state_dict(checkpoint, ckpt_state_dict_keys):
         if (isinstance(pre_train_dict, Mapping) and key not in pre_train_dict) or (
             isinstance(pre_train_dict, Sequence) and key >= len(pre_train_dict)
         ):
-            key_str = (
-                '["' + '"]["'.join(list(map(ckpt_state_dict_keys[:i], str))) + '"]'
-            )
-            raise KeyError(
-                f"'{key}' not found in checkpoint{key_str} "
-                f"with keys: {pre_train_dict.keys()}"
-            )
+            key_str = '["' + '"]["'.join(list(map(ckpt_state_dict_keys[:i], str))) + '"]'
+            raise KeyError(f"'{key}' not found in checkpoint{key_str} " f"with keys: {pre_train_dict.keys()}")
         pre_train_dict = pre_train_dict[key]
     return pre_train_dict
 
@@ -266,9 +243,7 @@ def load_checkpoint_and_apply_kernels(
 
     Returns: Model with the matchin pre-trained weights loaded.
     """
-    assert g_pathmgr.exists(checkpoint_path), "Checkpoint '{}' not found".format(
-        checkpoint_path
-    )
+    assert g_pathmgr.exists(checkpoint_path), "Checkpoint '{}' not found".format(checkpoint_path)
 
     # Load the checkpoint on CPU to avoid GPU mem spike.
     with g_pathmgr.open(checkpoint_path, "rb") as f:
@@ -278,8 +253,7 @@ def load_checkpoint_and_apply_kernels(
 
     # Not logging into info etc since it's a huge log
     logging.debug(
-        "Loaded Checkpoint State Dict pre-kernel application: %s"
-        % str(", ".join(list(pre_train_dict.keys())))
+        "Loaded Checkpoint State Dict pre-kernel application: %s" % str(", ".join(list(pre_train_dict.keys())))
     )
     # Apply kernels
     if checkpoint_kernels is not None:
@@ -287,8 +261,7 @@ def load_checkpoint_and_apply_kernels(
             pre_train_dict = f(state_dict=pre_train_dict)
 
     logging.debug(
-        "Loaded Checkpoint State Dict Post-kernel application %s"
-        % str(", ".join(list(pre_train_dict.keys())))
+        "Loaded Checkpoint State Dict Post-kernel application %s" % str(", ".join(list(pre_train_dict.keys())))
     )
 
     return pre_train_dict
@@ -302,18 +275,12 @@ def check_load_state_dict_errors(
     ignore_unexpected_keys: List[str] = None,
 ):
     if ignore_missing_keys is not None and len(ignore_missing_keys) > 0:
-        ignored_keys = unix_pattern_to_parameter_names(
-            ignore_missing_keys, missing_keys
-        )
+        ignored_keys = unix_pattern_to_parameter_names(ignore_missing_keys, missing_keys)
         missing_keys = [key for key in missing_keys if key not in ignored_keys]
 
     if ignore_unexpected_keys is not None and len(ignore_unexpected_keys) > 0:
-        ignored_unexpected_keys = unix_pattern_to_parameter_names(
-            ignore_unexpected_keys, unexpected_keys
-        )
-        unexpected_keys = [
-            key for key in unexpected_keys if key not in ignored_unexpected_keys
-        ]
+        ignored_unexpected_keys = unix_pattern_to_parameter_names(ignore_unexpected_keys, unexpected_keys)
+        unexpected_keys = [key for key in unexpected_keys if key not in ignored_unexpected_keys]
 
     err = "State key mismatch."
     if unexpected_keys:

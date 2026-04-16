@@ -5,7 +5,8 @@ import SimpleITK as sitk
 import numpy as np
 import blosc2
 
-class NfitiReaderWriter():
+
+class NfitiReaderWriter:
     def __init__(self):
         """
         NfitiReaderWriter class constructor. This class is responsible for reading and writing nifti files.
@@ -37,7 +38,7 @@ class NfitiReaderWriter():
         sitk.WriteImage(out_image, output_path)
 
 
-class BloscReaderWriter():
+class BloscReaderWriter:
     def __init__(self):
         """
         BloscReaderWriter class constructor. This class is responsible for reading and writing blosc files.
@@ -51,12 +52,10 @@ class BloscReaderWriter():
         Returns:
             array (np.ndarray): The image array.
         """
-        dparams = {
-            'nthreads': 1
-        }
-        im = blosc2.open(urlpath=image_path, mode='r', dparams=dparams, mmap_mode='r')
+        dparams = {"nthreads": 1}
+        im = blosc2.open(urlpath=image_path, mode="r", dparams=dparams, mmap_mode="r")
         return im[:], None
-    
+
     def write(self, array: np.ndarray, properties, output_path: str):
         """
         Write the image file.
@@ -67,24 +66,31 @@ class BloscReaderWriter():
             output_path (str): The path to save the image file.
         """
         cparams = {
-            'codec': blosc2.Codec.ZSTD,
+            "codec": blosc2.Codec.ZSTD,
             # 'filters': [blosc2.Filter.SHUFFLE],
             # 'splitmode': blosc2.SplitMode.ALWAYS_SPLIT,
-            'clevel': 8,
+            "clevel": 8,
         }
-        chunks, blocks = None, None # self.comp_blosc2_params(array.shape, [192, 192, 192], array.itemsize)
+        chunks, blocks = None, None  # self.comp_blosc2_params(array.shape, [192, 192, 192], array.itemsize)
         # print(output_filename_truncated, data.shape, seg.shape, blocks, chunks, blocks_seg, chunks_seg, data.dtype, seg.dtype)
-        blosc2.asarray(np.ascontiguousarray(array), urlpath=output_path, chunks=chunks,
-                       blocks=blocks, cparams=cparams, mmap_mode='w+')
+        blosc2.asarray(
+            np.ascontiguousarray(array),
+            urlpath=output_path,
+            chunks=chunks,
+            blocks=blocks,
+            cparams=cparams,
+            mmap_mode="w+",
+        )
 
-    def comp_blosc2_params(self,
-            image_size: Tuple[int, int, int, int],
-            patch_size: Union[Tuple[int, int], Tuple[int, int, int]],
-            bytes_per_pixel: int = 4,  # 4 byte are float32
-            l1_cache_size_per_core_in_bytes=32768,  # 1 Kibibyte (KiB) = 2^10 Byte;  32 KiB = 32768 Byte
-            l3_cache_size_per_core_in_bytes=1441792,
-            # 1 Mibibyte (MiB) = 2^20 Byte = 1.048.576 Byte; 1.375MiB = 1441792 Byte
-            safety_factor: float = 0.8  # we dont will the caches to the brim. 0.8 means we target 80% of the caches
+    def comp_blosc2_params(
+        self,
+        image_size: Tuple[int, int, int, int],
+        patch_size: Union[Tuple[int, int], Tuple[int, int, int]],
+        bytes_per_pixel: int = 4,  # 4 byte are float32
+        l1_cache_size_per_core_in_bytes=32768,  # 1 Kibibyte (KiB) = 2^10 Byte;  32 KiB = 32768 Byte
+        l3_cache_size_per_core_in_bytes=1441792,
+        # 1 Mibibyte (MiB) = 2^20 Byte = 1.048.576 Byte; 1.375MiB = 1441792 Byte
+        safety_factor: float = 0.8,  # we dont will the caches to the brim. 0.8 means we target 80% of the caches
     ):
         """
         Computes a recommended block and chunk size for saving arrays with blosc v2.
@@ -167,5 +173,3 @@ class BloscReaderWriter():
 
         # print(image_size, chunk_size, block_size)
         return tuple(block_size), tuple(chunk_size)
-
-

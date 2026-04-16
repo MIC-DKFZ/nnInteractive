@@ -67,30 +67,16 @@ def resize(datapoint, index, size, max_size=None, square=False, v2=False):
     if square:
         size = size, size
     else:
-        cur_size = (
-            datapoint.frames[index].data.size()[-2:][::-1]
-            if v2
-            else datapoint.frames[index].data.size
-        )
+        cur_size = datapoint.frames[index].data.size()[-2:][::-1] if v2 else datapoint.frames[index].data.size
         size = get_size(cur_size, size, max_size)
 
-    old_size = (
-        datapoint.frames[index].data.size()[-2:][::-1]
-        if v2
-        else datapoint.frames[index].data.size
-    )
+    old_size = datapoint.frames[index].data.size()[-2:][::-1] if v2 else datapoint.frames[index].data.size
     if v2:
-        datapoint.frames[index].data = Fv2.resize(
-            datapoint.frames[index].data, size, antialias=True
-        )
+        datapoint.frames[index].data = Fv2.resize(datapoint.frames[index].data, size, antialias=True)
     else:
         datapoint.frames[index].data = F.resize(datapoint.frames[index].data, size)
 
-    new_size = (
-        datapoint.frames[index].data.size()[-2:][::-1]
-        if v2
-        else datapoint.frames[index].data.size
-    )
+    new_size = datapoint.frames[index].data.size()[-2:][::-1] if v2 else datapoint.frames[index].data.size
 
     for obj in datapoint.frames[index].objects:
         if obj.segment is not None:
@@ -106,9 +92,7 @@ def pad(datapoint, index, padding, v2=False):
     h, w = old_h, old_w
     if len(padding) == 2:
         # assumes that we only pad on the bottom right corners
-        datapoint.frames[index].data = F.pad(
-            datapoint.frames[index].data, (0, 0, padding[0], padding[1])
-        )
+        datapoint.frames[index].data = F.pad(datapoint.frames[index].data, (0, 0, padding[0], padding[1]))
         h += padding[1]
         w += padding[0]
     else:
@@ -155,9 +139,7 @@ class RandomHorizontalFlip:
 
 
 class RandomResizeAPI:
-    def __init__(
-        self, sizes, consistent_transform, max_size=None, square=False, v2=False
-    ):
+    def __init__(self, sizes, consistent_transform, max_size=None, square=False, v2=False):
         if isinstance(sizes, int):
             sizes = (sizes,)
         assert isinstance(sizes, Iterable)
@@ -171,15 +153,11 @@ class RandomResizeAPI:
         if self.consistent_transform:
             size = random.choice(self.sizes)
             for i in range(len(datapoint.frames)):
-                datapoint = resize(
-                    datapoint, i, size, self.max_size, square=self.square, v2=self.v2
-                )
+                datapoint = resize(datapoint, i, size, self.max_size, square=self.square, v2=self.v2)
             return datapoint
         for i in range(len(datapoint.frames)):
             size = random.choice(self.sizes)
-            datapoint = resize(
-                datapoint, i, size, self.max_size, square=self.square, v2=self.v2
-            )
+            datapoint = resize(datapoint, i, size, self.max_size, square=self.square, v2=self.v2)
         return datapoint
 
 
@@ -252,21 +230,9 @@ class RandomGrayscale:
 class ColorJitter:
     def __init__(self, consistent_transform, brightness, contrast, saturation, hue):
         self.consistent_transform = consistent_transform
-        self.brightness = (
-            brightness
-            if isinstance(brightness, list)
-            else [max(0, 1 - brightness), 1 + brightness]
-        )
-        self.contrast = (
-            contrast
-            if isinstance(contrast, list)
-            else [max(0, 1 - contrast), 1 + contrast]
-        )
-        self.saturation = (
-            saturation
-            if isinstance(saturation, list)
-            else [max(0, 1 - saturation), 1 + saturation]
-        )
+        self.brightness = brightness if isinstance(brightness, list) else [max(0, 1 - brightness), 1 + brightness]
+        self.contrast = contrast if isinstance(contrast, list) else [max(0, 1 - contrast), 1 + contrast]
+        self.saturation = saturation if isinstance(saturation, list) else [max(0, 1 - saturation), 1 + saturation]
         self.hue = hue if isinstance(hue, list) or hue is None else ([-hue, hue])
 
     def __call__(self, datapoint: VideoDatapoint, **kwargs):
@@ -278,9 +244,7 @@ class ColorJitter:
                 contrast_factor,
                 saturation_factor,
                 hue_factor,
-            ) = T.ColorJitter.get_params(
-                self.brightness, self.contrast, self.saturation, self.hue
-            )
+            ) = T.ColorJitter.get_params(self.brightness, self.contrast, self.saturation, self.hue)
         for img in datapoint.frames:
             if not self.consistent_transform:
                 (
@@ -289,9 +253,7 @@ class ColorJitter:
                     contrast_factor,
                     saturation_factor,
                     hue_factor,
-                ) = T.ColorJitter.get_params(
-                    self.brightness, self.contrast, self.saturation, self.hue
-                )
+                ) = T.ColorJitter.get_params(self.brightness, self.contrast, self.saturation, self.hue)
             for fn_id in fn_idx:
                 if fn_id == 0 and brightness_factor is not None:
                     img.data = F.adjust_brightness(img.data, brightness_factor)
@@ -323,9 +285,7 @@ class RandomAffine:
         """
         self.degrees = degrees if isinstance(degrees, list) else ([-degrees, degrees])
         self.scale = scale
-        self.shear = (
-            shear if isinstance(shear, list) else ([-shear, shear] if shear else None)
-        )
+        self.shear = shear if isinstance(shear, list) else ([-shear, shear] if shear else None)
         self.translate = translate
         self.fill_img = image_mean
         self.consistent_transform = consistent_transform
@@ -366,10 +326,7 @@ class RandomAffine:
             )
 
         for img_idx, img in enumerate(datapoint.frames):
-            this_masks = [
-                obj.segment.unsqueeze(0) if obj.segment is not None else None
-                for obj in img.objects
-            ]
+            this_masks = [obj.segment.unsqueeze(0) if obj.segment is not None else None for obj in img.objects]
             if not self.consistent_transform:
                 # if not consistent we create a new affine params for every frame&mask pair Create a random affine transformation
                 affine_params = T.RandomAffine.get_params(
@@ -458,9 +415,7 @@ def random_mosaic_frame(
             if is_pil:
                 image_data_output.paste(image_data_downsize, (x_offset_b, y_offset_b))
             else:
-                image_data_output[:, y_offset_b:y_offset_e, x_offset_b:x_offset_e] = (
-                    image_data_downsize
-                )
+                image_data_output[:, y_offset_b:y_offset_e, x_offset_b:x_offset_e] = image_data_downsize
 
     datapoint.frames[index].data = image_data_output
 
@@ -487,9 +442,7 @@ def random_mosaic_frame(
         if should_hflip[target_grid_y, target_grid_x].item():
             segment_downsize = F.hflip(segment_downsize[None, None])[0, 0]
 
-        segment_output[
-            target_y_offset_b:target_y_offset_e, target_x_offset_b:target_x_offset_e
-        ] = segment_downsize
+        segment_output[target_y_offset_b:target_y_offset_e, target_x_offset_b:target_x_offset_e] = segment_downsize
         obj.segment = segment_output
 
     return datapoint

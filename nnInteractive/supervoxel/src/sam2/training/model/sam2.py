@@ -78,9 +78,7 @@ class SAM2Train(SAM2Base):
         self.prob_to_use_pt_input_for_eval = prob_to_use_pt_input_for_eval
         self.prob_to_use_box_input_for_eval = prob_to_use_box_input_for_eval
         if prob_to_use_pt_input_for_train > 0 or prob_to_use_pt_input_for_eval > 0:
-            logging.info(
-                f"Training with points (sampled from masks) as inputs with p={prob_to_use_pt_input_for_train}"
-            )
+            logging.info(f"Training with points (sampled from masks) as inputs with p={prob_to_use_pt_input_for_train}")
             assert num_frames_to_correct_for_train >= num_init_cond_frames_for_train
             assert num_frames_to_correct_for_eval >= num_init_cond_frames_for_eval
 
@@ -155,8 +153,7 @@ class SAM2Train(SAM2Base):
         #     for stage_id, targets in enumerate(input.find_targets)
         # }
         gt_masks_per_frame = {
-            stage_id: masks.unsqueeze(1)  # [B, 1, H_im, W_im]
-            for stage_id, masks in enumerate(input.masks)
+            stage_id: masks.unsqueeze(1) for stage_id, masks in enumerate(input.masks)  # [B, 1, H_im, W_im]
         }
         # gt_masks_per_frame = input.masks.unsqueeze(2) # [T,B,1,H_im,W_im] keep everything in tensor form
         backbone_out["gt_masks_per_frame"] = gt_masks_per_frame
@@ -189,19 +186,11 @@ class SAM2Train(SAM2Base):
         use_pt_input = self.rng.random() < prob_to_use_pt_input
         if rand_init_cond_frames and num_init_cond_frames > 1:
             # randomly select 1 to `num_init_cond_frames` frames as initial conditioning frames
-            num_init_cond_frames = self.rng.integers(
-                1, num_init_cond_frames, endpoint=True
-            )
-        if (
-            use_pt_input
-            and rand_frames_to_correct
-            and num_frames_to_correct > num_init_cond_frames
-        ):
+            num_init_cond_frames = self.rng.integers(1, num_init_cond_frames, endpoint=True)
+        if use_pt_input and rand_frames_to_correct and num_frames_to_correct > num_init_cond_frames:
             # randomly select `num_init_cond_frames` to `num_frames_to_correct` frames to sample
             # correction clicks (only for the case of point input)
-            num_frames_to_correct = self.rng.integers(
-                num_init_cond_frames, num_frames_to_correct, endpoint=True
-            )
+            num_frames_to_correct = self.rng.integers(num_init_cond_frames, num_frames_to_correct, endpoint=True)
         backbone_out["use_pt_input"] = use_pt_input
 
         # Sample initial conditioning frames
@@ -237,9 +226,7 @@ class SAM2Train(SAM2Base):
                     points, labels = get_next_point(
                         gt_masks=gt_masks_per_frame[t],
                         pred_masks=None,
-                        method=(
-                            "uniform" if self.training else self.pt_sampling_for_eval
-                        ),
+                        method=("uniform" if self.training else self.pt_sampling_for_eval),
                     )
 
                 point_inputs = {"point_coords": points, "point_labels": labels}
@@ -258,17 +245,13 @@ class SAM2Train(SAM2Base):
             extra_num = num_frames_to_correct - num_init_cond_frames
             frames_to_add_correction_pt = (
                 init_cond_frames
-                + self.rng.choice(
-                    backbone_out["frames_not_in_init_cond"], extra_num, replace=False
-                ).tolist()
+                + self.rng.choice(backbone_out["frames_not_in_init_cond"], extra_num, replace=False).tolist()
             )
         backbone_out["frames_to_add_correction_pt"] = frames_to_add_correction_pt
 
         return backbone_out
 
-    def forward_tracking(
-        self, backbone_out, input: BatchedVideoDatapoint, return_dict=False
-    ):
+    def forward_tracking(self, backbone_out, input: BatchedVideoDatapoint, return_dict=False):
         """Forward video tracking on each frame (and sample correction clicks)."""
         img_feats_already_computed = backbone_out["backbone_fpn"] is not None
         if img_feats_already_computed:
@@ -308,9 +291,7 @@ class SAM2Train(SAM2Base):
                     current_vision_feats,
                     current_vision_pos_embeds,
                     feat_sizes,
-                ) = self._prepare_backbone_features_per_frame(
-                    input.flat_img_batch, img_ids
-                )
+                ) = self._prepare_backbone_features_per_frame(input.flat_img_batch, img_ids)
 
             # Get output masks based on this frame's prompts and previous memory
             current_out = self.track_step(
@@ -328,8 +309,7 @@ class SAM2Train(SAM2Base):
             )
             # Append the output, depending on whether it's a conditioning frame
             add_output_as_cond_frame = stage_id in init_cond_frames or (
-                self.add_all_frames_to_correct_as_cond
-                and stage_id in frames_to_add_correction_pt
+                self.add_all_frames_to_correct_as_cond and stage_id in frames_to_add_correction_pt
             )
             if add_output_as_cond_frame:
                 output_dict["cond_frame_outputs"][stage_id] = current_out
@@ -344,9 +324,7 @@ class SAM2Train(SAM2Base):
         all_frame_outputs.update(output_dict["non_cond_frame_outputs"])
         all_frame_outputs = [all_frame_outputs[t] for t in range(num_frames)]
         # Make DDP happy with activation checkpointing by removing unused keys
-        all_frame_outputs = [
-            {k: v for k, v in d.items() if k != "obj_ptr"} for d in all_frame_outputs
-        ]
+        all_frame_outputs = [{k: v for k, v in d.items() if k != "obj_ptr"} for d in all_frame_outputs]
 
         return all_frame_outputs
 
@@ -473,9 +451,7 @@ class SAM2Train(SAM2Base):
             # sample a new point from the error between prediction and ground-truth
             # (with a small probability, directly sample from GT masks instead of errors)
             if self.training and self.prob_to_sample_from_gt_for_train > 0:
-                sample_from_gt = (
-                    self.rng.random() < self.prob_to_sample_from_gt_for_train
-                )
+                sample_from_gt = self.rng.random() < self.prob_to_sample_from_gt_for_train
             else:
                 sample_from_gt = False
             # if `pred_for_new_pt` is None, only GT masks will be used for point sampling
@@ -529,9 +505,7 @@ class SAM2Train(SAM2Base):
         # Concatenate the masks along channel (to compute losses on all of them,
         # using `MultiStepIteractiveMasks`)
         current_out["multistep_pred_masks"] = torch.cat(all_pred_masks, dim=1)
-        current_out["multistep_pred_masks_high_res"] = torch.cat(
-            all_pred_high_res_masks, dim=1
-        )
+        current_out["multistep_pred_masks_high_res"] = torch.cat(all_pred_high_res_masks, dim=1)
         current_out["multistep_pred_multimasks"] = all_pred_multimasks
         current_out["multistep_pred_multimasks_high_res"] = all_pred_high_res_multimasks
         current_out["multistep_pred_ious"] = all_pred_ious

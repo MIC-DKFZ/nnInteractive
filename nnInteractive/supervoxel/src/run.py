@@ -10,7 +10,6 @@ import torch
 import gc
 
 
-
 def list_and_clear_tensors_on_gpu():
 
     gpu_tensors = []  # Collect GPU tensors to analyze them
@@ -55,12 +54,14 @@ def run(input_folder: str, output_folder: str, config: str):
     # Load congiguration file
     with open(config, "r") as file:
         config = yaml.safe_load(file)
-    
+
     gen = SuperVoxelGenerator(input_folder, output_folder, config)
 
     # List of files
-    list_of_files = [f for f in os.listdir(input_folder) if f.endswith(config["file_format"]) and config["excluded_strings"] not in f]
-    
+    list_of_files = [
+        f for f in os.listdir(input_folder) if f.endswith(config["file_format"]) and config["excluded_strings"] not in f
+    ]
+
     # Shuffle the list of files
     np.random.shuffle(list_of_files)
     for image_name in tqdm(list_of_files):
@@ -95,12 +96,27 @@ def run(input_folder: str, output_folder: str, config: str):
 
 def run_entrypoint():
     parser = argparse.ArgumentParser(description="Run SuperVoxel generation using SAM")
-    parser.add_argument("-i", "-input_folder", type=str, help="Path to folder containing the images. They can be in raw Nifit format \
-                         or using the new nnUNet supported bloscv2, depending on the file format provided in the config file.")
-    parser.add_argument("-o", "-output_folder", type=str, help="Path to output folder. If not provided, the output will be saved in the \
-                         same parent folder as the dataset and named 'supervoxel'.")
-    parser.add_argument("-c", "-config", type=str, help="Path to configuration file containing the parameters for the SuperVoxel generation.",
-                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),"../configs/nnUNet_preprocessed.yaml"))
+    parser.add_argument(
+        "-i",
+        "-input_folder",
+        type=str,
+        help="Path to folder containing the images. They can be in raw Nifit format \
+                         or using the new nnUNet supported bloscv2, depending on the file format provided in the config file.",
+    )
+    parser.add_argument(
+        "-o",
+        "-output_folder",
+        type=str,
+        help="Path to output folder. If not provided, the output will be saved in the \
+                         same parent folder as the dataset and named 'supervoxel'.",
+    )
+    parser.add_argument(
+        "-c",
+        "-config",
+        type=str,
+        help="Path to configuration file containing the parameters for the SuperVoxel generation.",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "../configs/nnUNet_preprocessed.yaml"),
+    )
     args = parser.parse_args()
 
     run(args.i, args.o, args.c)
@@ -108,11 +124,13 @@ def run_entrypoint():
 
 def run_save_fg_locations_entrypoint():
     parser = argparse.ArgumentParser(description="Run generation of pkl files for nnUNet")
-    parser.add_argument("-supervoxel_folder", type=str, help="Path to folder containing the supervoxel masks", default="/home/m574s/PhD/projects/SuperVoxel/supervoxels/")
+    parser.add_argument(
+        "-supervoxel_folder",
+        type=str,
+        help="Path to folder containing the supervoxel masks",
+        default="/home/m574s/PhD/projects/SuperVoxel/supervoxels/",
+    )
     parser.add_argument("-np", "-num_processes", type=int, help="Number of processes to use")
     args = parser.parse_args()
 
     generate_fg_locations(args.supervoxel_folder, args.np)
-
-
-

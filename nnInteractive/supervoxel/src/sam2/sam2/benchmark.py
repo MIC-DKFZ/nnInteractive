@@ -28,19 +28,13 @@ sam2_checkpoint = "checkpoints/sam2.1_hiera_base_plus.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 
 # Build video predictor with vos_optimized=True setting
-predictor = build_sam2_video_predictor(
-    model_cfg, sam2_checkpoint, device=device, vos_optimized=True
-)
+predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device, vos_optimized=True)
 
 
 # Initialize with video
 video_dir = "notebooks/videos/bedroom"
 # scan all the JPEG frame names in this directory
-frame_names = [
-    p
-    for p in os.listdir(video_dir)
-    if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-]
+frame_names = [p for p in os.listdir(video_dir) if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]]
 frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
 inference_state = predictor.init_state(video_path=video_dir)
 

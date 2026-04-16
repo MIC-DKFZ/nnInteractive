@@ -209,15 +209,7 @@ class MemMeter:
             torch.cuda.reset_peak_memory_stats()
 
     def __str__(self):
-        fmtstr = (
-            "{name}: {val"
-            + self.fmt
-            + "} ({avg"
-            + self.fmt
-            + "}/{peak"
-            + self.fmt
-            + "})"
-        )
+        fmtstr = "{name}: {val" + self.fmt + "} ({avg" + self.fmt + "}/{peak" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
 
@@ -260,12 +252,7 @@ class ProgressMeter:
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         entries += [
-            " | ".join(
-                [
-                    f"{os.path.join(name, subname)}: {val:.4f}"
-                    for subname, val in meter.compute().items()
-                ]
-            )
+            " | ".join([f"{os.path.join(name, subname)}: {val:.4f}" for subname, val in meter.compute().items()])
             for name, meter in self.real_meters.items()
         ]
         logging.info(" | ".join(entries))

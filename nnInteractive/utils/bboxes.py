@@ -6,7 +6,14 @@ import numpy as np
 import torch
 
 
-def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[int], Tuple[int, int, int], str] = (16, 16, 16), margin=(10, 10, 10), max_depth=5, current_depth=0):
+def generate_bounding_boxes(
+    mask,
+    bbox_size=(192, 192, 192),
+    stride: Union[List[int], Tuple[int, int, int], str] = (16, 16, 16),
+    margin=(10, 10, 10),
+    max_depth=5,
+    current_depth=0,
+):
     """
     Generate overlapping bounding boxes to cover a 3D binary segmentation mask using PyTorch tensors.
 
@@ -48,7 +55,7 @@ def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[
     min_coords = object_voxels.min(dim=0)[0]
     max_coords = object_voxels.max(dim=0)[0]
 
-    if isinstance(stride, str) and stride == 'auto':
+    if isinstance(stride, str) and stride == "auto":
         stride = [max(1, round((j.item() - i.item()) / 4)) for i, j in zip(min_coords, max_coords)]
 
     stride = list(stride)
@@ -92,11 +99,7 @@ def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[
             z_start = max(0, c_z - half_size[2] + margin[2])
             z_end = min(mask.shape[2], c_z + end_offset[2] - margin[2])
 
-            num_covered = uncovered[
-                          x_start:x_end,
-                          y_start:y_end,
-                          z_start:z_end
-            ].sum().item()
+            num_covered = uncovered[x_start:x_end, y_start:y_end, z_start:z_end].sum().item()
             if num_covered > best_covered:
                 best_covered = num_covered
                 best_center = idx
@@ -109,18 +112,20 @@ def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[
 
         # Add the best bounding box
         c_x, c_y, c_z = [i.item() for i in potential_centers[best_center]]
-        bboxes.append([
-            [c_x - half_size[0], c_x + end_offset[0]],
-            [c_y - half_size[1], c_y + end_offset[1]],
-            [c_z - half_size[2], c_z + end_offset[2]],
-        ])
+        bboxes.append(
+            [
+                [c_x - half_size[0], c_x + end_offset[0]],
+                [c_y - half_size[1], c_y + end_offset[1]],
+                [c_z - half_size[2], c_z + end_offset[2]],
+            ]
+        )
 
         # Mark voxels as covered, respecting the margin
         x_s, x_e, y_s, y_e, z_s, z_e = best_bounds
         uncovered[
-            x_s: x_e,
-            y_s: y_e,
-            z_s: z_e,
+            x_s:x_e,
+            y_s:y_e,
+            z_s:z_e,
         ] = 0
 
         # Remove the used center from potential_centers
@@ -128,7 +133,7 @@ def generate_bounding_boxes(mask, bbox_size=(192, 192, 192), stride: Union[List[
 
     # Step 5: Recursively cover remaining voxels using uncovered as the mask
     if uncovered.any():
-        if True: #uncovered.sum() < np.prod([i // 3 for i in bbox_size]):
+        if True:  # uncovered.sum() < np.prod([i // 3 for i in bbox_size]):
             # print('random fallback')
             bboxes.extend(random_sampling_fallback(uncovered, bbox_size, margin, 10))
         else:
@@ -148,7 +153,7 @@ def random_sampling_fallback(mask: torch.Tensor, bbox_size=(192, 192, 192), marg
     bboxes = []
 
     while mask.any():
-        indices = torch.nonzero(mask) # nx3
+        indices = torch.nonzero(mask)  # nx3
 
         best_center = None
         best_covered = 0
@@ -166,11 +171,7 @@ def random_sampling_fallback(mask: torch.Tensor, bbox_size=(192, 192, 192), marg
             z_start = max(0, c_z - half_size[2] + margin[2])
             z_end = min(mask.shape[2], c_z + end_offset[2] - margin[2])
 
-            num_covered = mask[
-                          x_start:x_end,
-                          y_start:y_end,
-                          z_start:z_end
-            ].sum().item()
+            num_covered = mask[x_start:x_end, y_start:y_end, z_start:z_end].sum().item()
             if num_covered > best_covered:
                 best_covered = num_covered
                 best_center = center
@@ -178,23 +179,25 @@ def random_sampling_fallback(mask: torch.Tensor, bbox_size=(192, 192, 192), marg
 
         # Add the best bounding box
         c_x, c_y, c_z = [int(i.item()) for i in best_center]
-        bboxes.append([
-            [c_x - half_size[0], c_x + end_offset[0]],
-            [c_y - half_size[1], c_y + end_offset[1]],
-            [c_z - half_size[2], c_z + end_offset[2]],
-        ])
+        bboxes.append(
+            [
+                [c_x - half_size[0], c_x + end_offset[0]],
+                [c_y - half_size[1], c_y + end_offset[1]],
+                [c_z - half_size[2], c_z + end_offset[2]],
+            ]
+        )
 
         # Mark voxels as covered, respecting the margin
         x_s, x_e, y_s, y_e, z_s, z_e = best_bounds
         mask[
-            x_s: x_e,
-            y_s: y_e,
-            z_s: z_e,
+            x_s:x_e,
+            y_s:y_e,
+            z_s:z_e,
         ] = 0
     return bboxes
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     times = []
     torch.set_num_threads(8)
     for _ in range(1):
@@ -204,10 +207,7 @@ if __name__ == '__main__':
 
         # Generate bounding boxes with an odd size to test
         bboxes = random_sampling_fallback(
-            mask,
-            bbox_size=(193, 193, 193),  # Odd size
-            stride='auto',
-            margin=(10, 10, 10)
+            mask, bbox_size=(193, 193, 193), stride="auto", margin=(10, 10, 10)  # Odd size
         )
 
         # Print results
