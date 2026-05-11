@@ -5,16 +5,27 @@
 
 This repository provides the official Python backend for `nnInteractive`, a state-of-the-art framework for 3D promptable segmentation. It is designed for seamless integration into Python-based workflows—ideal for researchers, developers, and power users working directly with code.
 
-`nnInteractive` is also available through graphical viewers (GUI) for those who prefer a visual workflow. 
-The napari and MITK integrations are developed and maintained by our team. Thanks to the community for contributing the 
-3D Slicer extension!
+`nnInteractive` is also available through graphical viewers (GUI) for those who prefer a visual workflow.
 
+### Recommended integrations (developed and maintained by our team)
 
 <div align="center">
 
-| **<div align="center">[napari plugin](https://github.com/MIC-DKFZ/napari-nninteractive)</div>** | **<div align="center">[MITK integration](https://www.mitk.org/)</div>** | **<div align="center">[3D Slicer extension](https://github.com/coendevente/SlicerNNInteractive)</div>** | **<div align="center">[ITK-SNAP extension](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html)</div>** | **<div align="center">[OHIF integration](https://github.com/CCI-Bonn/OHIF-AI)</div>** |
-|-------------------|----------------------|-------------------------|-------------------------|-------------------------|
-| [<img src="imgs/Logos/napari.jpg" height="200">](https://github.com/MIC-DKFZ/napari-nninteractive) | [<img src="imgs/Logos/mitk.jpg" height="200">](https://www.mitk.org/) | [<img src="imgs/Logos/3DSlicer.png" height="200">](https://github.com/coendevente/SlicerNNInteractive) | [<img src="imgs/Logos/snaplogo_sq.png" height="200">](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html) | [<img src="imgs/Logos/ohif.png" height="200">](https://github.com/CCI-Bonn/OHIF-AI) |
+| **<div align="center">[napari plugin](https://github.com/MIC-DKFZ/napari-nninteractive)</div>** | **<div align="center">[MITK integration](https://www.mitk.org/)</div>** |
+|-------------------|----------------------|
+| [<img src="imgs/Logos/napari.jpg" height="200">](https://github.com/MIC-DKFZ/napari-nninteractive) | [<img src="imgs/Logos/mitk.jpg" height="200">](https://www.mitk.org/) |
+
+</div>
+
+### Community-driven integrations
+
+Huge thanks to the community for contributing these integrations!
+
+<div align="center">
+
+| **<div align="center">[3D Slicer extension](https://github.com/coendevente/SlicerNNInteractive)</div>** | **<div align="center">[ITK-SNAP extension](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html)</div>** | **<div align="center">[OHIF integration](https://github.com/CCI-Bonn/OHIF-AI)</div>** |
+|-------------------------|-------------------------|-------------------------|
+| [<img src="imgs/Logos/3DSlicer.png" height="200">](https://github.com/coendevente/SlicerNNInteractive) | [<img src="imgs/Logos/snaplogo_sq.png" height="200">](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html) | [<img src="imgs/Logos/ohif.png" height="200">](https://github.com/CCI-Bonn/OHIF-AI) |
 
 </div>
 
