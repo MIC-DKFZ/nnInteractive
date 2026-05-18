@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class nnInteractiveInferenceSession():
     def __init__(self,
                  device: torch.device = torch.device('cuda'),
-                 use_torch_compile: bool = False,
+                 use_torch_compile: bool = True,
                  verbose: bool = False,
                  torch_n_threads: int = 8,
                  do_autozoom: bool = True,
@@ -41,11 +41,11 @@ class nnInteractiveInferenceSession():
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
         """
         # set as part of initialization
-        assert use_torch_compile is False, ('This implementation places the preprocessed image and the interactions '
-                                            'into pinned memory for speed reasons. This is incompatible with '
-                                            'torch.compile because of inconsistent strides in the memory layout. '
-                                            'Note to self: .contiguous() on GPU could be a solution. Unclear whether '
-                                            'that will yield a benefit though.')
+        # assert use_torch_compile is False, ('This implementation places the preprocessed image and the interactions '
+        #                                     'into pinned memory for speed reasons. This is incompatible with '
+        #                                     'torch.compile because of inconsistent strides in the memory layout. '
+        #                                     'Note to self: .contiguous() on GPU could be a solution. Unclear whether '
+        #                                     'that will yield a benefit though.')
         self.network = None
         self.label_manager = None
         self.dataset_json = None
@@ -378,12 +378,13 @@ class nnInteractiveInferenceSession():
         zoom_out_factor = min(4, zoom_out_factor)
 
         start_predict = time()
-        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            # on macos, autocast does not have huge performance benefits.
+        with torch.autocast(self.device.type, enabled=True) if self.device.type in ['cuda', 'cpu'] else dummy_context():
             # make a prediction at zoom_out_factor, remember max_zoom_out_factor
             start_initial_pred = time()
             input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
-            pred = self.network(input_for_predict[None])[0].argmax(0).detach()
+            start_model_predict = time()
+            pred = self.network(input_for_predict.contiguous()[None])[0].argmax(0).detach()
+            
             del input_for_predict
 
             # detect changes at border. If there are, we enter autozoom
@@ -396,7 +397,9 @@ class nnInteractiveInferenceSession():
             has_change = self._detect_change_at_border(pred, previous_prediction)
             del previous_prediction
 
-            logger.info(f'Took {round(time() - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}')
+            current_time = time()
+            logger.info(f'Took {round(current_time - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}')
+            logger.info(f'Model inference time: {round(current_time - start_model_predict, 3)} s')
 
             # maybe do zoom out
             zoom_out_growth_factor = 1.5
@@ -411,7 +414,7 @@ class nnInteractiveInferenceSession():
                     zoom_out_factor = min(4, zoom_out_factor)
 
                 input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
-                pred = self.network(input_for_predict[None])[0].argmax(0).detach()
+                pred = self.network(input_for_predict.contiguous()[None])[0].argmax(0).detach()
                 del input_for_predict
 
                 # detect changes at border. If there are, we enter autozoom
@@ -548,7 +551,7 @@ class nnInteractiveInferenceSession():
             crop_and_pad_into_buffer(preallocated_input[1], refinement_bbox, prediction_with_coarse)
             crop_and_pad_into_buffer(preallocated_input[2:], refinement_bbox, self.interactions[1:])
 
-            pred = self.network(preallocated_input[None])[0].argmax(0).detach()
+            pred = self.network(preallocated_input.contiguous()[None])[0].argmax(0).detach()
 
             paste_tensor(self.interactions[0], pred, refinement_bbox)
             # place into target buffer
@@ -575,8 +578,10 @@ class nnInteractiveInferenceSession():
                 break
             for idx in [0, pred.shape[dim] - 1]:
                 slice_prev = prev_pred.index_select(dim, torch.tensor(idx, device='cpu'))
-                slice_curr = pred.index_select(dim, torch.tensor([idx], device=self.device)).to('cpu')  # list needed on MPS
-
+                try:
+                    slice_curr = pred.index_select(dim, torch.tensor([idx], device=self.device)).to('cpu')  # list needed on MPS?
+                except IndexError:
+                    breakpoint()
                 pixels_prev = torch.sum(slice_prev)
                 pixels_current = torch.sum(slice_curr)
                 pixels_diff = torch.sum(slice_prev != slice_curr)
@@ -751,6 +756,11 @@ class nnInteractiveInferenceSession():
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
         self.label_manager = plans_manager.get_label_manager(dataset_json)
+
+        # if self.device == torch.device('mps'):
+            # we need to replace some ops
+
+
         if self.use_torch_compile and not isinstance(self.network, OptimizedModule):
             logger.info('Using torch.compile')
             self.network = torch.compile(self.network)
