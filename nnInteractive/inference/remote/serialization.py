@@ -9,10 +9,20 @@ Wire format:
     dtype_len(1) | uint8 (length of the dtype string in bytes)
     dtype(dtype_len) | ascii (e.g. "float32", "uint8", "float16")
     shape(ndim * 8) | int64 little-endian per dim
-    payload    | blosc2-compressed bytes of arr.tobytes(order="C")
+    payload    | chunked blosc2-compressed bytes (see below)
 
-The header is tiny (single-digit bytes for the dtypes we use); the payload is
-where compression matters. blosc2 is already a project dependency.
+Payload format:
+
+    nchunks(4) | uint32 little-endian
+    for each chunk:
+        ulen(8)      | uint64 little-endian, uncompressed byte length
+        clen(8)      | uint64 little-endian, compressed byte length
+        cbytes(clen) | blosc2-compressed bytes
+
+Each chunk's uncompressed length is at most _CHUNK_SIZE bytes. This works
+around the ~2 GiB per-call input limit of blosc2.compress2() (its source
+length is a C int32), which is hit by e.g. a 1024^3 float32 image (~4 GiB)
+or a 1024^3 int16 image (~2 GiB).
 """
 
 from __future__ import annotations
@@ -25,6 +35,10 @@ import numpy as np
 
 MAGIC = b"NNIA"
 VERSION = 1
+
+# blosc2.compress2 takes its source length as a C int32, capping per-call
+# input at 2 GiB - 1. Chunk at 1 GiB to leave plenty of headroom.
+_CHUNK_SIZE = 1 << 30
 
 _CODEC_ID = {
     blosc2.Codec.ZSTD: 1,
@@ -58,8 +72,19 @@ def pack_array(arr: np.ndarray, codec: blosc2.Codec = blosc2.Codec.ZSTD, clevel:
         name,
     )
     shape_bytes = struct.pack(f"<{arr.ndim}q", *arr.shape)
-    payload = blosc2.compress2(arr.tobytes(order="C"), codec=codec, clevel=clevel)
-    return header + shape_bytes + payload
+
+    # Zero-copy byte view over the (contiguous) array; sliced per chunk below.
+    raw = memoryview(arr).cast("B")
+    total = raw.nbytes
+    nchunks = (total + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+    parts = [header, shape_bytes, struct.pack("<I", nchunks)]
+    for i in range(nchunks):
+        start = i * _CHUNK_SIZE
+        end = min(start + _CHUNK_SIZE, total)
+        chunk = blosc2.compress2(raw[start:end], codec=codec, clevel=clevel)
+        parts.append(struct.pack("<QQ", end - start, len(chunk)))
+        parts.append(chunk)
+    return b"".join(parts)
 
 
 def unpack_array(buf: bytes) -> np.ndarray:
@@ -78,12 +103,34 @@ def unpack_array(buf: bytes) -> np.ndarray:
     offset += name_len
     shape = struct.unpack_from(f"<{ndim}q", buf, offset)
     offset += ndim * 8
-    payload = buf[offset:]
 
-    raw = blosc2.decompress2(payload)
-    arr = np.frombuffer(raw, dtype=np.dtype(name)).reshape(shape)
-    # frombuffer returns a read-only view; return a writable copy for safety.
-    return np.array(arr, copy=True)
+    dtype = np.dtype(name)
+
+    # Decompress each chunk straight into a preallocated output buffer so we
+    # don't materialize the full uncompressed payload as a separate bytes
+    # object before reshaping.
+    (nchunks,) = struct.unpack_from("<I", buf, offset)
+    offset += 4
+    nelem = 1
+    for d in shape:
+        nelem *= d
+    out = np.empty(nelem, dtype=dtype)
+    out_view = memoryview(out).cast("B")
+    written = 0
+    for _ in range(nchunks):
+        ulen, clen = struct.unpack_from("<QQ", buf, offset)
+        offset += 16
+        chunk = blosc2.decompress2(buf[offset : offset + clen])
+        if len(chunk) != ulen:
+            raise ValueError(f"chunk size mismatch: header says {ulen} bytes, decoded {len(chunk)}")
+        if written + ulen > out_view.nbytes:
+            raise ValueError("payload larger than declared array shape")
+        out_view[written : written + ulen] = chunk
+        written += ulen
+        offset += clen
+    if written != out_view.nbytes:
+        raise ValueError(f"payload size mismatch: expected {out_view.nbytes} bytes, got {written}")
+    return out.reshape(shape)
 
 
 def empty_payload() -> bytes:
