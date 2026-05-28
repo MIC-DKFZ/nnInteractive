@@ -181,7 +181,7 @@ class SessionRegistry:
         if entry is None:
             return False
         entry.close()
-        logger.info("released session %s", token)
+        logger.info("released session %s (%d/%d active)", token, len(self._entries), self._max_sessions)
         return True
 
     def sweep(self) -> int:

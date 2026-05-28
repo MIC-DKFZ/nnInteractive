@@ -195,7 +195,7 @@ automatically on `close()` (or context-manager exit). **Users and GUI authors
 never see the lease token** — it's a private implementation detail.
 
 ```python
-with nnInteractiveRemoteInferenceSession(server_url, api_key=KEY) as session:
+`with nnInteractiveRemoteInferenceSession(server_url, api_key=KEY) as session:`
     session.set_image(image)
     session.set_target_buffer(buf)
     session.add_point_interaction([60, 70, 30], include_interaction=True)
