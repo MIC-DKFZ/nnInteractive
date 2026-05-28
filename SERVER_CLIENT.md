@@ -18,24 +18,9 @@ common deployment gotchas.
 
 ## Installation
 
-The server- and client-only dependencies are gated behind extras so users who
-only need the local session don't pull them in.
-
-**On the GPU machine** (server):
-
-```bash
-pip install -e ".[server]"
-# or, once published: pip install "nnInteractive[server]"
-```
-
-**On the client machine** (the box running your GUI):
-
-```bash
-pip install -e ".[client]"
-# or, once published: pip install "nnInteractive[client]"
-```
-
-Both extras can be combined with `pip install "nnInteractive[remote]"`.
+The server and client dependencies (`fastapi`, `uvicorn`, `httpx`) ship with the
+base package, so a single `pip install nnInteractive` covers both roles on the
+GPU machine and the GUI machine.
 
 ## Starting the server
 

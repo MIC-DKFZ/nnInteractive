@@ -34,6 +34,9 @@ dependencies = [
     "torch>=2.1.2,!=2.9.*",
     "acvl-utils>=0.2.3,<0.3",  # 0.3 may bring breaking changes. Careful!
     "batchgenerators>=0.25.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
 ]
 
 [project.urls]
@@ -44,17 +47,6 @@ dev = [
     "black",
     "ruff",
     "pre-commit"
-]
-server = [
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
-    "httpx"
-]
-client = [
-    "httpx>=0.27",
-]
-remote = [
-    "nnInteractive[server,client]",
 ]
 
 [project.scripts]
