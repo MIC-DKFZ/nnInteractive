@@ -185,6 +185,4 @@ But under the hood:
    zero array. Scribble and lasso are inherently 2D (they live on a single
    slice, so one bbox dim is `1`), which makes the cropped array orders of 
    magnitude smaller than the full volume for typical
-   annotations. The array you pass must already be cropped to exactly the
-   bbox size. This is the single biggest perf win in v2 — please prefer it
-   in new integrations and migrate existing ones.
+   annotations. This is A LOT faster!!!
