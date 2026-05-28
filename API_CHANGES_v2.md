@@ -68,12 +68,22 @@ Behavior changes — these can break programs that previously passed validation:
 +                       override_capability_checks=False, interaction_bbox=None)
 ```
 
-- **New `interaction_bbox` kwarg**: you can now pass a *subcrop of the
-  scribble / lasso array* instead of a full-volume mask. `interaction_bbox` is
-  `[[x1,x2],[y1,y2],[z1,z2]]` in original-image coordinates (half-open).
-  With `interaction_bbox=None` the legacy "must match
-  `original_image_shape[1:]`" assertion still applies, so existing code keeps
-  working unchanged.
+- **New `interaction_bbox` kwarg (recommended — faster)**: you can now pass a
+  *subcrop of the scribble / lasso array* instead of a full-volume mask.
+  `interaction_bbox` is `[[x1,x2],[y1,y2],[z1,z2]]` in original-image
+  coordinates (half-open). With `interaction_bbox=None` the legacy "must
+  match `original_image_shape[1:]`" assertion still applies, so existing code
+  keeps working unchanged.
+- **Please migrate to the bbox form — the speedup is large.** Scribble and
+  lasso annotations are 2D: they live in a single axial / coronal / sagittal
+  plane and typically cover only a small region within that one slice. That
+  means one of the three bbox dimensions is `1` and the other two are tiny
+  compared to the full volume — the cropped array is *orders of magnitude*
+  smaller than the full-volume mask. Passing the full volume forces the
+  session to allocate, transfer, and process a 3D array that is almost
+  entirely zero just to find a handful of non-zero voxels on one slice.
+  Handing over the small 2D crop plus its location is dramatically faster
+  and uses far less RAM/VRAM.
 - Capability checks for `"scribble"` / `"lasso"` (same
   `override_capability_checks` escape hatch).
 
@@ -91,28 +101,33 @@ assert list(scribble_image.shape) == bbox_size
 ```
 
 Example — session was set up with an original image whose spatial shape is
-`(256, 256, 128)`. You want to add a scribble inside the subvolume
-`x∈[10,50), y∈[20,80), z∈[0,32)`:
+`(256, 256, 128)`. The user drew a scribble on a single axial slice
+(`z = 64`) covering a small region `x∈[100,140), y∈[80,150)`:
 
 ```python
-# Correct: scribble array shape matches bbox size (40, 60, 32)
+# Recommended: 2D crop, one bbox dim is 1 because the scribble lives in one slice.
+# The cropped array is (40, 70, 1) — a few thousand voxels instead of 8.4M.
 session.add_scribble_interaction(
-    scribble_image=np.zeros((40, 60, 32), dtype=np.float16),
+    scribble_image=scribble_crop_2d,   # shape (40, 70, 1)
     include_interaction=True,
-    interaction_bbox=[[10, 50], [20, 80], [0, 32]],
+    interaction_bbox=[[100, 140], [80, 150], [64, 65]],
 )
 
-# Wrong: full-volume scribble array, will fail the assert
+# Legacy / discouraged: full-volume array, 8.4M voxels almost all zero.
 session.add_scribble_interaction(
-    scribble_image=np.zeros((256, 256, 128), dtype=np.float16),
+    scribble_image=full_volume_mask,   # shape (256, 256, 128)
     include_interaction=True,
-    interaction_bbox=[[10, 50], [20, 80], [0, 32]],   # size mismatch
 )
 ```
 
-The point of the feature is that you no longer need to allocate a full-volume
-zero array just to mark a few voxels — you hand over the small crop plus its
-location in original-image coordinates.
+In this example the cropped form moves ~2800 voxels instead of ~8.4M — about
+**three orders of magnitude less data** for a typical single-slice scribble.
+The cost difference compounds across every interaction the user makes, so
+this is by far the biggest perf win in v2 for any frontend that issues
+scribble or lasso prompts.
+
+**This path is the recommended one going forward: please prefer it in new
+integrations and migrate existing ones when convenient.**
 
 ## `add_initial_seg_interaction`
 
@@ -165,7 +180,11 @@ But under the hood:
    `override_capability_checks=True`).
 4. If you touch `session.interactions` directly, treat it as a blosc2
    `NDArray` (numpy-like), not a `torch.Tensor`.
-5. Optional: scribble / lasso can now be sent as a subcrop via the new
-   `interaction_bbox=` kwarg — handy if you want to skip wrapping a tiny
-   annotation in a full-volume zero array. The array you pass must already be
-   cropped to exactly the bbox size.
+5. **Strongly recommended for performance:** send scribble / lasso as a 2D
+   subcrop via the new `interaction_bbox=` kwarg instead of a full-volume
+   zero array. Scribble and lasso are inherently 2D (they live on a single
+   slice, so one bbox dim is `1`), which makes the cropped array roughly
+   three orders of magnitude smaller than the full volume for typical
+   annotations. The array you pass must already be cropped to exactly the
+   bbox size. This is the single biggest perf win in v2 — please prefer it
+   in new integrations and migrate existing ones.
