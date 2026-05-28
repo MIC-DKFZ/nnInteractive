@@ -183,8 +183,8 @@ But under the hood:
 5. **Strongly recommended for performance:** send scribble / lasso as a 2D
    subcrop via the new `interaction_bbox=` kwarg instead of a full-volume
    zero array. Scribble and lasso are inherently 2D (they live on a single
-   slice, so one bbox dim is `1`), which makes the cropped array roughly
-   three orders of magnitude smaller than the full volume for typical
+   slice, so one bbox dim is `1`), which makes the cropped array orders of 
+   magnitude smaller than the full volume for typical
    annotations. The array you pass must already be cropped to exactly the
    bbox size. This is the single biggest perf win in v2 — please prefer it
    in new integrations and migrate existing ones.

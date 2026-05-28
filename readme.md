@@ -186,14 +186,42 @@ session.add_point_interaction(POINT_COORDINATES, include_interaction=False)
 session.add_bbox_interaction(BBOX_COORDINATES, include_interaction=True)
 
 # Example: Add a scribble interaction
-# - A 3D image of the same shape as img where one slice (any axis-aligned orientation) contains a hand-drawn scribble.
 # - Background must be 0, and scribble must be 1.
 # - Use session.preferred_scribble_thickness for optimal results.
-session.add_scribble_interaction(SCRIBBLE_IMAGE, include_interaction=True)
+#
+# ✅ RECOMMENDED (v2): pass a small 2D crop plus its location.
+# Scribbles live on a single axis-aligned slice, so one of the three bbox
+# dimensions is always size 1 and the in-plane extent typically covers only
+# a small region. The cropped array is ORDERS OF MAGNITUDE
+# smaller than a full-volume mask for typical annotations, which makes this
+# path dramatically faster. Please prefer this
+# form in new integrations.
+#
+# SCRIBBLE_CROP.shape must equal the bbox size. INTERACTION_BBOX uses
+# half-open intervals [[x1,x2],[y1,y2],[z1,z2]] in original-image coordinates.
+# Example: a scribble drawn on axial slice z=64, covering x∈[100,140), y∈[80,150):
+#   SCRIBBLE_CROP    = <ndarray of shape (40, 70, 1), values 0 or 1>
+#   INTERACTION_BBOX = [[100, 140], [80, 150], [64, 65]]
+session.add_scribble_interaction(
+    SCRIBBLE_CROP,
+    include_interaction=True,
+    interaction_bbox=INTERACTION_BBOX,
+)
+
+# Legacy form (still supported, but discouraged): a 3D array matching the
+# full original image shape with the scribble baked into one slice.
+# session.add_scribble_interaction(SCRIBBLE_IMAGE, include_interaction=True)
 
 # Example: Add a lasso interaction
-# - Similarly to scribble a 3D image with a single slice containing a **closed contour** representing the selection.
-session.add_lasso_interaction(LASSO_IMAGE, include_interaction=True)
+# - Like scribble but the single slice contains a **closed contour** for the selection.
+# - Same recommendation applies: pass a 2D crop + interaction_bbox for a large speedup.
+session.add_lasso_interaction(
+    LASSO_CROP,
+    include_interaction=True,
+    interaction_bbox=INTERACTION_BBOX,
+)
+# Legacy full-volume form (discouraged):
+# session.add_lasso_interaction(LASSO_IMAGE, include_interaction=True)
 
 # You can combine any number of interactions as needed. 
 # The model refines the segmentation result incrementally with each new interaction.
