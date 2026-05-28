@@ -19,6 +19,7 @@ import torch
 
 from nnInteractive.inference.remote._protocol import (
     CONTENT_TYPE_OCTET_STREAM,
+    LEASE_HEADER,
     META_HEADER,
     PATH_ADD_BBOX,
     PATH_ADD_INITIAL_SEG,
@@ -26,13 +27,54 @@ from nnInteractive.inference.remote._protocol import (
     PATH_ADD_POINT,
     PATH_ADD_SCRIBBLE,
     PATH_CAPABILITIES,
+    PATH_CLAIM,
     PATH_HEALTHZ,
+    PATH_HEARTBEAT,
+    PATH_LEASE_STATUS,
+    PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
     PATH_SET_DO_AUTOZOOM,
     PATH_SET_IMAGE,
     PATH_SET_TARGET_BUFFER,
 )
 from nnInteractive.inference.remote.serialization import pack_array, unpack_array
+
+
+class SessionExpiredError(RuntimeError):
+    """Raised when the server reports the client's lease no longer exists.
+
+    A GUI should catch this and either reconnect (construct a new
+    ``nnInteractiveRemoteInferenceSession``) or surface a "session expired"
+    dialog. The most common causes are exceeding the server's idle timeout
+    (default 10 min) and a server restart.
+    """
+
+
+class ServerAtCapacityError(RuntimeError):
+    """Raised when the server has already issued ``--max-sessions`` leases.
+
+    Wait and retry, or ask the operator to bump the cap.
+    """
+
+
+def _raise_for_lease_errors(resp: httpx.Response) -> None:
+    """Translate server-side lease errors into typed exceptions before httpx raises."""
+    if resp.status_code == 410:
+        raise SessionExpiredError(_extract_detail(resp) or "lease expired or unknown")
+    if resp.status_code == 503:
+        raise ServerAtCapacityError(_extract_detail(resp) or "server is at capacity")
+
+
+def _extract_detail(resp: httpx.Response) -> Optional[str]:
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if isinstance(detail, str):
+            return detail
+    return None
 
 
 def _buffer_dtype_str(target_buffer: Union[np.ndarray, torch.Tensor]) -> str:
@@ -112,6 +154,18 @@ class nnInteractiveRemoteInferenceSession:
             ),
             headers=headers,
         )
+        self._lease_token: Optional[str] = None
+
+        # Claim a session on the server. The lease token is then attached to
+        # every subsequent request via the shared httpx headers dict; the
+        # caller never has to think about it.
+        claim_resp = self._http.post(PATH_CLAIM)
+        _raise_for_lease_errors(claim_resp)
+        claim_resp.raise_for_status()
+        claim_info = claim_resp.json()
+        self._lease_token = claim_info["lease_token"]
+        self.idle_timeout_seconds: float = float(claim_info.get("idle_timeout_seconds", 0.0))
+        self._http.headers[LEASE_HEADER] = self._lease_token
 
         caps = self._get_json(PATH_CAPABILITIES)
 
@@ -139,6 +193,7 @@ class nnInteractiveRemoteInferenceSession:
 
     def _get_json(self, path: str) -> dict:
         resp = self._http.get(path)
+        _raise_for_lease_errors(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -147,6 +202,7 @@ class nnInteractiveRemoteInferenceSession:
         # don't hit httpx's default json encoder, which can't handle them.
         payload = json.dumps(_to_jsonable(body), separators=(",", ":"))
         resp = self._http.post(path, content=payload, headers={"Content-Type": "application/json"})
+        _raise_for_lease_errors(resp)
         resp.raise_for_status()
         return resp
 
@@ -156,6 +212,7 @@ class nnInteractiveRemoteInferenceSession:
             "Content-Type": CONTENT_TYPE_OCTET_STREAM,
         }
         resp = self._http.post(path, content=array_bytes, headers=headers)
+        _raise_for_lease_errors(resp)
         resp.raise_for_status()
         return resp
 
@@ -362,7 +419,42 @@ class nnInteractiveRemoteInferenceSession:
         except httpx.HTTPError:
             return False
 
+    def heartbeat(self) -> float:
+        """Extend this session's idle timeout. Returns remaining seconds.
+
+        For GUIs that keep the app open across long idle stretches: drive
+        this from a timer (e.g. every 60 s) to avoid SessionExpiredError
+        after the configured idle timeout.
+        """
+        resp = self._http.post(PATH_HEARTBEAT)
+        _raise_for_lease_errors(resp)
+        resp.raise_for_status()
+        return float(resp.json().get("remaining_seconds", 0.0))
+
+    def lease_status(self) -> dict:
+        """Read-only probe: how much time is left before this session is reaped?
+
+        Returns ``{"remaining_seconds": float, "idle_timeout_seconds": float}``.
+        Does NOT extend the lease — use ``heartbeat()`` for that. Raises
+        :class:`SessionExpiredError` if the lease is already gone.
+        """
+        resp = self._http.get(PATH_LEASE_STATUS)
+        _raise_for_lease_errors(resp)
+        resp.raise_for_status()
+        return resp.json()
+
     def close(self) -> None:
+        # Best-effort release so the server can free our slot for other users
+        # without waiting for the idle reaper. Swallow errors: the server may
+        # already be gone, our lease may already be expired, etc. close()
+        # must remain idempotent.
+        if self._lease_token is not None:
+            try:
+                self._http.post(PATH_RELEASE, timeout=httpx.Timeout(5.0))
+            except httpx.HTTPError:
+                pass
+            self._lease_token = None
+            self._http.headers.pop(LEASE_HEADER, None)
         self._http.close()
 
     def __enter__(self):
@@ -373,6 +465,6 @@ class nnInteractiveRemoteInferenceSession:
 
     def __del__(self):
         try:
-            self._http.close()
+            self.close()
         except Exception:
             pass

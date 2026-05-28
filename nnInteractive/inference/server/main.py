@@ -1,4 +1,9 @@
-"""CLI entry point: launch a long-running nnInteractive inference server."""
+"""CLI entry point: launch a long-running nnInteractive inference server.
+
+The model is loaded once at startup; concurrent clients each get their own
+session that references the shared model. See ``SERVER_CLIENT.md`` for the
+multi-session model.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +39,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda", help="Torch device string (e.g. 'cuda', 'cuda:0', 'cpu')")
     p.add_argument("--torch-n-threads", type=int, default=8, help="Number of CPU threads for torch")
     p.add_argument("--no-autozoom", action="store_true", help="Disable adaptive zoom-out (default: enabled)")
+    p.add_argument(
+        "--max-sessions",
+        type=int,
+        default=1,
+        help="Maximum number of concurrent client sessions. Each session holds its own image, "
+        "target buffer, and interaction state; model weights are shared. Predictions remain "
+        "GPU-serialized across sessions. Default: 1.",
+    )
+    p.add_argument(
+        "--idle-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Idle timeout (seconds) after which a session is reaped. Clients can keep a "
+        "session alive across long idle stretches by calling heartbeat(). Default: 600 (10 min).",
+    )
     p.add_argument(
         "--api-key",
         default=None,
@@ -79,7 +99,13 @@ def main(argv=None) -> int:
             args.port,
         )
 
-    session = nnInteractiveInferenceSession(
+    if args.max_sessions < 1:
+        raise SystemExit("--max-sessions must be >= 1")
+    if args.idle_timeout_seconds <= 0:
+        raise SystemExit("--idle-timeout-seconds must be > 0")
+
+    # Load the model once into a "loader" session; we keep only the artifacts dict.
+    loader = nnInteractiveInferenceSession(
         device=device,
         use_torch_compile=False,
         verbose=args.verbose,
@@ -87,14 +113,34 @@ def main(argv=None) -> int:
         do_autozoom=not args.no_autozoom,
     )
     logger.info("Loading checkpoint from %s (fold=%s, checkpoint=%s)", args.model_dir, args.fold, args.checkpoint)
-    session.initialize_from_trained_model_folder(
+    artifacts = loader._load_model_artifacts_from_disk(
         model_training_output_dir=args.model_dir,
         use_fold=_resolve_fold(args.fold),
         checkpoint_name=args.checkpoint,
     )
-    logger.info("Checkpoint loaded; serving on http://%s:%s", args.host, args.port)
+    # The loader instance holds no per-session state worth keeping. Discard it;
+    # the artifacts dict carries everything sibling sessions need.
+    loader.executor.shutdown(wait=False)
+    del loader
 
-    app = make_app(session, api_key=api_key)
+    logger.info(
+        "Checkpoint loaded; serving on http://%s:%s (max_sessions=%d, idle_timeout=%.0fs)",
+        args.host,
+        args.port,
+        args.max_sessions,
+        args.idle_timeout_seconds,
+    )
+
+    app = make_app(
+        artifacts=artifacts,
+        device=device,
+        max_sessions=args.max_sessions,
+        idle_timeout_seconds=args.idle_timeout_seconds,
+        torch_n_threads=args.torch_n_threads,
+        do_autozoom=not args.no_autozoom,
+        verbose=args.verbose,
+        api_key=api_key,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 

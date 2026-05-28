@@ -1294,6 +1294,29 @@ class nnInteractiveInferenceSession:
         """
         This is used when making predictions with a trained model
         """
+        artifacts = self._load_model_artifacts_from_disk(model_training_output_dir, use_fold, checkpoint_name)
+        self.initialize_from_loaded_artifacts(artifacts)
+
+    def _load_model_artifacts_from_disk(
+        self,
+        model_training_output_dir: str,
+        use_fold: Union[int, str] = None,
+        checkpoint_name: str = "checkpoint_final.pth",
+    ) -> dict:
+        """Read all model artifacts from disk and build the network on ``self.device``.
+
+        Returns an artifact dict that can be applied to this or any other freshly
+        constructed session via :meth:`initialize_from_loaded_artifacts`. The
+        returned references (network, plans_manager, configuration_manager, ...)
+        are safe to share by reference across sessions — they are treated as
+        read-only after construction.
+
+        Note: this also mutates ``self`` (applies capability, sets pad/decay/
+        thickness) because ``num_interaction_channels`` is required to build the
+        network. The caller should follow up with
+        :meth:`initialize_from_loaded_artifacts` (this is what
+        :meth:`initialize_from_trained_model_folder` does).
+        """
         point_interaction_use_etd = True
         (
             capability_content,
@@ -1360,12 +1383,38 @@ class nnInteractiveInferenceSession:
         ).to(self.device)
         network.load_state_dict(parameters)
 
-        self.plans_manager = plans_manager
-        self.configuration_manager = configuration_manager
-        self.network = network
-        self.dataset_json = dataset_json
-        self.trainer_name = trainer_name
-        self.label_manager = plans_manager.get_label_manager(dataset_json)
+        return {
+            "capability_content": capability_content,
+            "point_interaction": self.point_interaction,
+            "preferred_scribble_thickness": self.preferred_scribble_thickness,
+            "interaction_decay": self.interaction_decay,
+            "pad_mode_data": self.pad_mode_data,
+            "network": network,
+            "plans_manager": plans_manager,
+            "configuration_manager": configuration_manager,
+            "dataset_json": dataset_json,
+            "trainer_name": trainer_name,
+            "label_manager": plans_manager.get_label_manager(dataset_json),
+        }
+
+    def initialize_from_loaded_artifacts(self, artifacts: dict):
+        """Apply pre-loaded artifacts to this session instance.
+
+        ``artifacts`` is the dict returned by :meth:`_load_model_artifacts_from_disk`.
+        Useful for spawning multiple sessions that share one loaded model (e.g.
+        the multi-session inference server).
+        """
+        self.preferred_scribble_thickness = artifacts["preferred_scribble_thickness"]
+        self.interaction_decay = artifacts["interaction_decay"]
+        self.pad_mode_data = artifacts["pad_mode_data"]
+        self.point_interaction = artifacts["point_interaction"]
+        self._apply_capability(artifacts["capability_content"])
+        self.plans_manager = artifacts["plans_manager"]
+        self.configuration_manager = artifacts["configuration_manager"]
+        self.network = artifacts["network"]
+        self.dataset_json = artifacts["dataset_json"]
+        self.trainer_name = artifacts["trainer_name"]
+        self.label_manager = artifacts["label_manager"]
         if self.use_torch_compile and not isinstance(self.network, OptimizedModule):
             print("Using torch.compile")
             self.network = torch.compile(self.network)

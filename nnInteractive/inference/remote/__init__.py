@@ -1,3 +1,11 @@
-from nnInteractive.inference.remote.remote_session import nnInteractiveRemoteInferenceSession
+from nnInteractive.inference.remote.remote_session import (
+    ServerAtCapacityError,
+    SessionExpiredError,
+    nnInteractiveRemoteInferenceSession,
+)
 
-__all__ = ["nnInteractiveRemoteInferenceSession"]
+__all__ = [
+    "nnInteractiveRemoteInferenceSession",
+    "SessionExpiredError",
+    "ServerAtCapacityError",
+]

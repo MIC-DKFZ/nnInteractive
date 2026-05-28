@@ -1,15 +1,38 @@
-"""FastAPI app factory wrapping a single nnInteractiveInferenceSession.
+"""FastAPI app factory for the multi-session nnInteractive inference server.
 
-All session-mutating endpoints are serialized by a single ``threading.Lock`` —
-the underlying session is stateful and the GPU is the bottleneck, so there is no
-benefit to overlapping calls.
+The server hosts up to ``max_sessions`` concurrent
+:class:`nnInteractiveInferenceSession` instances, one per connected client. The
+model weights are loaded once at startup and shared by reference across all
+sessions — per-session state (image, target buffer, interactions tensor) is
+isolated.
+
+Each client identifies itself via a lease token issued by ``POST /claim``. The
+token rides along on every subsequent request in the ``X-Lease-Token`` header.
+Sessions idle for longer than ``idle_timeout_seconds`` are reaped automatically;
+subsequent requests bearing a reaped lease receive HTTP 410 Gone so the client
+can surface a "session expired" message.
+
+Concurrency model:
+  - Each session has its own ``threading.Lock`` that serializes the per-session
+    mutating endpoints (so a single client can't tear its own state with
+    parallel calls).
+  - A single global ``gpu_lock`` serializes the predict-capable endpoints
+    (``add_*_interaction``) across *all* sessions, because the GPU is one
+    resource. Two clients can preprocess images concurrently but only one
+    prediction runs at a time.
+  - The acquisition order is always (session lock → gpu lock) so there is no
+    deadlock potential.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import numpy as np
@@ -19,6 +42,7 @@ from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response, 
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
 from nnInteractive.inference.remote._protocol import (
     CONTENT_TYPE_OCTET_STREAM,
+    LEASE_HEADER,
     META_HEADER,
     PATH_ADD_BBOX,
     PATH_ADD_INITIAL_SEG,
@@ -26,7 +50,11 @@ from nnInteractive.inference.remote._protocol import (
     PATH_ADD_POINT,
     PATH_ADD_SCRIBBLE,
     PATH_CAPABILITIES,
+    PATH_CLAIM,
     PATH_HEALTHZ,
+    PATH_HEARTBEAT,
+    PATH_LEASE_STATUS,
+    PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
     PATH_SET_DO_AUTOZOOM,
     PATH_SET_IMAGE,
@@ -37,9 +65,223 @@ from nnInteractive.inference.remote.serialization import pack_array, unpack_arra
 logger = logging.getLogger("nninteractive.server")
 
 
-def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = None) -> FastAPI:
-    app = FastAPI(title="nnInteractive Inference Server")
-    lock = threading.Lock()
+class SessionEntry:
+    """One client's session plus its bookkeeping."""
+
+    def __init__(self, session: nnInteractiveInferenceSession) -> None:
+        self.session = session
+        self.lock = threading.Lock()
+        self.created_at = time.monotonic()
+        self.last_active_at = self.created_at
+
+    def touch(self) -> None:
+        self.last_active_at = time.monotonic()
+
+    def close(self) -> None:
+        """Free the session's per-instance state. Shared model artifacts are NOT freed.
+
+        Best-effort: any exception here is logged but not re-raised; cleanup must
+        not block reaping or shutdown.
+        """
+        try:
+            self.session._reset_session()
+        except Exception:
+            logger.exception("error during session._reset_session() in SessionEntry.close()")
+        try:
+            self.session.executor.shutdown(wait=False)
+        except Exception:
+            logger.exception("error during executor.shutdown() in SessionEntry.close()")
+
+
+class SessionFull(Exception):
+    """Raised by SessionRegistry.claim() when the server is at capacity."""
+
+
+class SessionRegistry:
+    """Threadsafe lease-keyed dict of :class:`SessionEntry`.
+
+    The model artifacts loaded at server startup are stashed here and reused
+    whenever a new session is created.
+    """
+
+    def __init__(
+        self,
+        artifacts: dict,
+        max_sessions: int,
+        idle_timeout_seconds: float,
+        device: torch.device,
+        torch_n_threads: int,
+        do_autozoom: bool,
+        verbose: bool,
+    ) -> None:
+        self._artifacts = artifacts
+        self._max_sessions = int(max_sessions)
+        self._idle_timeout_seconds = float(idle_timeout_seconds)
+        self._device = device
+        self._torch_n_threads = torch_n_threads
+        self._do_autozoom = do_autozoom
+        self._verbose = verbose
+        self._entries: dict[str, SessionEntry] = {}
+        self._mu = threading.Lock()
+
+    @property
+    def max_sessions(self) -> int:
+        return self._max_sessions
+
+    @property
+    def idle_timeout_seconds(self) -> float:
+        return self._idle_timeout_seconds
+
+    def claim(self) -> str:
+        """Create a new session and return its lease token. Raises SessionFull if at cap."""
+        with self._mu:
+            if len(self._entries) >= self._max_sessions:
+                raise SessionFull()
+            token = uuid.uuid4().hex
+            session = nnInteractiveInferenceSession(
+                device=self._device,
+                use_torch_compile=False,
+                verbose=self._verbose,
+                torch_n_threads=self._torch_n_threads,
+                do_autozoom=self._do_autozoom,
+            )
+            session.initialize_from_loaded_artifacts(self._artifacts)
+            entry = SessionEntry(session)
+            self._entries[token] = entry
+            logger.info("claimed session %s (%d/%d active)", token, len(self._entries), self._max_sessions)
+            return token
+
+    def get(self, token: Optional[str]) -> SessionEntry:
+        """Look up a session by lease token, touching last_active_at on success."""
+        if not token:
+            raise HTTPException(status.HTTP_410_GONE, detail="lease token missing")
+        with self._mu:
+            entry = self._entries.get(token)
+            if entry is None:
+                raise HTTPException(status.HTTP_410_GONE, detail="lease expired or unknown")
+        entry.touch()
+        return entry
+
+    def peek(self, token: Optional[str]) -> SessionEntry:
+        """Look up without touching last_active_at. Used for /lease_status."""
+        if not token:
+            raise HTTPException(status.HTTP_410_GONE, detail="lease token missing")
+        with self._mu:
+            entry = self._entries.get(token)
+            if entry is None:
+                raise HTTPException(status.HTTP_410_GONE, detail="lease expired or unknown")
+        return entry
+
+    def release(self, token: Optional[str]) -> bool:
+        """Release a session by token. Idempotent; returns True if a session was actually released."""
+        if not token:
+            return False
+        with self._mu:
+            entry = self._entries.pop(token, None)
+        if entry is None:
+            return False
+        entry.close()
+        logger.info("released session %s", token)
+        return True
+
+    def sweep(self) -> int:
+        """Drop sessions idle for more than idle_timeout_seconds. Returns the number reaped."""
+        now = time.monotonic()
+        reaped: list[tuple[str, SessionEntry]] = []
+        with self._mu:
+            for token, entry in list(self._entries.items()):
+                if (now - entry.last_active_at) > self._idle_timeout_seconds:
+                    self._entries.pop(token, None)
+                    reaped.append((token, entry))
+        for token, entry in reaped:
+            entry.close()
+            logger.info("reaped idle session %s", token)
+        return len(reaped)
+
+    def close_all(self) -> None:
+        with self._mu:
+            entries = list(self._entries.items())
+            self._entries.clear()
+        for token, entry in entries:
+            entry.close()
+            logger.info("closed session %s during shutdown", token)
+
+    def remaining_seconds(self, entry: SessionEntry) -> float:
+        return max(0.0, self._idle_timeout_seconds - (time.monotonic() - entry.last_active_at))
+
+
+def make_app(
+    artifacts: dict,
+    device: torch.device,
+    max_sessions: int = 1,
+    idle_timeout_seconds: float = 600.0,
+    torch_n_threads: int = 8,
+    do_autozoom: bool = True,
+    verbose: bool = False,
+    api_key: Optional[str] = None,
+    sweep_interval_seconds: float = 30.0,
+) -> FastAPI:
+    registry = SessionRegistry(
+        artifacts=artifacts,
+        max_sessions=max_sessions,
+        idle_timeout_seconds=idle_timeout_seconds,
+        device=device,
+        torch_n_threads=torch_n_threads,
+        do_autozoom=do_autozoom,
+        verbose=verbose,
+    )
+    gpu_lock = threading.Lock()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        stop = asyncio.Event()
+
+        async def reaper():
+            try:
+                while not stop.is_set():
+                    try:
+                        await asyncio.sleep(sweep_interval_seconds)
+                    except asyncio.CancelledError:
+                        break
+                    if stop.is_set():
+                        break
+                    try:
+                        registry.sweep()
+                    except Exception:
+                        logger.exception("error in registry sweep()")
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(reaper())
+        try:
+            yield
+        finally:
+            stop.set()
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            registry.close_all()
+
+    app = FastAPI(title="nnInteractive Inference Server", lifespan=lifespan)
+
+    # Capability snapshot is computed once and never changes (model is loaded
+    # once at startup and shared by all sessions). We build it from a fresh
+    # session initialized off the artifacts.
+    _capability_session = nnInteractiveInferenceSession(
+        device=device,
+        use_torch_compile=False,
+        verbose=False,
+        torch_n_threads=torch_n_threads,
+        do_autozoom=do_autozoom,
+    )
+    _capability_session.initialize_from_loaded_artifacts(artifacts)
+    _capability_snapshot = _build_capability_snapshot(_capability_session)
+    # We don't need the per-session state of _capability_session, just the snapshot.
+    _capability_session._reset_session()
+    _capability_session.executor.shutdown(wait=False)
+    del _capability_session
 
     # ----------------------------- auth ----------------------------------- #
 
@@ -53,6 +295,11 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
 
     auth = Depends(require_auth)
 
+    def require_lease(x_lease_token: Optional[str] = Header(default=None, alias=LEASE_HEADER)) -> SessionEntry:
+        return registry.get(x_lease_token)
+
+    lease = Depends(require_lease)
+
     # --------------------------- helpers ---------------------------------- #
 
     def _parse_meta_header(meta_header: Optional[str]) -> dict:
@@ -63,14 +310,7 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
         except json.JSONDecodeError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"Bad {META_HEADER}: {e}")
 
-    def _channel_mapping_serializable(mapping: dict) -> dict:
-        # tuples (pos, neg) → lists for JSON; client re-tuples them on receipt.
-        out = {}
-        for k, v in mapping.items():
-            out[k] = list(v) if isinstance(v, (tuple, list)) else v
-        return out
-
-    def _read_target_bbox(bbox: list[list[int]]) -> np.ndarray:
+    def _read_target_bbox(session: nnInteractiveInferenceSession, bbox: list[list[int]]) -> np.ndarray:
         """Return the (cropped) target_buffer region for the given bbox as a numpy array.
 
         The bbox must already be clipped to valid in-bounds indices — passing a
@@ -83,7 +323,7 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
             return tb[slicer].detach().cpu().numpy()
         return np.ascontiguousarray(tb[slicer])
 
-    def _clip_bbox_to_buffer(bbox: list[list[int]]) -> list[list[int]]:
+    def _clip_bbox_to_buffer(session: nnInteractiveInferenceSession, bbox: list[list[int]]) -> list[list[int]]:
         """Clip an inference-time bbox to the target buffer's spatial bounds.
 
         The local session stores ``_last_paste_bbox`` in unclipped form: when
@@ -95,7 +335,7 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
         tb_shape = session.target_buffer.shape
         return [[max(int(lb), 0), min(int(ub), int(tb_shape[i]))] for i, (lb, ub) in enumerate(bbox)]
 
-    def _build_prediction_response(ran_prediction: bool) -> Response:
+    def _build_prediction_response(session: nnInteractiveInferenceSession, ran_prediction: bool) -> Response:
         bbox = session._last_paste_bbox if ran_prediction else None
         if bbox is None or session.target_buffer is None:
             meta = {"ran_prediction": bool(ran_prediction), "bbox": None}
@@ -104,7 +344,7 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
                 media_type=CONTENT_TYPE_OCTET_STREAM,
                 headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
             )
-        clipped = _clip_bbox_to_buffer(bbox)
+        clipped = _clip_bbox_to_buffer(session, bbox)
         if any(lb >= ub for lb, ub in clipped):
             # Bbox lies entirely outside the buffer — nothing to send.
             session._last_paste_bbox = None
@@ -114,7 +354,7 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
                 media_type=CONTENT_TYPE_OCTET_STREAM,
                 headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
             )
-        sub = _read_target_bbox(clipped)
+        sub = _read_target_bbox(session, clipped)
         meta = {
             "ran_prediction": True,
             "bbox": clipped,
@@ -129,18 +369,23 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
             headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
         )
 
-    def _under_lock(fn):
-        """Run ``fn()`` under the global lock, converting known errors to HTTP 400.
-
-        The lock spans the full request body — including reading
-        ``_last_paste_bbox`` and the target-buffer slice — so no other request
-        can interleave session state in between.
-        """
-        with lock:
+    def _under_session_lock(entry: SessionEntry, fn):
+        """Run ``fn(session)`` under the session's lock, converting known errors to HTTP 400."""
+        with entry.lock:
             try:
-                return fn()
+                return fn(entry.session)
             except (ValueError, AssertionError) as e:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    def _under_session_and_gpu_lock(entry: SessionEntry, fn):
+        """Run ``fn(session)`` under session lock + global GPU lock. Acquisition order
+        is always session-then-gpu to avoid deadlocks."""
+        with entry.lock:
+            with gpu_lock:
+                try:
+                    return fn(entry.session)
+                except (ValueError, AssertionError) as e:
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     # ----------------------------- routes --------------------------------- #
 
@@ -150,105 +395,133 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
 
     @app.get(PATH_CAPABILITIES, dependencies=[auth])
     def capabilities() -> dict:
-        cfg = session.configuration_manager
+        return _capability_snapshot
+
+    @app.post(PATH_CLAIM, dependencies=[auth])
+    def claim() -> Response:
+        try:
+            token = registry.claim()
+        except SessionFull:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"server is at capacity ({registry.max_sessions} sessions)",
+                headers={"Retry-After": "10"},
+            )
+        body = {
+            "lease_token": token,
+            "idle_timeout_seconds": registry.idle_timeout_seconds,
+            "max_sessions": registry.max_sessions,
+        }
+        return Response(
+            content=json.dumps(body),
+            media_type="application/json",
+        )
+
+    @app.post(PATH_RELEASE, dependencies=[auth])
+    def release(x_lease_token: Optional[str] = Header(default=None, alias=LEASE_HEADER)) -> dict:
+        registry.release(x_lease_token)
+        # Idempotent: succeed even if the lease was already gone.
+        return {"released": True}
+
+    @app.post(PATH_HEARTBEAT, dependencies=[auth])
+    def heartbeat(entry: SessionEntry = lease) -> dict:
+        # require_lease already touched last_active_at.
+        return {"remaining_seconds": registry.remaining_seconds(entry)}
+
+    @app.get(PATH_LEASE_STATUS, dependencies=[auth])
+    def lease_status(x_lease_token: Optional[str] = Header(default=None, alias=LEASE_HEADER)) -> dict:
+        # Read-only probe: does NOT touch last_active_at.
+        entry = registry.peek(x_lease_token)
         return {
-            "supported_interactions": session.supported_interactions,
-            "channel_mapping": _channel_mapping_serializable(session.channel_mapping),
-            "num_interaction_channels": int(session.num_interaction_channels),
-            "supports_initial_label": bool(session.supports_initial_label),
-            "supports_zero_shot_label_refinement": bool(session.supports_zero_shot_label_refinement),
-            "preferred_scribble_thickness": session.preferred_scribble_thickness,
-            "interaction_decay": float(session.interaction_decay) if session.interaction_decay is not None else None,
-            "patch_size": list(cfg.patch_size) if cfg is not None else None,
-            "do_autozoom": bool(session.do_autozoom),
-            "inference_session_version": session.INFERENCE_SESSION_VERSION,
+            "remaining_seconds": registry.remaining_seconds(entry),
+            "idle_timeout_seconds": registry.idle_timeout_seconds,
         }
 
     @app.post(PATH_SET_IMAGE, dependencies=[auth])
-    async def set_image(request: Request) -> dict:
+    async def set_image(request: Request, entry: SessionEntry = lease) -> dict:
         meta = _parse_meta_header(request.headers.get(META_HEADER))
         body = await request.body()
         image = unpack_array(body)
         image_properties = meta.get("image_properties") or {}
 
-        def _do():
+        def _do(session):
             session.set_image(image, image_properties)
             # set_image preprocesses in a background thread; force completion so
             # subsequent calls can safely use original_image_shape.
             session._finish_preprocessing_and_initialize_interactions()
             return {"original_image_shape": list(session.original_image_shape)}
 
-        return _under_lock(_do)
+        return _under_session_lock(entry, _do)
 
     @app.post(PATH_SET_TARGET_BUFFER, dependencies=[auth])
-    def set_target_buffer(payload: dict) -> dict:
+    def set_target_buffer(payload: dict, entry: SessionEntry = lease) -> dict:
         shape = tuple(int(x) for x in payload["shape"])
         dtype = np.dtype(payload["dtype"])
         buf = np.zeros(shape, dtype=dtype)
 
-        def _do():
+        def _do(session):
             session.set_target_buffer(buf)
             return {}
 
-        return _under_lock(_do)
+        return _under_session_lock(entry, _do)
 
     @app.post(PATH_SET_DO_AUTOZOOM, dependencies=[auth])
-    def set_do_autozoom(payload: dict) -> dict:
+    def set_do_autozoom(payload: dict, entry: SessionEntry = lease) -> dict:
         do_autozoom = bool(payload["do_autozoom"])
 
-        def _do():
+        def _do(session):
             session.set_do_autozoom(do_autozoom)
             return {}
 
-        return _under_lock(_do)
+        return _under_session_lock(entry, _do)
 
     @app.post(PATH_RESET_INTERACTIONS, dependencies=[auth])
-    def reset_interactions() -> dict:
-        def _do():
+    def reset_interactions(entry: SessionEntry = lease) -> dict:
+        def _do(session):
             session.reset_interactions()
             return {}
 
-        return _under_lock(_do)
+        return _under_session_lock(entry, _do)
 
     @app.post(PATH_ADD_BBOX, dependencies=[auth])
-    def add_bbox_interaction(payload: dict) -> Response:
+    def add_bbox_interaction(payload: dict, entry: SessionEntry = lease) -> Response:
         run_prediction = bool(payload.get("run_prediction", True))
 
-        def _do():
+        def _do(session):
             session.add_bbox_interaction(
                 bbox_coords=[list(b) for b in payload["bbox_coords"]],
                 include_interaction=bool(payload["include_interaction"]),
                 run_prediction=run_prediction,
                 override_capability_checks=bool(payload.get("override_capability_checks", False)),
             )
-            return _build_prediction_response(run_prediction)
+            return _build_prediction_response(session, run_prediction)
 
-        return _under_lock(_do)
+        return _under_session_and_gpu_lock(entry, _do)
 
     @app.post(PATH_ADD_POINT, dependencies=[auth])
-    def add_point_interaction(payload: dict) -> Response:
+    def add_point_interaction(payload: dict, entry: SessionEntry = lease) -> Response:
         run_prediction = bool(payload.get("run_prediction", True))
 
-        def _do():
+        def _do(session):
             session.add_point_interaction(
                 coordinates=list(payload["coordinates"]),
                 include_interaction=bool(payload["include_interaction"]),
                 run_prediction=run_prediction,
                 override_capability_checks=bool(payload.get("override_capability_checks", False)),
             )
-            return _build_prediction_response(run_prediction)
+            return _build_prediction_response(session, run_prediction)
 
-        return _under_lock(_do)
+        return _under_session_and_gpu_lock(entry, _do)
 
     @app.post(PATH_ADD_SCRIBBLE, dependencies=[auth])
-    async def add_scribble_interaction(request: Request) -> Response:
-        return await _handle_mask_interaction(request, session.add_scribble_interaction)
+    async def add_scribble_interaction(request: Request, entry: SessionEntry = lease) -> Response:
+        return await _handle_mask_interaction(request, entry, "scribble")
 
     @app.post(PATH_ADD_LASSO, dependencies=[auth])
-    async def add_lasso_interaction(request: Request) -> Response:
-        return await _handle_mask_interaction(request, session.add_lasso_interaction)
+    async def add_lasso_interaction(request: Request, entry: SessionEntry = lease) -> Response:
+        return await _handle_mask_interaction(request, entry, "lasso")
 
-    async def _handle_mask_interaction(request: Request, session_method) -> Response:
+    async def _handle_mask_interaction(request: Request, entry: SessionEntry, kind: str) -> Response:
         meta = _parse_meta_header(request.headers.get(META_HEADER))
         body = await request.body()
         mask = unpack_array(body)
@@ -257,33 +530,58 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
         if interaction_bbox is not None:
             interaction_bbox = [list(b) for b in interaction_bbox]
 
-        def _do():
-            session_method(
+        def _do(session):
+            method = session.add_scribble_interaction if kind == "scribble" else session.add_lasso_interaction
+            method(
                 mask,
                 bool(meta["include_interaction"]),
                 run_prediction=run_prediction,
                 override_capability_checks=bool(meta.get("override_capability_checks", False)),
                 interaction_bbox=interaction_bbox,
             )
-            return _build_prediction_response(run_prediction)
+            return _build_prediction_response(session, run_prediction)
 
-        return _under_lock(_do)
+        return _under_session_and_gpu_lock(entry, _do)
 
     @app.post(PATH_ADD_INITIAL_SEG, dependencies=[auth])
-    async def add_initial_seg_interaction(request: Request) -> Response:
+    async def add_initial_seg_interaction(request: Request, entry: SessionEntry = lease) -> Response:
         meta = _parse_meta_header(request.headers.get(META_HEADER))
         body = await request.body()
         initial_seg = unpack_array(body)
         run_prediction = bool(meta.get("run_prediction", False))
 
-        def _do():
+        def _do(session):
             session.add_initial_seg_interaction(
                 initial_seg=initial_seg,
                 run_prediction=run_prediction,
                 override_capability_checks=bool(meta.get("override_capability_checks", False)),
             )
-            return _build_prediction_response(run_prediction)
+            return _build_prediction_response(session, run_prediction)
 
-        return _under_lock(_do)
+        return _under_session_and_gpu_lock(entry, _do)
 
     return app
+
+
+def _channel_mapping_serializable(mapping: dict) -> dict:
+    # tuples (pos, neg) → lists for JSON; client re-tuples them on receipt.
+    out = {}
+    for k, v in mapping.items():
+        out[k] = list(v) if isinstance(v, (tuple, list)) else v
+    return out
+
+
+def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
+    cfg = session.configuration_manager
+    return {
+        "supported_interactions": session.supported_interactions,
+        "channel_mapping": _channel_mapping_serializable(session.channel_mapping),
+        "num_interaction_channels": int(session.num_interaction_channels),
+        "supports_initial_label": bool(session.supports_initial_label),
+        "supports_zero_shot_label_refinement": bool(session.supports_zero_shot_label_refinement),
+        "preferred_scribble_thickness": session.preferred_scribble_thickness,
+        "interaction_decay": float(session.interaction_decay) if session.interaction_decay is not None else None,
+        "patch_size": list(cfg.patch_size) if cfg is not None else None,
+        "do_autozoom": bool(session.do_autozoom),
+        "inference_session_version": session.INFERENCE_SESSION_VERSION,
+    }

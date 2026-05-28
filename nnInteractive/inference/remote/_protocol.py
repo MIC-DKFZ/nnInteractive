@@ -2,10 +2,17 @@
 
 # HTTP header used to carry JSON-encoded metadata alongside a binary array body.
 META_HEADER = "X-Meta"
+# HTTP header used to carry a per-client lease token identifying which session
+# on the (multi-session) server the request applies to.
+LEASE_HEADER = "X-Lease-Token"
 
 # Endpoint paths.
 PATH_HEALTHZ = "/healthz"
 PATH_CAPABILITIES = "/capabilities"
+PATH_CLAIM = "/claim"
+PATH_RELEASE = "/release"
+PATH_HEARTBEAT = "/heartbeat"
+PATH_LEASE_STATUS = "/lease_status"
 PATH_SET_IMAGE = "/set_image"
 PATH_SET_TARGET_BUFFER = "/set_target_buffer"
 PATH_RESET_INTERACTIONS = "/reset_interactions"

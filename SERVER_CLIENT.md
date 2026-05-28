@@ -7,14 +7,23 @@ network using **`nnInteractiveRemoteInferenceSession`** — a drop-in replacemen
 with the same public API as the local session.
 
 ```
-[GUI / client machine]                       [GPU machine]
-  nnInteractiveRemoteInferenceSession  --HTTP-->  nninteractive-server
-  (talks to the server, holds the                 (holds the model + state,
-   user's target_buffer)                           runs predictions)
+[GUI client A]  ─┐
+                 │ HTTP
+[GUI client B]  ─┼────►  nninteractive-server  ──►  one shared model on GPU
+                 │       (per-client sessions:           (loaded once at startup)
+[GUI client C]  ─┘        image, target_buffer,
+                          interactions per session)
 ```
 
-This document covers how to start the server, point a client at it, and
-common deployment gotchas.
+The server loads the model once at startup and hosts up to `--max-sessions`
+concurrent client sessions. Each client gets its own session (its own image,
+target buffer, and interactions) via a lease token; the client library
+handles the lease handshake transparently. Predictions are GPU-serialized
+across sessions — two clients can preprocess images at the same time, but
+only one prediction runs at a time.
+
+This document covers how to start the server, point a client at it, the
+concurrency / session model, and common deployment gotchas.
 
 ## Installation
 
@@ -47,6 +56,8 @@ nninteractive-server \
 | `--device` | Torch device string, e.g. `cuda`, `cuda:0`, `cpu`. Default: `cuda`. |
 | `--torch-n-threads` | CPU threads for torch. Default: `8`. |
 | `--no-autozoom` | Disable adaptive zoom-out (rarely needed; on by default). |
+| `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; model weights are shared. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
+| `--idle-timeout-seconds` | Idle timeout in seconds after which a session is reaped and its slot freed. Clients can extend their session by calling `heartbeat()`. Default: `600` (10 min). |
 | `--api-key` | Bearer token required on every request. See *Authentication* below. |
 | `--verbose` | Verbose session-side logging. |
 | `--log-level` | uvicorn log level (`info`, `warning`, `error`, …). Default: `info`. |
@@ -168,11 +179,131 @@ Note: on the remote session, `initialize_from_trained_model_folder()` is a
 no-op (with a warning). The server already loaded the checkpoint at startup.
 Switching checkpoints at runtime is on the roadmap.
 
+## Concurrency and sessions
+
+The server hosts up to `--max-sessions` concurrent client sessions. Each client
+holds its own session — its own image, target buffer, and interaction state —
+while the model weights are shared. This gives multiple researchers on one GPU
+box independent state without duplicating the model.
+
+### How a client gets a session
+
+A session is claimed automatically when `nnInteractiveRemoteInferenceSession(...)`
+is constructed (the client posts to `/claim` and stores a lease token, which
+then rides on every subsequent request). The client also releases the session
+automatically on `close()` (or context-manager exit). **Users and GUI authors
+never see the lease token** — it's a private implementation detail.
+
+```python
+with nnInteractiveRemoteInferenceSession(server_url, api_key=KEY) as session:
+    session.set_image(image)
+    session.set_target_buffer(buf)
+    session.add_point_interaction([60, 70, 30], include_interaction=True)
+# context manager exit -> client posts /release -> server frees the slot.
+```
+
+### GPU serialization
+
+Two clients each calling `add_point_interaction(..., run_prediction=True)` at the
+same moment will see one of the two predictions wait briefly for the other to
+finish. This is by design — there is only one GPU. Non-prediction calls
+(`set_image`, `set_target_buffer`, `reset_interactions`, `add_*_interaction(...,
+run_prediction=False)`) do not contend on this lock and run concurrently across
+sessions.
+
+If predictions feel slow under concurrent load, the answer is more GPUs (run one
+`nninteractive-server` per GPU on different ports), not raising `--max-sessions`.
+
+### Idle expiry
+
+A session is reaped if it sees no requests for `--idle-timeout-seconds` (default
+600 s = 10 minutes). After that, any request from the client raises
+`SessionExpiredError`. The session may also be reaped by a server restart.
+
+```python
+from nnInteractive.inference.remote import SessionExpiredError
+
+try:
+    session.add_point_interaction([60, 70, 30], include_interaction=True)
+except SessionExpiredError:
+    # The server-side session is gone. There is nothing to restore: the
+    # image, target buffer, and the chain of interactions only exist on the
+    # server, and they were dropped when the lease was reaped. The user has
+    # to start the segmentation workflow over.
+    session = nnInteractiveRemoteInferenceSession(server_url, api_key=KEY)
+    session.set_image(image)
+    session.set_target_buffer(buf)
+    # GUI should surface: "Your session timed out. Please redo your prompts."
+```
+
+For a GUI where users may stare at the screen for long stretches without
+clicking, drive `session.heartbeat()` on a timer (e.g. every 60 s) to keep the
+session alive without doing real work:
+
+```python
+# Cheap call; returns remaining seconds until expiry.
+remaining = session.heartbeat()
+```
+
+`session.lease_status()` is a read-only variant: it returns the remaining
+seconds without extending the lease — useful for a "your session expires in N
+seconds" UI badge.
+
+### Capacity (`--max-sessions`)
+
+If all `--max-sessions` slots are in use when a new client tries to connect,
+constructing the remote session raises `ServerAtCapacityError`. Typical
+handling is "wait a moment and retry":
+
+```python
+import time
+from nnInteractive.inference.remote import (
+    nnInteractiveRemoteInferenceSession,
+    ServerAtCapacityError,
+)
+
+for attempt in range(6):
+    try:
+        session = nnInteractiveRemoteInferenceSession(server_url, api_key=KEY)
+        break
+    except ServerAtCapacityError:
+        time.sleep(10)
+else:
+    raise SystemExit("server has been at capacity for too long")
+```
+
+### For GUI developers
+
+A few contract points worth respecting when wiring this into a GUI:
+
+- **Construct the session in a worker thread.** HTTP + prediction both block;
+  doing this on the UI thread freezes the app.
+- **Catch `SessionExpiredError` around every interaction call.** A timed-out
+  session cannot be restored — the image, target buffer, and accumulated
+  prompts are all server-side state that has been freed. The GUI must claim
+  a new session, call `set_image` and `set_target_buffer` again, and ask the
+  user to redo their prompts. Show a clear "session timed out" message so
+  the user understands why they're being asked to start over.
+- **Call `session.close()` on app quit** (or use the `with` statement). The
+  destructor also releases the lease, but explicit close is preferred so the
+  server frees the slot immediately for other users.
+- **Drive `heartbeat()` from a timer if the GUI may sit idle for minutes.**
+  Otherwise the server will reap the session at the idle timeout. Skip the
+  heartbeat if your UX assumes the user is actively interacting.
+- **Surface `ServerAtCapacityError` as "server is full, try again later".** It's
+  a transient operator-level condition; the user can't fix it from the GUI.
+
 ## Authentication
 
-Authentication is a static bearer token. The server requires it if it was
-started with `--api-key`; otherwise it accepts every request without
-checking.
+Authentication is a static bearer token shared by everyone who can use the
+server. The server requires it if it was started with `--api-key`; otherwise
+it accepts every request without checking.
+
+The bearer token gates **access to the server as a whole** — anyone who has
+it can claim a session. The lease token (issued per client at `/claim`) is a
+separate, per-session ownership mechanism handled transparently by the
+client; it is not a second authentication layer and a GUI user never sees
+it.
 
 ### On the server
 
@@ -206,19 +337,27 @@ so you find out at session construction time, not later in a prediction.
 Rotation: change the key, restart the server, update the client. There is no
 login flow.
 
-## Recommended: SSH tunnel (avoids exposing the server)
+## Single-user secure setup: SSH tunnel
 
-For a single user, the simplest secure setup is to bind the server to
-`127.0.0.1` on the GPU box and forward a port over SSH. The server is
-unreachable from any other machine; only an authenticated SSH session can
-talk to it.
+> **This pattern is for a single user only.** It binds the server to the
+> GPU box's loopback interface, which means *the user running the SSH
+> tunnel is the only one who can reach it*. If you want multiple
+> researchers to share one server, skip this section and go to *Multi-user
+> deployment* below.
+
+If only you will be using the GPU box, the simplest secure setup is to bind
+the server to `127.0.0.1` on the GPU box and forward a port over SSH. The
+server is unreachable from any other machine; only your SSH session can
+talk to it. Start the server with `--max-sessions 1` for this pattern —
+nobody else can claim a session anyway.
 
 **On the GPU box:**
 
 ```bash
 nninteractive-server \
     --model-dir /path/to/checkpoint --fold all \
-    --host 127.0.0.1 --port 1527
+    --host 127.0.0.1 --port 1527 \
+    --max-sessions 1
 ```
 
 **On the client box:**
@@ -241,9 +380,30 @@ autossh -M 0 -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
         -N -L 1527:127.0.0.1:1527 you@gpu-box.lab
 ```
 
-If you do expose the server on `0.0.0.0`, **set an API key** and ideally
-front the server with a reverse proxy that adds TLS (nginx, caddy, traefik).
-The server itself does not terminate TLS.
+## Multi-user deployment
+
+For multiple users sharing one server, bind to `0.0.0.0` (or to a non-loopback
+interface reachable on your network), pick a `--max-sessions` value that fits
+your GPU, and set an API key:
+
+```bash
+nninteractive-server \
+    --model-dir /path/to/checkpoint --fold all \
+    --host 0.0.0.0 --port 1527 \
+    --max-sessions 4 \
+    --api-key "$(openssl rand -hex 32)"
+```
+
+Distribute the API key to your users via whatever channel you'd use for any
+other shared credential. Every authorized client claims its own session
+automatically on construction; users do not coordinate.
+
+**Add TLS.** The server itself does not terminate TLS. Put it behind a
+reverse proxy (nginx, caddy, traefik) that adds HTTPS, especially if the
+traffic leaves a trusted network. The proxy should pass through the
+`Authorization`, `X-Lease-Token`, `X-Meta`, and `Content-Type` headers
+unchanged and not buffer the response body (the server streams compressed
+prediction diffs).
 
 ## Proxy gotcha
 
@@ -291,14 +451,37 @@ GUI.
   run_prediction=True)` call blocks until the server finishes. Run the
   remote session from a worker thread in the GUI, exactly as you would for
   a slow local prediction.
+- **`SessionExpiredError`** — the server reaped your session because it
+  was idle longer than `--idle-timeout-seconds`, or the server was
+  restarted. A timed-out session cannot be restored; the image, target
+  buffer, and prompts have been freed on the server. Construct a new
+  `nnInteractiveRemoteInferenceSession`, call `set_image` + `set_target_buffer`,
+  and prompt the user to redo their interactions. To avoid this for
+  long-idle GUIs, call `session.heartbeat()` on a timer or raise
+  `--idle-timeout-seconds` on the server.
+- **`ServerAtCapacityError` on construction** — every session slot is in
+  use (`--max-sessions` reached). Wait and retry, ask the operator to
+  bump `--max-sessions`, or scale out with more `nninteractive-server`
+  processes on more GPUs.
+- **Predictions feel slower with multiple users** — expected: predictions
+  are serialized on the GPU across all sessions. Two clients each adding
+  a point at the same time will see one wait briefly for the other. For
+  higher throughput, run multiple `nninteractive-server` processes on
+  multiple GPUs and route clients across them.
 
 ## Limitations (current version)
 
-- One server process serves one in-flight session at a time (calls are
-  serialized by a lock). No multi-tenancy yet.
+- Predictions are GPU-serialized within one server process: multiple clients
+  can hold sessions and preprocess concurrently, but predictions run one at
+  a time. For higher throughput across many concurrent users, run multiple
+  `nninteractive-server` processes on different GPUs.
+- Authentication is a single shared bearer token: anyone with the API key
+  can claim a session. There is no per-user identity or quota.
 - The checkpoint loaded at startup is fixed for the lifetime of the server
   process. Switch-by-name is planned.
-- The server does not terminate TLS itself — put it behind a reverse proxy
-  or run over an SSH tunnel for any non-trivial deployment.
-- No retry/reconnect logic in the client — a network blip raises through to
-  the caller; the GUI is expected to handle this.
+- The server does not terminate TLS itself — front it with a reverse
+  proxy for any multi-user deployment, or use the single-user SSH-tunnel
+  pattern when only one user needs access.
+- No retry/reconnect logic in the client — a network blip or
+  `SessionExpiredError` raises through to the caller; the GUI is expected
+  to handle this.
