@@ -41,6 +41,23 @@ def _buffer_dtype_str(target_buffer: Union[np.ndarray, torch.Tensor]) -> str:
     return str(np.dtype(target_buffer.dtype))
 
 
+def _to_jsonable(obj):
+    """Recursively coerce numpy arrays/scalars into JSON-serializable builtins.
+
+    The local session accepts numpy values for things like ``image_properties['spacing']``;
+    the remote session JSON-encodes that metadata, so we have to match the contract.
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
+
 class nnInteractiveRemoteInferenceSession:
     """Drop-in replacement for nnInteractiveInferenceSession that talks to a server.
 
@@ -126,13 +143,16 @@ class nnInteractiveRemoteInferenceSession:
         return resp.json()
 
     def _post_json(self, path: str, body: dict) -> httpx.Response:
-        resp = self._http.post(path, json=body)
+        # Pre-serialize so numpy values in `body` (e.g. spacing as np.ndarray)
+        # don't hit httpx's default json encoder, which can't handle them.
+        payload = json.dumps(_to_jsonable(body), separators=(",", ":"))
+        resp = self._http.post(path, content=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         return resp
 
     def _post_binary(self, path: str, meta: dict, array_bytes: bytes) -> httpx.Response:
         headers = {
-            META_HEADER: json.dumps(meta, separators=(",", ":")),
+            META_HEADER: json.dumps(_to_jsonable(meta), separators=(",", ":")),
             "Content-Type": CONTENT_TYPE_OCTET_STREAM,
         }
         resp = self._http.post(path, content=array_bytes, headers=headers)
