@@ -14,6 +14,7 @@ step (bbox prediction + 5 click refinements).  The evaluator will overwrite
 the same input file between calls, injecting updated clicks and the previous
 prediction (`prev_pred`).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,10 +29,10 @@ from nnInteractive.inference.inference_session import nnInteractiveInferenceSess
 
 from nnunetv2.utilities.helpers import empty_cache
 
-
 # --------------------------------------------------------------------------- #
 #                           ===  EDIT BELOW  ===                              #
 # --------------------------------------------------------------------------- #
+
 
 def run_inference(
     image: np.ndarray,
@@ -66,27 +67,28 @@ def run_inference(
         classes start from 1 … N.  Make sure dtype is `np.uint8`.
     """
     session = nnInteractiveInferenceSession(
-        device=torch.device('cuda', 0),
+        device=torch.device("cuda", 0),
         use_torch_compile=False,
         verbose=False,
         torch_n_threads=os.cpu_count(),
         do_autozoom=True,
-        use_pinned_memory=True
     )
     session.initialize_from_trained_model_folder(
         model_training_output_dir=CHECKPOINT_DIR,
-        use_fold='all',
+        use_fold="all",
     )
     session.set_image(image[None].astype(np.float32))
-    target_buffer = torch.zeros(image.shape, dtype=torch.uint8, device='cpu')
+    target_buffer = torch.zeros(image.shape, dtype=torch.uint8, device="cpu")
     session.set_target_buffer(target_buffer)
     result = torch.zeros(image.shape, dtype=torch.uint8)
     num_objects = len(bbox) if bbox is not None else len(clicks)
     if bbox is not None and clicks is not None:
-        assert len(bbox) == len(clicks), ('Both bboxs and clicks lists are provided but with different length '
-                                          'suggesting different number of objects. This is not supported by this script '
-                                          'and it was not communicated by the organizing team that such cases exist '
-                                          'or how they are supposed to be handled.')
+        assert len(bbox) == len(clicks), (
+            "Both bboxs and clicks lists are provided but with different length "
+            "suggesting different number of objects. This is not supported by this script "
+            "and it was not communicated by the organizing team that such cases exist "
+            "or how they are supposed to be handled."
+        )
     for oid in range(1, num_objects + 1):
         # place previous segmentation
         if prev_pred is not None:
@@ -96,37 +98,39 @@ def run_inference(
         if bbox is not None:
             bbox_here = bbox[oid - 1]
             bbox_here = [
-                [bbox_here['z_min'], bbox_here['z_max'] + 1],
-                [bbox_here['z_mid_y_min'], bbox_here['z_mid_y_max'] + 1],
-                [bbox_here['z_mid_x_min'], bbox_here['z_mid_x_max'] + 1]
-                ]
+                [bbox_here["z_min"], bbox_here["z_max"] + 1],
+                [bbox_here["z_mid_y_min"], bbox_here["z_mid_y_max"] + 1],
+                [bbox_here["z_mid_x_min"], bbox_here["z_mid_x_max"] + 1],
+            ]
             session.add_bbox_interaction(bbox_here, include_interaction=True, run_prediction=False)
         if clicks is not None:
             clicks_here = clicks[oid - 1]
             clicks_order_here = clicks_order[oid - 1]
             fg_ptr = bg_ptr = 0
             for kind in clicks_order_here:
-                if kind == 'fg':
-                    click = clicks_here['fg'][fg_ptr]
+                if kind == "fg":
+                    click = clicks_here["fg"][fg_ptr]
                     fg_ptr += 1
                 else:
-                    click = clicks_here['bg'][bg_ptr]
+                    click = clicks_here["bg"][bg_ptr]
                     bg_ptr += 1
 
                 print(f"Class {oid}: {kind} click at {click}")
-                session.add_point_interaction(click, include_interaction=kind == 'fg', run_prediction=False)
+                session.add_point_interaction(click, include_interaction=kind == "fg", run_prediction=False)
         # now run inference on the last interaction center
         session.new_interaction_centers = [session.new_interaction_centers[-1]]
         session.new_interaction_zoom_out_factors = [session.new_interaction_zoom_out_factors[-1]]
         session._predict()
         result[session.target_buffer > 0] = oid
     del session
-    empty_cache(torch.device('cuda', 0))
+    empty_cache(torch.device("cuda", 0))
     return result.cpu().numpy()
+
 
 # --------------------------------------------------------------------------- #
 #                         ===  DO NOT EDIT BELOW ===                          #
 # --------------------------------------------------------------------------- #
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -134,8 +138,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_path", required=True, help="Path to write output *.npz")
     return p.parse_args()
 
+
 # Adapt this to your checkpoint directory (relative to the script)
-CHECKPOINT_DIR = 'checkpoint_folder'
+CHECKPOINT_DIR = "checkpoint_folder"
+
 
 def main() -> None:
     args = parse_args()
@@ -147,12 +153,12 @@ def main() -> None:
 
     # ---------------------- Load input & prompts -------------------------- #
     data = np.load(case_path, allow_pickle=True)
-    image        = data["imgs"]
-    spacing      = tuple(data["spacing"])
-    bbox         = data.get("boxes")         # bounding boxes
-    clicks       = data.get("clicks")        # fg/bg clicks per class
+    image = data["imgs"]
+    spacing = tuple(data["spacing"])
+    bbox = data.get("boxes")  # bounding boxes
+    clicks = data.get("clicks")  # fg/bg clicks per class
     clicks_order = data.get("clicks_order")  # order of click types
-    prev_pred    = data.get("prev_pred")     # from last iteration
+    prev_pred = data.get("prev_pred")  # from last iteration
 
     # --------------------------- Inference -------------------------------- #
     seg = run_inference(image, spacing, bbox, clicks, clicks_order, prev_pred)
@@ -161,6 +167,7 @@ def main() -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(save_path, segs=seg.astype(np.uint8))
     print(f"[predict.py] Saved prediction to {save_path}")
+
 
 if __name__ == "__main__":
     main()

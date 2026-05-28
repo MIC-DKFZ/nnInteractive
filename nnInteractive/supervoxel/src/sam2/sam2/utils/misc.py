@@ -100,12 +100,15 @@ def _load_img_as_tensor(img_path, image_size):
     video_width, video_height = img_pil.size  # the original video size
     return img, video_height, video_width
 
+
 from skimage.transform import resize
+
+
 def _load_np_as_tensor(img_arr, image_size):
     _, video_width, video_height = img_arr.shape  # the original video siz
     img_arr = resize(img_arr, (3, image_size, image_size))
 
-    img = torch.from_numpy(img_arr)# .permute(2, 0, 1)
+    img = torch.from_numpy(img_arr)  # .permute(2, 0, 1)
     return img, video_height, video_width
 
 
@@ -160,9 +163,7 @@ class AsyncVideoFrameLoader:
         if img is not None:
             return img
 
-        img, video_height, video_width = _load_img_as_tensor(
-            self.img_paths[index], self.image_size
-        )
+        img, video_height, video_width = _load_img_as_tensor(self.img_paths[index], self.image_size)
         self.video_height = video_height
         self.video_width = video_width
         # normalize by mean and std
@@ -235,9 +236,7 @@ def load_video_frames(
             compute_device=compute_device,
         )
     else:
-        raise NotImplementedError(
-            "Only MP4 video and JPEG folder are supported at this moment"
-        )
+        raise NotImplementedError("Only MP4 video and JPEG folder are supported at this moment")
 
 
 def load_video_frames_from_jpg_images(
@@ -270,11 +269,7 @@ def load_video_frames_from_jpg_images(
             "ffmpeg to start the JPEG file from 00000.jpg."
         )
 
-    frame_names = [
-        p
-        for p in os.listdir(jpg_folder)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
+    frame_names = [p for p in os.listdir(jpg_folder) if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     num_frames = len(frame_names)
     if num_frames == 0:
@@ -326,9 +321,10 @@ def load_video_frames_from_nifti_images(
     """
     import SimpleITK as sitk
     from skimage.transform import resize
+
     volume = sitk.ReadImage(video_path)
     vol_data = sitk.GetArrayFromImage(volume)
-    # Clip 
+    # Clip
     vol_data = np.clip(vol_data, -100, 400)
     # Normalize
     vol_data = (vol_data - vol_data.min()) / (vol_data.max() - vol_data.min())
@@ -382,6 +378,7 @@ def load_video_frames_from_nifti_images(
     if not offload_video_to_cpu:
         images = images.to(compute_device)
     return images, video_height, video_width
+
 
 def load_video_frames_from_numpy_array(
     vol_data,

@@ -50,15 +50,9 @@ def get_args_parser():
         required=True,
         help="Shard the run over this many jobs.",
     )
-    launch_parser.add_argument(
-        "--timeout", type=int, required=True, help="SLURM timeout parameter in minutes."
-    )
-    launch_parser.add_argument(
-        "--partition", type=str, required=True, help="Partition to launch on."
-    )
-    launch_parser.add_argument(
-        "--account", type=str, required=True, help="Partition to launch on."
-    )
+    launch_parser.add_argument("--timeout", type=int, required=True, help="SLURM timeout parameter in minutes.")
+    launch_parser.add_argument("--partition", type=str, required=True, help="Partition to launch on.")
+    launch_parser.add_argument("--account", type=str, required=True, help="Partition to launch on.")
     launch_parser.add_argument("--qos", type=str, required=True, help="QOS.")
 
     # ------------

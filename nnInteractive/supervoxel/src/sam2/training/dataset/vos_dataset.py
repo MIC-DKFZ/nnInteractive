@@ -57,15 +57,11 @@ class VOSDataset(VisionDataset):
                 # sample a video
                 video, segment_loader = self.video_dataset.get_video(idx)
                 # sample frames and object indices to be used in a datapoint
-                sampled_frms_and_objs = self.sampler.sample(
-                    video, segment_loader, epoch=self.curr_epoch
-                )
+                sampled_frms_and_objs = self.sampler.sample(video, segment_loader, epoch=self.curr_epoch)
                 break  # Succesfully loaded video
             except Exception as e:
                 if self.training:
-                    logging.warning(
-                        f"Loading failed (id={idx}); Retry {retry} with exception: {e}"
-                    )
+                    logging.warning(f"Loading failed (id={idx}); Retry {retry} with exception: {e}")
                     idx = random.randrange(0, len(self.video_dataset))
                 else:
                     # Shouldn't fail to load a val video
@@ -96,17 +92,13 @@ class VOSDataset(VisionDataset):
             )
             # We load the gt segments associated with the current frame
             if isinstance(segment_loader, JSONSegmentLoader):
-                segments = segment_loader.load(
-                    frame.frame_idx, obj_ids=sampled_object_ids
-                )
+                segments = segment_loader.load(frame.frame_idx, obj_ids=sampled_object_ids)
             else:
                 segments = segment_loader.load(frame.frame_idx)
             for obj_id in sampled_object_ids:
                 # Extract the segment
                 if obj_id in segments:
-                    assert (
-                        segments[obj_id] is not None
-                    ), "None targets are not supported"
+                    assert segments[obj_id] is not None, "None targets are not supported"
                     # segment is uint8 and remains uint8 throughout the transforms
                     segment = segments[obj_id].to(torch.uint8)
                 else:

@@ -67,9 +67,7 @@ class JSONSegmentLoader:
                 id_2_idx[obj_id] = None
 
         # Decode the masks
-        raw_segments = torch.from_numpy(mask_utils.decode(rle_mask_filtered)).permute(
-            2, 0, 1
-        )  # （num_obj, h, w）
+        raw_segments = torch.from_numpy(mask_utils.decode(rle_mask_filtered)).permute(2, 0, 1)  # （num_obj, h, w）
         segments = {}
         for obj_id in valid_objs_ids:
             if id_2_idx[obj_id] is None:
@@ -125,9 +123,7 @@ class PalettisedPNGSegmentLoader:
             binary_segments: dict
         """
         # check the path
-        mask_path = os.path.join(
-            self.video_png_root, self.frame_id_to_png_filename[frame_id]
-        )
+        mask_path = os.path.join(self.video_png_root, self.frame_id_to_png_filename[frame_id])
 
         # load the mask
         masks = PILImage.open(mask_path).convert("P")
@@ -165,9 +161,7 @@ class MultiplePNGSegmentLoader:
         self.H = tmp_mask.shape[0]
         self.W = tmp_mask.shape[1]
         if self.single_object_mode:
-            self.obj_id = (
-                int(video_png_root.split("/")[-1]) + 1
-            )  # offset by 1 as bg is 0
+            self.obj_id = int(video_png_root.split("/")[-1]) + 1  # offset by 1 as bg is 0
         else:
             self.obj_id = None
 
@@ -280,15 +274,10 @@ class SA1BSegmentLoader:
         for frame_annot in self.frame_annots:
             if not frame_annot["area"] > 0:
                 continue
-            if ("uncertain_iou" in frame_annot) and (
-                frame_annot["uncertain_iou"] < uncertain_iou
-            ):
+            if ("uncertain_iou" in frame_annot) and (frame_annot["uncertain_iou"] < uncertain_iou):
                 # uncertain_iou is stability score
                 continue
-            if (
-                mask_area_frac_thresh <= 1.0
-                and (frame_annot["area"] / area) >= mask_area_frac_thresh
-            ):
+            if mask_area_frac_thresh <= 1.0 and (frame_annot["area"] / area) >= mask_area_frac_thresh:
                 continue
             rle_masks.append(frame_annot["segmentation"])
 

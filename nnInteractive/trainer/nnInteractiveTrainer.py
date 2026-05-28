@@ -3,20 +3,22 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, Config
 from torch import nn
 
 
-class nnInteractiveTrainer_stub():
+class nnInteractiveTrainer_stub:
     def __init__(self, *args, **kwargs):
         pass
 
     @staticmethod
-    def build_network_architecture(plans_manager: PlansManager,
-                                   configuration_manager: ConfigurationManager,
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
+    def build_network_architecture(
+        plans_manager: PlansManager,
+        configuration_manager: ConfigurationManager,
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool = True,
+    ) -> nn.Module:
         return nnUNetTrainer.build_network_architecture(
             plans_manager,
             configuration_manager,
-            num_input_channels + 7,
+            num_input_channels,
             2,  # nnunet handles one class segmentation still as CE so we need 2 outputs.
-            enable_deep_supervision
+            enable_deep_supervision,
         )

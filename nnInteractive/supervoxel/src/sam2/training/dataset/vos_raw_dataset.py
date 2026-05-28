@@ -88,9 +88,7 @@ class PNGRawDataset(VOSRawDataset):
             excluded_files = []
 
         # Check if it's not in excluded_files
-        self.video_names = sorted(
-            [video_name for video_name in subset if video_name not in excluded_files]
-        )
+        self.video_names = sorted([video_name for video_name in subset if video_name not in excluded_files])
 
         if self.single_object_mode:
             # single object mode
@@ -116,9 +114,7 @@ class PNGRawDataset(VOSRawDataset):
         video_name = self.video_names[idx]
 
         if self.single_object_mode:
-            video_frame_root = os.path.join(
-                self.img_folder, os.path.dirname(video_name)
-            )
+            video_frame_root = os.path.join(self.img_folder, os.path.dirname(video_name))
         else:
             video_frame_root = os.path.join(self.img_folder, video_name)
 
@@ -127,9 +123,7 @@ class PNGRawDataset(VOSRawDataset):
         if self.is_palette:
             segment_loader = PalettisedPNGSegmentLoader(video_mask_root)
         else:
-            segment_loader = MultiplePNGSegmentLoader(
-                video_mask_root, self.single_object_mode
-            )
+            segment_loader = MultiplePNGSegmentLoader(video_mask_root, self.single_object_mode)
 
         all_frames = sorted(glob.glob(os.path.join(video_frame_root, "*.jpg")))
         if self.truncate_video > 0:
@@ -168,9 +162,7 @@ class SA1BRawDataset(VOSRawDataset):
                 subset = [os.path.splitext(line.strip())[0] for line in f]
         else:
             subset = os.listdir(self.img_folder)
-            subset = [
-                path.split(".")[0] for path in subset if path.endswith(".jpg")
-            ]  # remove extension
+            subset = [path.split(".")[0] for path in subset if path.endswith(".jpg")]  # remove extension
 
         # Read and process excluded files if provided
         if excluded_videos_list_txt is not None:
@@ -180,9 +172,7 @@ class SA1BRawDataset(VOSRawDataset):
             excluded_files = []
 
         # Check if it's not in excluded_files and it exists
-        self.video_names = [
-            video_name for video_name in subset if video_name not in excluded_files
-        ]
+        self.video_names = [video_name for video_name in subset if video_name not in excluded_files]
 
     def get_video(self, idx):
         """
@@ -247,9 +237,7 @@ class JSONRawDataset(VOSRawDataset):
 
             for excluded_videos_list_txt in excluded_videos_lists:
                 with open(excluded_videos_list_txt, "r") as f:
-                    excluded_files.extend(
-                        [os.path.splitext(line.strip())[0] for line in f]
-                    )
+                    excluded_files.extend([os.path.splitext(line.strip())[0] for line in f])
         excluded_files = set(excluded_files)
 
         # Read the subset defined in file_list_txt
@@ -259,9 +247,7 @@ class JSONRawDataset(VOSRawDataset):
         else:
             subset = os.listdir(self.img_folder)
 
-        self.video_names = sorted(
-            [video_name for video_name in subset if video_name not in excluded_files]
-        )
+        self.video_names = sorted([video_name for video_name in subset if video_name not in excluded_files])
 
     def get_video(self, video_idx):
         """
@@ -277,17 +263,13 @@ class JSONRawDataset(VOSRawDataset):
 
         frame_ids = [
             int(os.path.splitext(frame_name)[0])
-            for frame_name in sorted(
-                os.listdir(os.path.join(self.img_folder, video_name))
-            )
+            for frame_name in sorted(os.listdir(os.path.join(self.img_folder, video_name)))
         ]
 
         frames = [
             VOSFrame(
                 frame_id,
-                image_path=os.path.join(
-                    self.img_folder, f"{video_name}/%05d.jpg" % (frame_id)
-                ),
+                image_path=os.path.join(self.img_folder, f"{video_name}/%05d.jpg" % (frame_id)),
             )
             for frame_id in frame_ids[:: self.sample_rate]
         ]

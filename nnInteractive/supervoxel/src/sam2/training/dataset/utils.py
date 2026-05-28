@@ -97,8 +97,6 @@ class RepeatFactorWrapper(Dataset):
 
     def __getitem__(self, idx):
         if self.epoch_ids is None:
-            raise RuntimeError(
-                "Repeat ids haven't been computed. Did you forget to call set_epoch?"
-            )
+            raise RuntimeError("Repeat ids haven't been computed. Did you forget to call set_epoch?")
 
         return self.dataset[self.epoch_ids[idx]]

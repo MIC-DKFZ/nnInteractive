@@ -27,9 +27,7 @@ Scalar = Union[Tensor, ndarray, int, float]
 def make_tensorboard_logger(log_dir: str, **writer_kwargs: Any):
     makedir(log_dir)
     summary_writer_method = SummaryWriter
-    return TensorBoardLogger(
-        path=log_dir, summary_writer_method=summary_writer_method, **writer_kwargs
-    )
+    return TensorBoardLogger(path=log_dir, summary_writer_method=summary_writer_method, **writer_kwargs)
 
 
 class TensorBoardWriterWrapper:
@@ -63,9 +61,7 @@ class TensorBoardWriterWrapper:
         _, self._rank = get_machine_local_and_dist_rank()
         self._path: str = path
         if self._rank == 0:
-            logging.info(
-                f"TensorBoard SummaryWriter instantiated. Files will be stored in: {path}"
-            )
+            logging.info(f"TensorBoard SummaryWriter instantiated. Files will be stored in: {path}")
             self._writer = summary_writer_method(
                 log_dir=path,
                 *args,
@@ -73,9 +69,7 @@ class TensorBoardWriterWrapper:
                 **kwargs,
             )
         else:
-            logging.debug(
-                f"Not logging meters on this host because env RANK: {self._rank} != 0"
-            )
+            logging.debug(f"Not logging meters on this host because env RANK: {self._rank} != 0")
         atexit.register(self.close)
 
     @property
@@ -135,9 +129,7 @@ class TensorBoardLogger(TensorBoardWriterWrapper):
             return
         self._writer.add_scalar(name, data, global_step=step, new_style=True)
 
-    def log_hparams(
-        self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
-    ) -> None:
+    def log_hparams(self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]) -> None:
         """Add hyperparameter data to TensorBoard.
 
         Args:
@@ -168,9 +160,7 @@ class Logger:
         if self.tb_logger:
             self.tb_logger.log(name, data, step)
 
-    def log_hparams(
-        self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
-    ) -> None:
+    def log_hparams(self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]) -> None:
         if self.tb_logger:
             self.tb_logger.log_hparams(hparams, meters)
 

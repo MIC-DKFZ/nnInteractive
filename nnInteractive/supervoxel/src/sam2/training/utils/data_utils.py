@@ -131,9 +131,7 @@ def collate_fn(
     step_t_frame_orig_size = [[] for _ in range(T)]
 
     step_t_masks = [[] for _ in range(T)]
-    step_t_obj_to_frame_idx = [
-        [] for _ in range(T)
-    ]  # List to store frame indices for each time step
+    step_t_obj_to_frame_idx = [[] for _ in range(T)]  # List to store frame indices for each time step
 
     for video_idx, video in enumerate(batch):
         orig_video_id = video.video_id
@@ -143,29 +141,18 @@ def collate_fn(
             for obj in objects:
                 orig_obj_id = obj.object_id
                 orig_frame_idx = obj.frame_index
-                step_t_obj_to_frame_idx[t].append(
-                    torch.tensor([t, video_idx], dtype=torch.int)
-                )
+                step_t_obj_to_frame_idx[t].append(torch.tensor([t, video_idx], dtype=torch.int))
                 step_t_masks[t].append(obj.segment.to(torch.bool))
-                step_t_objects_identifier[t].append(
-                    torch.tensor([orig_video_id, orig_obj_id, orig_frame_idx])
-                )
+                step_t_objects_identifier[t].append(torch.tensor([orig_video_id, orig_obj_id, orig_frame_idx]))
                 step_t_frame_orig_size[t].append(torch.tensor(orig_frame_size))
 
     obj_to_frame_idx = torch.stack(
-        [
-            torch.stack(obj_to_frame_idx, dim=0)
-            for obj_to_frame_idx in step_t_obj_to_frame_idx
-        ],
+        [torch.stack(obj_to_frame_idx, dim=0) for obj_to_frame_idx in step_t_obj_to_frame_idx],
         dim=0,
     )
     masks = torch.stack([torch.stack(masks, dim=0) for masks in step_t_masks], dim=0)
-    objects_identifier = torch.stack(
-        [torch.stack(id, dim=0) for id in step_t_objects_identifier], dim=0
-    )
-    frame_orig_size = torch.stack(
-        [torch.stack(id, dim=0) for id in step_t_frame_orig_size], dim=0
-    )
+    objects_identifier = torch.stack([torch.stack(id, dim=0) for id in step_t_objects_identifier], dim=0)
+    frame_orig_size = torch.stack([torch.stack(id, dim=0) for id in step_t_frame_orig_size], dim=0)
     return BatchedVideoDatapoint(
         img_batch=img_batch,
         obj_to_frame_idx=obj_to_frame_idx,

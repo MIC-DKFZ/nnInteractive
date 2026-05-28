@@ -18,7 +18,6 @@ import torch
 import torch.autograd as autograd
 import torch.distributed as dist
 
-
 # Default to GPU 0
 _cuda_device_index: int = 0
 
@@ -125,9 +124,7 @@ def all_gather(data, force_cpu=False, force_filesys=False, filesys_save_dir=None
         return [data]
 
     if os.getenv("MDETR_FILESYS_REDUCE_RANK_0_ONLY") == "1":
-        return all_gather_via_filesys(
-            data, filesys_save_dir, gather_to_rank_0_only=True
-        )
+        return all_gather_via_filesys(data, filesys_save_dir, gather_to_rank_0_only=True)
 
     if os.getenv("MDETR_FILESYS_REDUCE") == "1" or force_filesys:
         return all_gather_via_filesys(data, filesys_save_dir)
@@ -144,9 +141,7 @@ def all_gather(data, force_cpu=False, force_filesys=False, filesys_save_dir=None
 
     # obtain Tensor size of each rank
     local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.long)
-    size_list = [
-        torch.tensor([0], device=device, dtype=torch.long) for _ in range(world_size)
-    ]
+    size_list = [torch.tensor([0], device=device, dtype=torch.long) for _ in range(world_size)]
     if cpu_group is None:
         dist.all_gather(size_list, local_size)
     else:
@@ -164,9 +159,7 @@ def all_gather(data, force_cpu=False, force_filesys=False, filesys_save_dir=None
     for _ in size_list:
         tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device=device))
     if local_size != max_size:
-        padding = torch.empty(
-            size=(max_size - local_size,), dtype=torch.uint8, device=device
-        )
+        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device=device)
         tensor = torch.cat((tensor, padding), dim=0)
     if cpu_group is None:
         dist.all_gather(tensor_list, tensor)
@@ -295,14 +288,9 @@ def gather_tensors_from_all(tensor: torch.Tensor) -> List[torch.Tensor]:
 
     if is_distributed_training_run():
         tensor, orig_device = convert_to_distributed_tensor(tensor)
-        gathered_tensors = [
-            torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())
-        ]
+        gathered_tensors = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather(gathered_tensors, tensor)
-        gathered_tensors = [
-            convert_to_normal_tensor(_tensor, orig_device)
-            for _tensor in gathered_tensors
-        ]
+        gathered_tensors = [convert_to_normal_tensor(_tensor, orig_device) for _tensor in gathered_tensors]
     else:
         gathered_tensors = [tensor]
 
@@ -355,9 +343,7 @@ def get_rank() -> int:
     / non-distributed settings
     """
     return (
-        torch.distributed.get_rank()
-        if torch.distributed.is_available() and torch.distributed.is_initialized()
-        else 0
+        torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
     )
 
 
@@ -456,9 +442,7 @@ def all_gather_tensor(tensor: torch.Tensor, world_size=None):
     tensor, orig_device = convert_to_distributed_tensor(tensor)
     tensor_all = [torch.ones_like(tensor) for _ in range(world_size)]
     dist.all_gather(tensor_all, tensor, async_op=False)  # performance opt
-    tensor_all = [
-        convert_to_normal_tensor(tensor, orig_device) for tensor in tensor_all
-    ]
+    tensor_all = [convert_to_normal_tensor(tensor, orig_device) for tensor in tensor_all]
     return tensor_all
 
 

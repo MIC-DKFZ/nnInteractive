@@ -139,7 +139,6 @@ session = nnInteractiveInferenceSession(
     verbose=False,
     torch_n_threads=os.cpu_count(),  # Use available CPU cores
     do_autozoom=True,  # Enables AutoZoom for better patching
-    use_pinned_memory=True,  # Optimizes GPU memory transfers
 )
 
 # Load the trained model

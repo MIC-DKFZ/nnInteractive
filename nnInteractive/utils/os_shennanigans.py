@@ -1,6 +1,7 @@
 import platform
 import sys
 
+
 def is_linux_kernel_6_11():
     if sys.platform != "linux":
         return False

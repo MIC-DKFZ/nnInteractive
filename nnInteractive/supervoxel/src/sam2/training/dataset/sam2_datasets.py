@@ -49,9 +49,7 @@ class MixedDataLoader:
             raise TypeError(f"{type(self).__name__} object is not an iterator")
 
         while self._iter_mixing_prob.any():  # at least one D-Loader with non-zero prob.
-            dataset_idx = self._iter_mixing_prob.multinomial(
-                1, generator=self.random_generator
-            ).item()
+            dataset_idx = self._iter_mixing_prob.multinomial(1, generator=self.random_generator).item()
             try:
                 item = next(self._iter_dls[dataset_idx])
                 return item
@@ -134,9 +132,7 @@ class TorchTrainMixedDataset:
 
     def get_loader(self, epoch) -> Iterable:
         dataloaders = []
-        for d_idx, (dataset, batch_size) in enumerate(
-            zip(self.datasets, self.batch_sizes)
-        ):
+        for d_idx, (dataset, batch_size) in enumerate(zip(self.datasets, self.batch_sizes)):
             if self.phases_per_epoch > 1:
                 # Major epoch that looops over entire dataset
                 # len(main_epoch) == phases_per_epoch * len(epoch)

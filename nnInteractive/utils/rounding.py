@@ -1,5 +1,6 @@
 from math import ceil, floor
 
+
 def round_to_nearest_odd(number: float):
     assert number > 0
     cl = ceil(number)
