@@ -249,6 +249,41 @@ session.set_target_buffer(torch.zeros(NEW_IMAGE.shape[1:], dtype=torch.uint8))
 # Enjoy!
 ```
 
+## Running inference on a remote GPU (client / server)
+
+If the machine running your GUI does not have a powerful GPU, you can run the
+model on a remote box and drive it over HTTP with
+**`nnInteractiveRemoteInferenceSession`** — a drop-in replacement with the same
+public API as the local session. The server loads the model once at startup and
+hosts multiple concurrent client sessions; each client keeps its own image,
+target buffer, and interaction state.
+
+Start the server on the GPU box:
+
+```bash
+nninteractive-server \
+    --model-dir /path/to/checkpoint_folder --fold all \
+    --host 0.0.0.0 --port 1527 \
+    --api-key "$(openssl rand -hex 32)"
+```
+
+And in the client code, swap the local session for the remote one:
+
+```python
+from nnInteractive.inference.remote import nnInteractiveRemoteInferenceSession
+
+session = nnInteractiveRemoteInferenceSession(
+    server_url="http://gpu-box.lab:1527",
+    api_key="…",
+)
+# From here on, the API is identical to nnInteractiveInferenceSession.
+```
+
+For full details — installation, authentication, single-user SSH-tunnel setup,
+multi-user deployment behind a reverse proxy, concurrency/session model, idle
+expiry and heartbeats, GUI integration notes, and troubleshooting — see
+[`SERVER_CLIENT.md`](SERVER_CLIENT.md).
+
 ## nnInteractive SuperVoxels
 
 As part of the `nnInteractive` framework, we provide a dedicated module for **supervoxel generation** based on [SAM](https://github.com/facebookresearch/segment-anything) and [SAM2](https://github.com/facebookresearch/sam2). This replaces traditional superpixel methods (e.g., SLIC) with **foundation model–powered 3D pseudo-labels**.
