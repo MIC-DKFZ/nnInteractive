@@ -71,12 +71,29 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
         return out
 
     def _read_target_bbox(bbox: list[list[int]]) -> np.ndarray:
-        """Return the (cropped) target_buffer region for the given bbox as a numpy array."""
+        """Return the (cropped) target_buffer region for the given bbox as a numpy array.
+
+        The bbox must already be clipped to valid in-bounds indices — passing a
+        negative lower bound here would invoke numpy's "from the end" slicing
+        semantics and return the wrong region (silently empty in most cases).
+        """
         slicer = tuple(slice(int(lb), int(ub)) for lb, ub in bbox)
         tb = session.target_buffer
         if isinstance(tb, torch.Tensor):
             return tb[slicer].detach().cpu().numpy()
         return np.ascontiguousarray(tb[slicer])
+
+    def _clip_bbox_to_buffer(bbox: list[list[int]]) -> list[list[int]]:
+        """Clip an inference-time bbox to the target buffer's spatial bounds.
+
+        The local session stores ``_last_paste_bbox`` in unclipped form: when
+        the prediction patch extends past an image edge (common with autozoom
+        + click near a boundary), bounds can be negative or exceed shape. We
+        clip so the bbox we slice with is valid and matches what was actually
+        pasted into the target buffer.
+        """
+        tb_shape = session.target_buffer.shape
+        return [[max(int(lb), 0), min(int(ub), int(tb_shape[i]))] for i, (lb, ub) in enumerate(bbox)]
 
     def _build_prediction_response(ran_prediction: bool) -> Response:
         bbox = session._last_paste_bbox if ran_prediction else None
@@ -87,10 +104,20 @@ def make_app(session: nnInteractiveInferenceSession, api_key: Optional[str] = No
                 media_type=CONTENT_TYPE_OCTET_STREAM,
                 headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
             )
-        sub = _read_target_bbox(bbox)
+        clipped = _clip_bbox_to_buffer(bbox)
+        if any(lb >= ub for lb, ub in clipped):
+            # Bbox lies entirely outside the buffer — nothing to send.
+            session._last_paste_bbox = None
+            meta = {"ran_prediction": True, "bbox": None}
+            return Response(
+                content=b"",
+                media_type=CONTENT_TYPE_OCTET_STREAM,
+                headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
+            )
+        sub = _read_target_bbox(clipped)
         meta = {
             "ran_prediction": True,
-            "bbox": [[int(lb), int(ub)] for lb, ub in bbox],
+            "bbox": clipped,
             "dtype": str(sub.dtype),
             "shape": list(sub.shape),
         }
