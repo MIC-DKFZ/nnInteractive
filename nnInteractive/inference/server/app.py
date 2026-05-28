@@ -73,6 +73,16 @@ from nnInteractive.inference.remote.serialization import pack_array, unpack_arra
 
 logger = logging.getLogger("nninteractive.server")
 
+MAX_TARGET_BUFFER_BYTES = 4 * 1024**3
+SUPPORTED_TARGET_BUFFER_DTYPES = {
+    np.dtype("bool"),
+    np.dtype("uint8"),
+    np.dtype("uint16"),
+    np.dtype("int16"),
+    np.dtype("int32"),
+    np.dtype("float32"),
+}
+
 
 class SessionEntry:
     """One client's session plus its bookkeeping."""
@@ -436,6 +446,45 @@ def make_app(
             headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
         )
 
+    def _parse_target_buffer_request(payload: dict) -> tuple[tuple[int, ...], np.dtype]:
+        if "shape" not in payload:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="missing required field: shape")
+        if "dtype" not in payload:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="missing required field: dtype")
+
+        raw_shape = payload["shape"]
+        if not isinstance(raw_shape, list):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must be a list of positive integers")
+        if len(raw_shape) not in (2, 3):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must have 2 or 3 dimensions")
+
+        shape = []
+        for dim in raw_shape:
+            if not isinstance(dim, int) or isinstance(dim, bool):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must contain only integers")
+            if dim <= 0:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape dimensions must be positive")
+            shape.append(dim)
+
+        try:
+            dtype = np.dtype(payload["dtype"])
+        except TypeError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"invalid dtype: {payload['dtype']!r}") from e
+        if dtype not in SUPPORTED_TARGET_BUFFER_DTYPES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"unsupported dtype: {dtype}")
+
+        nbytes = int(np.prod(shape, dtype=np.uint64)) * dtype.itemsize
+        if nbytes > MAX_TARGET_BUFFER_BYTES:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"target buffer would require {nbytes} bytes, "
+                    f"limit is {MAX_TARGET_BUFFER_BYTES} bytes"
+                ),
+            )
+
+        return tuple(shape), dtype
+
     def _under_session_lock(entry: SessionEntry, fn):
         """Run ``fn(session)`` under the session's lock, converting known errors to HTTP 400.
 
@@ -530,8 +579,7 @@ def make_app(
 
     @app.post(PATH_SET_TARGET_BUFFER, dependencies=[auth])
     def set_target_buffer(payload: dict, entry: SessionEntry = lease) -> dict:
-        shape = tuple(int(x) for x in payload["shape"])
-        dtype = np.dtype(payload["dtype"])
+        shape, dtype = _parse_target_buffer_request(payload)
         buf = np.zeros(shape, dtype=dtype)
 
         def _do(session):
