@@ -45,6 +45,19 @@ dev = [
     "ruff",
     "pre-commit"
 ]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+client = [
+    "httpx>=0.27",
+]
+remote = [
+    "nnInteractive[server,client]",
+]
+
+[project.scripts]
+nninteractive-server = "nnInteractive.inference.server.main:main"
 
 [build-system]
 requires = ["setuptools>=67.8.0"]

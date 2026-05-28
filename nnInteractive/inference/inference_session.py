@@ -83,6 +83,10 @@ class nnInteractiveInferenceSession:
         self.preprocessed_image: torch.Tensor = None
         self.preprocessed_props = None
         self.target_buffer: Union[np.ndarray, torch.Tensor] = None
+        # Bbox (in original-image coordinates) of the most recent target_buffer write.
+        # Captured inside _paste_prediction_to_target_buffer so remote callers can
+        # fetch just the touched region without diffing.
+        self._last_paste_bbox: Optional[List[List[int]]] = None
 
         # this will be set when loading the model (initialize_from_trained_model_folder)
         self.pad_mode_data = self.preferred_scribble_thickness = self.point_interaction = None
@@ -287,6 +291,7 @@ class nnInteractiveInferenceSession:
         else:
             pred_for_target = prediction.to("cpu")
         paste_tensor(self.target_buffer, pred_for_target, target_bbox)
+        self._last_paste_bbox = target_bbox
 
     def _estimate_refinement_cache_nbytes(self, cache_bbox: List[List[int]]) -> int:
         cache_voxels = int(np.prod(self._bbox_size(cache_bbox), dtype=np.int64))
@@ -517,6 +522,7 @@ class nnInteractiveInferenceSession:
         self.current_interaction_intensity = 1.0
         empty_cache(self.device)
         self.original_image_shape = None
+        self._last_paste_bbox = None
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
         shape = (self.num_interaction_channels, *image_torch.shape[1:])
@@ -606,6 +612,7 @@ class nnInteractiveInferenceSession:
                 self.target_buffer.fill(0)
             elif isinstance(self.target_buffer, torch.Tensor):
                 self.target_buffer.zero_()
+        self._last_paste_bbox = None
         empty_cache(self.device)
 
     def add_bbox_interaction(
