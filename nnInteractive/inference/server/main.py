@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from typing import Optional
 
 import torch
@@ -174,6 +175,32 @@ def main(argv=None) -> int:
     # the artifacts dict carries everything sibling sessions need.
     loader.executor.shutdown(wait=False)
     del loader
+
+    if args.torch_compile:
+        # Compile the network once and run a single dummy forward pass so the
+        # lazy torch.compile compilation happens here at startup rather than on
+        # the first client's first prediction. We promote the resulting single
+        # OptimizedModule back into the shared artifacts dict, so every client
+        # session references that same compiled module (and the warmed compile
+        # cache) instead of re-wrapping the raw module.
+        logger.info("torch.compile enabled; compiling network and warming up (the first compile is slow)...")
+        warmup_session = nnInteractiveInferenceSession(
+            device=device,
+            use_torch_compile=True,
+            verbose=args.verbose,
+            torch_n_threads=args.torch_n_threads,
+            do_autozoom=not args.no_autozoom,
+        )
+        warmup_session.initialize_from_loaded_artifacts(artifacts)
+        artifacts["network"] = warmup_session.network
+        t0 = time.monotonic()
+        warmup_session.warmup()
+        logger.info(
+            "warmup forward pass complete in %.1fs; clients' first prediction will be fast",
+            time.monotonic() - t0,
+        )
+        warmup_session.executor.shutdown(wait=False)
+        del warmup_session
 
     logger.info(
         "Checkpoint loaded; serving on http://%s:%s (max_sessions=%d, idle_timeout=%.0fs, " "liveness_timeout=%.0fs)",

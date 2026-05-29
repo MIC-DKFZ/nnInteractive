@@ -886,6 +886,42 @@ class nnInteractiveInferenceSession:
             del initial_seg
 
     @torch.inference_mode()
+    def warmup(self) -> bool:
+        """Run a single dummy forward pass to trigger lazy ``torch.compile`` compilation up front.
+
+        With ``torch.compile`` enabled the network is compiled lazily on its first
+        forward pass, which would otherwise make the user's *first* real prediction
+        slow. Every prediction path — the initial coarse pass, the zoom-out
+        iterations, and the refinement patches — feeds the network an input of
+        identical shape ``[1, num_input_channels + num_interaction_channels,
+        *patch_size]`` (``_build_network_input`` always resizes the crop to
+        ``patch_size``, and refinement crops at exactly ``patch_size``). So a single
+        dummy pass at that shape populates the compile cache and every subsequent
+        real prediction is fast.
+
+        Returns ``True`` if a warmup pass was run, ``False`` if it was a no-op
+        (network not compiled — there is nothing to pre-compile, so a dummy pass
+        would not save the user any time). Mirrors ``_predict``'s autocast/
+        inference-mode context and the float32 input dtype that ``torch.cat``
+        produces when concatenating the float32 image with the fp16 interactions.
+        """
+        if self.network is None or self.configuration_manager is None:
+            raise RuntimeError("warmup() requires an initialized network; call initialize_* first")
+        if not isinstance(self.network, OptimizedModule):
+            return False
+        num_input_channels = (
+            determine_num_input_channels(self.plans_manager, self.configuration_manager, self.dataset_json)
+            + self.num_interaction_channels
+        )
+        patch_size = self.configuration_manager.patch_size
+        dummy = torch.zeros((1, num_input_channels, *patch_size), dtype=torch.float32, device=self.device)
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
+            self.network(dummy)
+        del dummy
+        empty_cache(self.device)
+        return True
+
+    @torch.inference_mode()
     def _predict(self, force_full_refine: bool = False):
         """
         force_full_refine if True we run the refinement over the whole current prediction and not just the diff map.
