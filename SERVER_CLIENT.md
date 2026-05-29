@@ -56,7 +56,7 @@ nninteractive-server \
 | `--device` | Torch device string, e.g. `cuda`, `cuda:0`, `cpu`. Default: `cuda`. |
 | `--torch-n-threads` | CPU threads for torch. Default: `8`. |
 | `--no-autozoom` | Disable adaptive zoom-out (rarely needed; on by default). |
-| `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; model weights are shared. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
+| `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; the network module (and therefore its weights) is shared by reference across all sessions — exactly one copy on the GPU regardless of session count. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
 | `--idle-timeout-seconds` | Idle timeout in seconds after which a session is reaped and its slot freed. Clients can extend their session by calling `heartbeat()`. Default: `600` (10 min). |
 | `--api-key` | Bearer token required on every request. See *Authentication* below. |
 | `--verbose` | Verbose session-side logging. |
@@ -183,8 +183,14 @@ Switching checkpoints at runtime is on the roadmap.
 
 The server hosts up to `--max-sessions` concurrent client sessions. Each client
 holds its own session — its own image, target buffer, and interaction state —
-while the model weights are shared. This gives multiple researchers on one GPU
-box independent state without duplicating the model.
+while the network module itself (the `nn.Module` instance, its weights, and
+its buffers) is shared by reference across every session. There is exactly
+one network and one copy of the weights resident on the GPU regardless of
+how many sessions are active. This gives multiple researchers on one GPU box
+independent state without duplicating the model. Sharing is safe because
+inference runs under `@torch.inference_mode()` and a global GPU lock
+serializes predict-capable endpoints, so two sessions never touch the
+network concurrently and nothing mutates it after startup.
 
 ### How a client gets a session
 

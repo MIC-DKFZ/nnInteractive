@@ -2,9 +2,15 @@
 
 The server hosts up to ``max_sessions`` concurrent
 :class:`nnInteractiveInferenceSession` instances, one per connected client. The
-model weights are loaded once at startup and shared by reference across all
-sessions — per-session state (image, target buffer, interactions tensor) is
-isolated.
+model artifacts (``nn.Module`` network with its weights and buffers, plans/
+configuration managers, dataset json, label manager) are loaded once at startup;
+each session's ``self.network`` is a plain Python reference to that single
+module — there is exactly one network and one copy of the weights on the GPU
+regardless of session count. Per-session state (image, target buffer,
+interactions tensor) is isolated. Safety of sharing relies on (a) inference
+running under ``@torch.inference_mode()`` and (b) a global ``gpu_lock``
+serializing predict-capable endpoints, so no two sessions ever touch the
+module concurrently and nothing mutates it after construction.
 
 Each client identifies itself via a lease token issued by ``POST /claim``. The
 token rides along on every subsequent request in the ``X-Lease-Token`` header.
@@ -78,7 +84,9 @@ class SessionEntry:
         self.last_active_at = time.monotonic()
 
     def close(self) -> None:
-        """Free the session's per-instance state. Shared model artifacts are NOT freed.
+        """Free the session's per-instance state. The shared network module and
+        other model artifacts are NOT freed — they live in the registry and are
+        reused by future sessions.
 
         Best-effort: any exception here is logged but not re-raised; cleanup must
         not block reaping or shutdown.
@@ -100,8 +108,10 @@ class SessionFull(Exception):
 class SessionRegistry:
     """Threadsafe lease-keyed dict of :class:`SessionEntry`.
 
-    The model artifacts loaded at server startup are stashed here and reused
-    whenever a new session is created.
+    The model artifacts loaded at server startup are stashed here and handed to
+    every newly created session by reference (the ``nn.Module`` instance, its
+    weights, and the plans/configuration/label-manager objects are not copied
+    or re-instantiated per session).
     """
 
     def __init__(
@@ -266,9 +276,10 @@ def make_app(
 
     app = FastAPI(title="nnInteractive Inference Server", lifespan=lifespan)
 
-    # Capability snapshot is computed once and never changes (model is loaded
-    # once at startup and shared by all sessions). We build it from a fresh
-    # session initialized off the artifacts.
+    # Capability snapshot is computed once and never changes (the network
+    # module is loaded once at startup and the same instance is referenced by
+    # every session). We build it from a fresh session initialized off the
+    # artifacts.
     _capability_session = nnInteractiveInferenceSession(
         device=device,
         use_torch_compile=False,

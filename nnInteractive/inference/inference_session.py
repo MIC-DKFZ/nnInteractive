@@ -1307,9 +1307,16 @@ class nnInteractiveInferenceSession:
 
         Returns an artifact dict that can be applied to this or any other freshly
         constructed session via :meth:`initialize_from_loaded_artifacts`. The
-        returned references (network, plans_manager, configuration_manager, ...)
-        are safe to share by reference across sessions — they are treated as
-        read-only after construction.
+        returned values are the actual objects (the ``nn.Module`` with its
+        weights and buffers, the plans/configuration managers, the dataset
+        json, the label manager) — not copies. Multiple sessions calling
+        :meth:`initialize_from_loaded_artifacts` with the same dict will all
+        end up with ``self.network`` pointing at the same module instance and
+        the same weight tensors on the GPU. This is safe as long as callers
+        treat these objects as read-only after construction; in the multi-
+        session server that is enforced by running inference under
+        ``@torch.inference_mode()`` and serializing predict calls with a
+        global GPU lock.
 
         Note: this also mutates ``self`` (applies capability, sets pad/decay/
         thickness) because ``num_interaction_channels`` is required to build the
@@ -1402,7 +1409,10 @@ class nnInteractiveInferenceSession:
 
         ``artifacts`` is the dict returned by :meth:`_load_model_artifacts_from_disk`.
         Useful for spawning multiple sessions that share one loaded model (e.g.
-        the multi-session inference server).
+        the multi-session inference server). All artifact entries — including
+        ``self.network`` — are stored by reference; passing the same dict to
+        multiple sessions does not duplicate the network or its weights in
+        memory.
         """
         self.preferred_scribble_thickness = artifacts["preferred_scribble_thickness"]
         self.interaction_decay = artifacts["interaction_decay"]

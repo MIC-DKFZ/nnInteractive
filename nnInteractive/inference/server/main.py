@@ -1,8 +1,9 @@
 """CLI entry point: launch a long-running nnInteractive inference server.
 
-The model is loaded once at startup; concurrent clients each get their own
-session that references the shared model. See ``SERVER_CLIENT.md`` for the
-multi-session model.
+The network is built and weights loaded once at startup; each concurrent
+client gets its own session whose ``self.network`` is a reference to that
+single ``nn.Module`` instance (no per-session copy of the network or its
+weights). See ``SERVER_CLIENT.md`` for the multi-session model.
 """
 
 from __future__ import annotations
@@ -44,8 +45,9 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Maximum number of concurrent client sessions. Each session holds its own image, "
-        "target buffer, and interaction state; model weights are shared. Predictions remain "
-        "GPU-serialized across sessions. Default: 1.",
+        "target buffer, and interaction state; the network module (and therefore its weights) "
+        "is shared by reference across all sessions — exactly one copy on the GPU. Predictions "
+        "remain GPU-serialized across sessions. Default: 1.",
     )
     p.add_argument(
         "--idle-timeout-seconds",
