@@ -53,12 +53,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--torch-n-threads", type=int, default=8, help="Number of CPU threads for torch")
     p.add_argument(
-        "--torch-compile",
+        "--no-torch-compile",
         action="store_true",
-        help="Compile the network with torch.compile (default: disabled). The first prediction "
-        "after startup is slow because compilation happens lazily on the first forward pass, but "
-        "every subsequent prediction is faster. Recommended for this server: the process is "
-        "long-lived, so the one-time compile cost is paid once and amortized across all sessions.",
+        help="Disable compiling the network with torch.compile (default: enabled). With compile "
+        "enabled the network is compiled once at startup via a dummy warmup forward pass, which "
+        "makes startup slower but every prediction faster; the one-time cost is amortized across "
+        "the long-lived process. Pass this flag to skip compilation (e.g. for faster startup or "
+        "to work around a compile/backend issue).",
     )
     p.add_argument(
         "--no-autozoom",
@@ -128,6 +129,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     device = torch.device(args.device)
+    use_torch_compile = not args.no_torch_compile
     api_key = _resolve_api_key(args.api_key)
     if api_key is None:
         logger.warning(
@@ -155,7 +157,7 @@ def main(argv=None) -> int:
     # Load the model once into a "loader" session; we keep only the artifacts dict.
     loader = nnInteractiveInferenceSession(
         device=device,
-        use_torch_compile=args.torch_compile,
+        use_torch_compile=use_torch_compile,
         verbose=args.verbose,
         torch_n_threads=args.torch_n_threads,
         do_autozoom=not args.no_autozoom,
@@ -176,7 +178,7 @@ def main(argv=None) -> int:
     loader.executor.shutdown(wait=False)
     del loader
 
-    if args.torch_compile:
+    if use_torch_compile:
         # Compile the network once and run a single dummy forward pass so the
         # lazy torch.compile compilation happens here at startup rather than on
         # the first client's first prediction. We promote the resulting single
@@ -219,7 +221,7 @@ def main(argv=None) -> int:
         liveness_timeout_seconds=args.liveness_timeout_seconds,
         torch_n_threads=args.torch_n_threads,
         do_autozoom=not args.no_autozoom,
-        use_torch_compile=args.torch_compile,
+        use_torch_compile=use_torch_compile,
         verbose=args.verbose,
         api_key=api_key,
     )
