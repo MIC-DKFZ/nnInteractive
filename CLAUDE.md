@@ -44,7 +44,7 @@ Session-based inference engine (~1040 lines) that manages state across multiple 
 - **Memory management**: Selective CPU/GPU transfers, pre-allocated tensors, half-precision interactions, pinned memory (disabled on Linux kernel 6.11)
 
 **Important API constraints**:
-- `use_torch_compile=False` is required (there is an assertion; `torch.compile` is incompatible with pinned memory)
+- `use_torch_compile` is supported (default `False`). When enabled, the first prediction is slow (lazy compilation on the first forward pass) but subsequent ones are faster. Recommended for the persistent inference server (`--torch-compile`), where the one-time compile cost is amortized across the long-lived process
 - `target_buffer` must be 3D (shape `[X, Y, Z]`), not 4D
 - Scribble and lasso images must match `original_image_shape[1:]` (the original uncropped spatial shape)
 - `add_initial_seg_interaction()` **resets all existing interactions** (see WARNING in its docstring)

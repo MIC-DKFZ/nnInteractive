@@ -139,6 +139,7 @@ class SessionRegistry:
         device: torch.device,
         torch_n_threads: int,
         do_autozoom: bool,
+        use_torch_compile: bool,
         verbose: bool,
     ) -> None:
         self._artifacts = artifacts
@@ -148,6 +149,7 @@ class SessionRegistry:
         self._device = device
         self._torch_n_threads = torch_n_threads
         self._do_autozoom = do_autozoom
+        self._use_torch_compile = use_torch_compile
         self._verbose = verbose
         self._entries: dict[str, SessionEntry] = {}
         self._mu = threading.Lock()
@@ -172,7 +174,7 @@ class SessionRegistry:
             token = uuid.uuid4().hex
             session = nnInteractiveInferenceSession(
                 device=self._device,
-                use_torch_compile=False,
+                use_torch_compile=self._use_torch_compile,
                 verbose=self._verbose,
                 torch_n_threads=self._torch_n_threads,
                 do_autozoom=self._do_autozoom,
@@ -276,6 +278,7 @@ def make_app(
     liveness_timeout_seconds: float = 60.0,
     torch_n_threads: int = 8,
     do_autozoom: bool = True,
+    use_torch_compile: bool = False,
     verbose: bool = False,
     api_key: Optional[str] = None,
     sweep_interval_seconds: float = 15.0,
@@ -288,6 +291,7 @@ def make_app(
         device=device,
         torch_n_threads=torch_n_threads,
         do_autozoom=do_autozoom,
+        use_torch_compile=use_torch_compile,
         verbose=verbose,
     )
     gpu_lock = threading.Lock()
@@ -330,6 +334,8 @@ def make_app(
     # module is loaded once at startup and the same instance is referenced by
     # every session). We build it from a fresh session initialized off the
     # artifacts.
+    # This throwaway session only reads static capability metadata and never runs
+    # a forward pass, so there is no point compiling its network reference.
     _capability_session = nnInteractiveInferenceSession(
         device=device,
         use_torch_compile=False,

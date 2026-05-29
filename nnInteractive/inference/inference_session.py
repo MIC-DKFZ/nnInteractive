@@ -50,14 +50,16 @@ class nnInteractiveInferenceSession:
     ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
+
+        ``use_torch_compile``: compile the network with ``torch.compile``. The
+        first prediction after enabling this is slow (compilation happens lazily
+        on the first forward pass), but every subsequent prediction is faster.
+        This is recommended for the persistent inference server, where the
+        process is long-lived so the one-time compile cost is paid only once and
+        amortized across the whole session lifetime.
         """
         print("session initialized")
 
-        # set as part of initialization
-        assert use_torch_compile is False, (
-            "torch.compile is not supported. The blosc2-backed interaction tensor "
-            "requires numpy↔torch round-trips that break compile tracing."
-        )
         self.network = None
         self.label_manager = None
         self.dataset_json = None

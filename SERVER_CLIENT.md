@@ -55,6 +55,7 @@ nninteractive-server \
 | `--port` | TCP port. Default: `1527`. |
 | `--device` | Torch device string, e.g. `cuda`, `cuda:0`, `cpu`. Default: `cuda`. |
 | `--torch-n-threads` | CPU threads for torch. Default: `8`. |
+| `--torch-compile` | Compile the network with `torch.compile` (off by default). The first prediction after startup is slow (compilation is lazy, on the first forward pass), but every subsequent prediction is faster. Recommended here: the server is long-lived, so the one-time compile cost is paid once and amortized across all sessions. |
 | `--no-autozoom` | Disable adaptive zoom-out (rarely needed; on by default). |
 | `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; the network module (and therefore its weights) is shared by reference across all sessions — exactly one copy on the GPU regardless of session count. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
 | `--idle-timeout-seconds` | Inactivity timeout in seconds after which a session is reaped and its slot freed. Refreshed only by real user actions (`set_image`, `add_*_interaction`, …) — *not* by heartbeats — so a connected-but-idle client is still reaped here. Default: `600` (10 min). |
