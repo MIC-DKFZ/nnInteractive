@@ -38,6 +38,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import numbers
+import os
 import threading
 import time
 import uuid
@@ -73,15 +75,13 @@ from nnInteractive.inference.remote.serialization import pack_array, unpack_arra
 
 logger = logging.getLogger("nninteractive.server")
 
-MAX_TARGET_BUFFER_BYTES = 4 * 1024**3
-SUPPORTED_TARGET_BUFFER_DTYPES = {
-    np.dtype("bool"),
-    np.dtype("uint8"),
-    np.dtype("uint16"),
-    np.dtype("int16"),
-    np.dtype("int32"),
-    np.dtype("float32"),
-}
+# Cap a single client's target buffer at 25% of total system RAM. Falls back to 32 GiB
+# of headroom if the system RAM can't be determined.
+try:
+    total_ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+except (ValueError, OSError, AttributeError):
+    total_ram = 32 * 1024**3
+MAX_TARGET_BUFFER_BYTES = int(total_ram * 0.25)
 
 
 class SessionEntry:
@@ -455,12 +455,12 @@ def make_app(
         raw_shape = payload["shape"]
         if not isinstance(raw_shape, list):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must be a list of positive integers")
-        if len(raw_shape) not in (2, 3):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must have 2 or 3 dimensions")
+        if len(raw_shape) != 3:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must be 3D")
 
         shape = []
         for dim in raw_shape:
-            if not isinstance(dim, int) or isinstance(dim, bool):
+            if not isinstance(dim, numbers.Integral) or isinstance(dim, bool):
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape must contain only integers")
             if dim <= 0:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="shape dimensions must be positive")
@@ -468,10 +468,14 @@ def make_app(
 
         try:
             dtype = np.dtype(payload["dtype"])
-        except TypeError as e:
+        except (TypeError, ValueError) as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"invalid dtype: {payload['dtype']!r}") from e
-        if dtype not in SUPPORTED_TARGET_BUFFER_DTYPES:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"unsupported dtype: {dtype}")
+        # 'b' = bool, 'i' = signed int, 'u' = unsigned int.
+        if dtype.kind not in ("b", "i", "u"):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"unsupported dtype {dtype}: target buffer must be bool or an integer type",
+            )
 
         nbytes = int(np.prod(shape, dtype=np.uint64)) * dtype.itemsize
         if nbytes > MAX_TARGET_BUFFER_BYTES:
