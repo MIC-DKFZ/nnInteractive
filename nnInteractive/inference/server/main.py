@@ -29,17 +29,33 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Run an nnInteractive inference server. The model is loaded once at startup.",
     )
     p.add_argument(
-        "--model-dir", required=True, help="Path to the trained model folder (contains fold_*/checkpoint_*.pth)"
+        "--model-dir",
+        required=True,
+        help="Path to the trained model folder (contains fold_*/checkpoint_*.pth)",
     )
     p.add_argument("--fold", default=None, help="Fold to use (int, 'all', or omit to auto-detect)")
-    p.add_argument("--checkpoint", default="checkpoint_final.pth", help="Checkpoint filename inside the fold folder")
     p.add_argument(
-        "--host", default="127.0.0.1", help="Bind host (default 127.0.0.1; use 0.0.0.0 to listen on all interfaces)"
+        "--checkpoint",
+        default="checkpoint_final.pth",
+        help="Checkpoint filename inside the fold folder",
+    )
+    p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host (default 127.0.0.1; use 0.0.0.0 to listen on all interfaces)",
     )
     p.add_argument("--port", type=int, default=1527, help="Bind port (default 1527)")
-    p.add_argument("--device", default="cuda", help="Torch device string (e.g. 'cuda', 'cuda:0', 'cpu')")
+    p.add_argument(
+        "--device",
+        default="cuda",
+        help="Torch device string (e.g. 'cuda', 'cuda:0', 'cpu')",
+    )
     p.add_argument("--torch-n-threads", type=int, default=8, help="Number of CPU threads for torch")
-    p.add_argument("--no-autozoom", action="store_true", help="Disable adaptive zoom-out (default: enabled)")
+    p.add_argument(
+        "--no-autozoom",
+        action="store_true",
+        help="Disable adaptive zoom-out (default: enabled)",
+    )
     p.add_argument(
         "--max-sessions",
         type=int,
@@ -53,8 +69,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--idle-timeout-seconds",
         type=float,
         default=600.0,
-        help="Idle timeout (seconds) after which a session is reaped. Clients can keep a "
-        "session alive across long idle stretches by calling heartbeat(). Default: 600 (10 min).",
+        help="Inactivity timeout (seconds) after which a session is reaped because the user "
+        "stopped interacting. Refreshed only by real user actions (set_image, add_*_interaction, "
+        "etc.) — NOT by heartbeats — so a connected-but-idle client is still reaped here. "
+        "Default: 600 (10 min).",
+    )
+    p.add_argument(
+        "--liveness-timeout-seconds",
+        type=float,
+        default=60.0,
+        help="Liveness timeout (seconds): a session is reaped if the server sees no request at "
+        "all from the client (not even a heartbeat) for this long. Detects crashed/disconnected "
+        "clients and frees their slot quickly. The client heartbeats automatically at half this "
+        "interval. Should be well below --idle-timeout-seconds. Default: 60.",
     )
     p.add_argument(
         "--api-key",
@@ -105,6 +132,16 @@ def main(argv=None) -> int:
         raise SystemExit("--max-sessions must be >= 1")
     if args.idle_timeout_seconds <= 0:
         raise SystemExit("--idle-timeout-seconds must be > 0")
+    if args.liveness_timeout_seconds <= 0:
+        raise SystemExit("--liveness-timeout-seconds must be > 0")
+    if args.liveness_timeout_seconds >= args.idle_timeout_seconds:
+        logger.warning(
+            "--liveness-timeout-seconds (%.0fs) is not below --idle-timeout-seconds (%.0fs); "
+            "the liveness check will then dominate and connected-but-idle clients will be reaped "
+            "at the liveness timeout instead of the idle timeout.",
+            args.liveness_timeout_seconds,
+            args.idle_timeout_seconds,
+        )
 
     # Load the model once into a "loader" session; we keep only the artifacts dict.
     loader = nnInteractiveInferenceSession(
@@ -114,7 +151,12 @@ def main(argv=None) -> int:
         torch_n_threads=args.torch_n_threads,
         do_autozoom=not args.no_autozoom,
     )
-    logger.info("Loading checkpoint from %s (fold=%s, checkpoint=%s)", args.model_dir, args.fold, args.checkpoint)
+    logger.info(
+        "Loading checkpoint from %s (fold=%s, checkpoint=%s)",
+        args.model_dir,
+        args.fold,
+        args.checkpoint,
+    )
     artifacts = loader._load_model_artifacts_from_disk(
         model_training_output_dir=args.model_dir,
         use_fold=_resolve_fold(args.fold),
@@ -126,11 +168,12 @@ def main(argv=None) -> int:
     del loader
 
     logger.info(
-        "Checkpoint loaded; serving on http://%s:%s (max_sessions=%d, idle_timeout=%.0fs)",
+        "Checkpoint loaded; serving on http://%s:%s (max_sessions=%d, idle_timeout=%.0fs, " "liveness_timeout=%.0fs)",
         args.host,
         args.port,
         args.max_sessions,
         args.idle_timeout_seconds,
+        args.liveness_timeout_seconds,
     )
 
     app = make_app(
@@ -138,6 +181,7 @@ def main(argv=None) -> int:
         device=device,
         max_sessions=args.max_sessions,
         idle_timeout_seconds=args.idle_timeout_seconds,
+        liveness_timeout_seconds=args.liveness_timeout_seconds,
         torch_n_threads=args.torch_n_threads,
         do_autozoom=not args.no_autozoom,
         verbose=args.verbose,

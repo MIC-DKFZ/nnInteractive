@@ -57,7 +57,8 @@ nninteractive-server \
 | `--torch-n-threads` | CPU threads for torch. Default: `8`. |
 | `--no-autozoom` | Disable adaptive zoom-out (rarely needed; on by default). |
 | `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; the network module (and therefore its weights) is shared by reference across all sessions — exactly one copy on the GPU regardless of session count. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
-| `--idle-timeout-seconds` | Idle timeout in seconds after which a session is reaped and its slot freed. Clients can extend their session by calling `heartbeat()`. Default: `600` (10 min). |
+| `--idle-timeout-seconds` | Inactivity timeout in seconds after which a session is reaped and its slot freed. Refreshed only by real user actions (`set_image`, `add_*_interaction`, …) — *not* by heartbeats — so a connected-but-idle client is still reaped here. Default: `600` (10 min). |
+| `--liveness-timeout-seconds` | Liveness timeout in seconds: a session is reaped if the server sees *no request at all* (not even a heartbeat) from the client for this long. This is how a crashed or disconnected client's slot is reclaimed quickly. The client heartbeats automatically at half this interval. Keep it well below `--idle-timeout-seconds`. Default: `60`. |
 | `--api-key` | Bearer token required on every request. See *Authentication* below. |
 | `--verbose` | Verbose session-side logging. |
 | `--log-level` | uvicorn log level (`info`, `warning`, `error`, …). Default: `info`. |
@@ -220,11 +221,27 @@ sessions.
 If predictions feel slow under concurrent load, the answer is more GPUs (run one
 `nninteractive-server` per GPU on different ports), not raising `--max-sessions`.
 
-### Idle expiry
+### Session expiry: two independent timeouts
 
-A session is reaped if it sees no requests for `--idle-timeout-seconds` (default
-600 s = 10 minutes). After that, any request from the client raises
-`SessionExpiredError`. The session may also be reaped by a server restart.
+The server reaps a session for either of two distinct reasons, each with its own
+timeout:
+
+- **Liveness** (`--liveness-timeout-seconds`, default 60 s) — the client process
+  stopped responding entirely (crash, kill, network drop). The client library
+  *automatically* heartbeats in the background (a daemon thread, every half the
+  liveness timeout), so a healthy client never trips this. When a client dies,
+  its heartbeats stop and the server frees the slot within ~one liveness timeout
+  — instead of holding it for the full idle timeout. **You don't have to do
+  anything to get this; it's on by default.**
+- **Idle / inactivity** (`--idle-timeout-seconds`, default 600 s = 10 min) — the
+  client is alive and heartbeating, but the *user* hasn't done anything. This
+  timer is refreshed only by real interactions (`set_image`,
+  `set_target_buffer`, `add_*_interaction`, `reset_interactions`, …), **not** by
+  heartbeats. So a window left open with no clicks is still reclaimed at the idle
+  timeout.
+
+After a reap (for either reason), the next request from the client raises
+`SessionExpiredError`. A session may also be reaped by a server restart.
 
 ```python
 from nnInteractive.inference.remote import SessionExpiredError
@@ -242,18 +259,14 @@ except SessionExpiredError:
     # GUI should surface: "Your session timed out. Please redo your prompts."
 ```
 
-For a GUI where users may stare at the screen for long stretches without
-clicking, drive `session.heartbeat()` on a timer (e.g. every 60 s) to keep the
-session alive without doing real work:
+Note: `session.heartbeat()` proves liveness only — it does **not** postpone the
+idle timeout. If you want users to keep a session across long idle stretches,
+raise `--idle-timeout-seconds` on the server; there is no client-side way to
+suppress the inactivity reap.
 
-```python
-# Cheap call; returns remaining seconds until expiry.
-remaining = session.heartbeat()
-```
-
-`session.lease_status()` is a read-only variant: it returns the remaining
-seconds without extending the lease — useful for a "your session expires in N
-seconds" UI badge.
+`session.lease_status()` is a read-only probe: it returns the remaining seconds
+until the *idle* timeout without touching either clock — useful for a "your
+session expires in N seconds" UI badge.
 
 ### Capacity (`--max-sessions`)
 
@@ -293,9 +306,11 @@ A few contract points worth respecting when wiring this into a GUI:
 - **Call `session.close()` on app quit** (or use the `with` statement). The
   destructor also releases the lease, but explicit close is preferred so the
   server frees the slot immediately for other users.
-- **Drive `heartbeat()` from a timer if the GUI may sit idle for minutes.**
-  Otherwise the server will reap the session at the idle timeout. Skip the
-  heartbeat if your UX assumes the user is actively interacting.
+- **You don't need to drive `heartbeat()` yourself.** The session auto-heartbeats
+  from a background thread to keep the server from reaping it as a dead client.
+  This does *not* extend the idle timeout, though — a window left idle past
+  `--idle-timeout-seconds` is still reaped. Raise that flag on the server if your
+  UX expects users to sit idle for long stretches.
 - **Surface `ServerAtCapacityError` as "server is full, try again later".** It's
   a transient operator-level condition; the user can't fix it from the GUI.
 
@@ -457,14 +472,17 @@ GUI.
   run_prediction=True)` call blocks until the server finishes. Run the
   remote session from a worker thread in the GUI, exactly as you would for
   a slow local prediction.
-- **`SessionExpiredError`** — the server reaped your session because it
-  was idle longer than `--idle-timeout-seconds`, or the server was
-  restarted. A timed-out session cannot be restored; the image, target
-  buffer, and prompts have been freed on the server. Construct a new
+- **`SessionExpiredError`** — the server reaped your session, either because
+  the user was inactive longer than `--idle-timeout-seconds`, because the
+  client stopped heartbeating for longer than `--liveness-timeout-seconds`
+  (usually a crash or network drop — note the background heartbeat keeps a
+  healthy client well clear of this), or because the server was restarted. A
+  timed-out session cannot be restored; the image, target buffer, and prompts
+  have been freed on the server. Construct a new
   `nnInteractiveRemoteInferenceSession`, call `set_image` + `set_target_buffer`,
-  and prompt the user to redo their interactions. To avoid this for
-  long-idle GUIs, call `session.heartbeat()` on a timer or raise
-  `--idle-timeout-seconds` on the server.
+  and prompt the user to redo their interactions. To allow longer idle
+  stretches, raise `--idle-timeout-seconds` on the server (heartbeats no longer
+  postpone the idle timeout).
 - **`ServerAtCapacityError` on construction** — every session slot is in
   use (`--max-sessions` reached). Wait and retry, ask the operator to
   bump `--max-sessions`, or scale out with more `nninteractive-server`

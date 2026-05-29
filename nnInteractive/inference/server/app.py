@@ -14,9 +14,12 @@ module concurrently and nothing mutates it after construction.
 
 Each client identifies itself via a lease token issued by ``POST /claim``. The
 token rides along on every subsequent request in the ``X-Lease-Token`` header.
-Sessions idle for longer than ``idle_timeout_seconds`` are reaped automatically;
-subsequent requests bearing a reaped lease receive HTTP 410 Gone so the client
-can surface a "session expired" message.
+Sessions are reaped automatically for either of two reasons: the user went idle
+(no real interaction for longer than ``idle_timeout_seconds``) or the client
+went dead (no request of any kind — not even a heartbeat — for longer than the
+much shorter ``liveness_timeout_seconds``, which reclaims slots held by crashed
+clients quickly). Subsequent requests bearing a reaped lease receive HTTP 410
+Gone so the client can surface a "session expired" message.
 
 Concurrency model:
   - Each session has its own ``threading.Lock`` that serializes the per-session
@@ -78,10 +81,23 @@ class SessionEntry:
         self.session = session
         self.lock = threading.Lock()
         self.created_at = time.monotonic()
+        # Two independent clocks. ``last_active_at`` tracks real user actions
+        # (drives the idle timeout); ``last_seen_at`` tracks any sign of life
+        # including heartbeats (drives the much shorter liveness timeout used to
+        # reclaim slots held by crashed/disconnected clients).
         self.last_active_at = self.created_at
+        self.last_seen_at = self.created_at
 
-    def touch(self) -> None:
-        self.last_active_at = time.monotonic()
+    def mark_seen(self) -> None:
+        """Record that the client is still alive (liveness only)."""
+        self.last_seen_at = time.monotonic()
+
+    def mark_active(self) -> None:
+        """Record real user activity. Activity implies liveness, so this bumps
+        both clocks."""
+        now = time.monotonic()
+        self.last_active_at = now
+        self.last_seen_at = now
 
     def close(self) -> None:
         """Free the session's per-instance state. The shared network module and
@@ -119,6 +135,7 @@ class SessionRegistry:
         artifacts: dict,
         max_sessions: int,
         idle_timeout_seconds: float,
+        liveness_timeout_seconds: float,
         device: torch.device,
         torch_n_threads: int,
         do_autozoom: bool,
@@ -127,6 +144,7 @@ class SessionRegistry:
         self._artifacts = artifacts
         self._max_sessions = int(max_sessions)
         self._idle_timeout_seconds = float(idle_timeout_seconds)
+        self._liveness_timeout_seconds = float(liveness_timeout_seconds)
         self._device = device
         self._torch_n_threads = torch_n_threads
         self._do_autozoom = do_autozoom
@@ -141,6 +159,10 @@ class SessionRegistry:
     @property
     def idle_timeout_seconds(self) -> float:
         return self._idle_timeout_seconds
+
+    @property
+    def liveness_timeout_seconds(self) -> float:
+        return self._liveness_timeout_seconds
 
     def claim(self) -> str:
         """Create a new session and return its lease token. Raises SessionFull if at cap."""
@@ -158,18 +180,28 @@ class SessionRegistry:
             session.initialize_from_loaded_artifacts(self._artifacts)
             entry = SessionEntry(session)
             self._entries[token] = entry
-            logger.info("claimed session %s (%d/%d active)", token, len(self._entries), self._max_sessions)
+            logger.info(
+                "claimed session %s (%d/%d active)",
+                token,
+                len(self._entries),
+                self._max_sessions,
+            )
             return token
 
     def get(self, token: Optional[str]) -> SessionEntry:
-        """Look up a session by lease token, touching last_active_at on success."""
+        """Look up a session by lease token, marking it seen (liveness) on success.
+
+        Note this only refreshes the liveness clock, not activity: a bare
+        ``/heartbeat`` keeps the session from being reaped as dead but does not
+        postpone the idle timeout. Endpoints that represent real user actions
+        call ``entry.mark_active()`` explicitly (see the lock helpers)."""
         if not token:
             raise HTTPException(status.HTTP_410_GONE, detail="lease token missing")
         with self._mu:
             entry = self._entries.get(token)
             if entry is None:
                 raise HTTPException(status.HTTP_410_GONE, detail="lease expired or unknown")
-        entry.touch()
+        entry.mark_seen()
         return entry
 
     def peek(self, token: Optional[str]) -> SessionEntry:
@@ -191,21 +223,37 @@ class SessionRegistry:
         if entry is None:
             return False
         entry.close()
-        logger.info("released session %s (%d/%d active)", token, len(self._entries), self._max_sessions)
+        logger.info(
+            "released session %s (%d/%d active)",
+            token,
+            len(self._entries),
+            self._max_sessions,
+        )
         return True
 
     def sweep(self) -> int:
-        """Drop sessions idle for more than idle_timeout_seconds. Returns the number reaped."""
+        """Drop sessions that have either gone idle or stopped showing signs of life.
+
+        A session is reaped if it has seen no real user activity for longer than
+        ``idle_timeout_seconds`` (the user walked away) OR if it has not been
+        seen at all for longer than ``liveness_timeout_seconds`` (the client
+        process crashed/disconnected and stopped heartbeating). Returns the
+        number reaped."""
         now = time.monotonic()
-        reaped: list[tuple[str, SessionEntry]] = []
+        reaped: list[tuple[str, SessionEntry, str]] = []
         with self._mu:
             for token, entry in list(self._entries.items()):
-                if (now - entry.last_active_at) > self._idle_timeout_seconds:
-                    self._entries.pop(token, None)
-                    reaped.append((token, entry))
-        for token, entry in reaped:
+                if (now - entry.last_seen_at) > self._liveness_timeout_seconds:
+                    reason = "dead"
+                elif (now - entry.last_active_at) > self._idle_timeout_seconds:
+                    reason = "idle"
+                else:
+                    continue
+                self._entries.pop(token, None)
+                reaped.append((token, entry, reason))
+        for token, entry, reason in reaped:
             entry.close()
-            logger.info("reaped idle session %s", token)
+            logger.info("reaped %s session %s", reason, token)
         return len(reaped)
 
     def close_all(self) -> None:
@@ -225,16 +273,18 @@ def make_app(
     device: torch.device,
     max_sessions: int = 1,
     idle_timeout_seconds: float = 600.0,
+    liveness_timeout_seconds: float = 60.0,
     torch_n_threads: int = 8,
     do_autozoom: bool = True,
     verbose: bool = False,
     api_key: Optional[str] = None,
-    sweep_interval_seconds: float = 30.0,
+    sweep_interval_seconds: float = 15.0,
 ) -> FastAPI:
     registry = SessionRegistry(
         artifacts=artifacts,
         max_sessions=max_sessions,
         idle_timeout_seconds=idle_timeout_seconds,
+        liveness_timeout_seconds=liveness_timeout_seconds,
         device=device,
         torch_n_threads=torch_n_threads,
         do_autozoom=do_autozoom,
@@ -381,7 +431,11 @@ def make_app(
         )
 
     def _under_session_lock(entry: SessionEntry, fn):
-        """Run ``fn(session)`` under the session's lock, converting known errors to HTTP 400."""
+        """Run ``fn(session)`` under the session's lock, converting known errors to HTTP 400.
+
+        Every endpoint routed through here represents a real user action, so we
+        also refresh the activity clock (postponing the idle timeout)."""
+        entry.mark_active()
         with entry.lock:
             try:
                 return fn(entry.session)
@@ -390,7 +444,10 @@ def make_app(
 
     def _under_session_and_gpu_lock(entry: SessionEntry, fn):
         """Run ``fn(session)`` under session lock + global GPU lock. Acquisition order
-        is always session-then-gpu to avoid deadlocks."""
+        is always session-then-gpu to avoid deadlocks.
+
+        Like ``_under_session_lock``, this marks real user activity."""
+        entry.mark_active()
         with entry.lock:
             with gpu_lock:
                 try:
@@ -421,6 +478,7 @@ def make_app(
         body = {
             "lease_token": token,
             "idle_timeout_seconds": registry.idle_timeout_seconds,
+            "liveness_timeout_seconds": registry.liveness_timeout_seconds,
             "max_sessions": registry.max_sessions,
         }
         return Response(
@@ -591,7 +649,7 @@ def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
         "supports_initial_label": bool(session.supports_initial_label),
         "supports_zero_shot_label_refinement": bool(session.supports_zero_shot_label_refinement),
         "preferred_scribble_thickness": session.preferred_scribble_thickness,
-        "interaction_decay": float(session.interaction_decay) if session.interaction_decay is not None else None,
+        "interaction_decay": (float(session.interaction_decay) if session.interaction_decay is not None else None),
         "patch_size": list(cfg.patch_size) if cfg is not None else None,
         "do_autozoom": bool(session.do_autozoom),
         "inference_session_version": session.INFERENCE_SESSION_VERSION,

@@ -1,6 +1,6 @@
 [project]
 name = "nnInteractive"
-version = "2.1.0"
+version = "2.2.0"
 requires-python = ">=3.10"
 description = "Inference code for nnInteractive"
 readme = "readme.md"
@@ -37,6 +37,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "httpx>=0.27",
+    "blosc2",  # array (de)serialization on the client/server wire
 ]
 
 [project.urls]
@@ -47,6 +48,14 @@ dev = [
     "black",
     "ruff",
     "pre-commit"
+]
+# Everything the remote client needs is already in the base dependencies
+# (httpx, blosc2, numpy via nnunetv2). This extra exists so that
+# ``pip install nnInteractive[client]`` is a valid, self-documenting way to ask
+# for the client role; it pins the wire dependencies explicitly.
+client = [
+    "httpx>=0.27",
+    "blosc2",
 ]
 
 [project.scripts]

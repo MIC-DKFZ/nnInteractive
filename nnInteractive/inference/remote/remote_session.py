@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -165,7 +166,15 @@ class nnInteractiveRemoteInferenceSession:
         claim_info = claim_resp.json()
         self._lease_token = claim_info["lease_token"]
         self.idle_timeout_seconds: float = float(claim_info.get("idle_timeout_seconds", 0.0))
+        self.liveness_timeout_seconds: float = float(claim_info.get("liveness_timeout_seconds", 0.0))
         self._http.headers[LEASE_HEADER] = self._lease_token
+
+        # Background liveness heartbeat bookkeeping. Defined before any code that
+        # might raise so close()/__del__ can always reference them safely. The
+        # thread itself is started at the end of __init__, once construction has
+        # fully succeeded.
+        self._stop_heartbeat = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
         caps = self._get_json(PATH_CAPABILITIES)
 
@@ -186,6 +195,17 @@ class nnInteractiveRemoteInferenceSession:
         self.original_image_shape: Optional[Tuple[int, ...]] = None
         self.target_buffer: Union[np.ndarray, torch.Tensor, None] = None
         self.do_autozoom: bool = bool(caps.get("do_autozoom", True))
+
+        # Construction succeeded — start auto-heartbeating to keep the server
+        # from reaping us as a dead client. Beat at half the liveness timeout so
+        # one dropped request still leaves margin. Daemon thread: it never blocks
+        # interpreter exit, and close() joins it cleanly.
+        if self.liveness_timeout_seconds > 0:
+            self._heartbeat_interval = max(5.0, self.liveness_timeout_seconds / 2.0)
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, name="nnInteractive-heartbeat", daemon=True
+            )
+            self._heartbeat_thread.start()
 
     # ------------------------------------------------------------------ #
     #                       HTTP helpers (private)                       #
@@ -272,7 +292,10 @@ class nnInteractiveRemoteInferenceSession:
         self.target_buffer = target_buffer
         self._post_json(
             PATH_SET_TARGET_BUFFER,
-            {"shape": list(target_buffer.shape), "dtype": _buffer_dtype_str(target_buffer)},
+            {
+                "shape": list(target_buffer.shape),
+                "dtype": _buffer_dtype_str(target_buffer),
+            },
         )
 
     def set_do_autozoom(self, do_autozoom: bool) -> None:
@@ -420,16 +443,43 @@ class nnInteractiveRemoteInferenceSession:
             return False
 
     def heartbeat(self) -> float:
-        """Extend this session's idle timeout. Returns remaining seconds.
+        """Tell the server this client is still alive. Returns remaining seconds
+        until the *idle* timeout.
 
-        For GUIs that keep the app open across long idle stretches: drive
-        this from a timer (e.g. every 60 s) to avoid SessionExpiredError
-        after the configured idle timeout.
+        This proves liveness only: it stops the server from reaping the session
+        as a crashed/dead client, but it does NOT postpone the idle timeout —
+        that is refreshed solely by real user actions (``set_image``,
+        ``add_*_interaction``, …). A session left untouched will therefore still
+        be reaped at the idle timeout even while heartbeats keep arriving.
+
+        You normally never call this yourself: the session auto-heartbeats from
+        a background thread for the lifetime of the object.
         """
         resp = self._http.post(PATH_HEARTBEAT)
         _raise_for_lease_errors(resp)
         resp.raise_for_status()
         return float(resp.json().get("remaining_seconds", 0.0))
+
+    def _heartbeat_loop(self) -> None:
+        """Background daemon: prove liveness every ``_heartbeat_interval`` seconds.
+
+        Stops when the session is closed or once the lease is gone. Transient
+        network errors are swallowed so a brief blip doesn't kill the heartbeat;
+        the server's liveness timeout tolerates a few missed beats. Lease expiry
+        (idle reap or server restart) is surfaced to the user on their next real
+        call, not from this thread.
+        """
+        while not self._stop_heartbeat.wait(self._heartbeat_interval):
+            try:
+                self.heartbeat()
+            except SessionExpiredError:
+                break
+            except httpx.HTTPError:
+                continue
+            except Exception:
+                # Never let the daemon thread die noisily (e.g. client closing
+                # concurrently). Bail out quietly.
+                break
 
     def lease_status(self) -> dict:
         """Read-only probe: how much time is left before this session is reaped?
@@ -444,6 +494,14 @@ class nnInteractiveRemoteInferenceSession:
         return resp.json()
 
     def close(self) -> None:
+        # Stop the heartbeat thread first so it can't use self._http after we
+        # close it. join() with a short timeout: the thread spends almost all
+        # its time in Event.wait(), which the set() interrupts immediately.
+        self._stop_heartbeat.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=5.0)
+            self._heartbeat_thread = None
+
         # Best-effort release so the server can free our slot for other users
         # without waiting for the idle reaper. Swallow errors: the server may
         # already be gone, our lease may already be expired, etc. close()
