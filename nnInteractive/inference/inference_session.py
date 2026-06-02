@@ -535,7 +535,13 @@ class nnInteractiveInferenceSession:
             dtype=np.float16,
             chunks=(1, *[min(64, s) for s in shape[1:]]),
             blocks=(1, *[min(32, s) for s in shape[1:]]),
-            cparams={"codec": blosc2.Codec.LZ4, "clevel": 5, "nthreads": min(self.torch_n_threads, os.cpu_count())},
+            # Interactions compress better with NOFILTER, which is also faster than SHUFFLE.
+            cparams={
+                "codec": blosc2.Codec.LZ4,
+                "clevel": 5,
+                "filters": [blosc2.Filter.NOFILTER],
+                "nthreads": min(self.torch_n_threads, os.cpu_count()),
+            },
             dparams={"nthreads": 4},
         )
         self._interactions_shape = shape
@@ -604,7 +610,13 @@ class nnInteractiveInferenceSession:
                 dtype=np.float16,
                 chunks=(1, *[min(64, s) for s in self._interactions_shape[1:]]),
                 blocks=(1, *[min(32, s) for s in self._interactions_shape[1:]]),
-                cparams={"codec": blosc2.Codec.LZ4, "clevel": 5, "nthreads": os.cpu_count()},
+                # Interactions compress better with NOFILTER, which is also faster than SHUFFLE.
+                cparams={
+                    "codec": blosc2.Codec.LZ4,
+                    "clevel": 5,
+                    "filters": [blosc2.Filter.NOFILTER],
+                    "nthreads": os.cpu_count(),
+                },
                 dparams={"nthreads": 4},
             )
         self.current_interaction_intensity = 1.0

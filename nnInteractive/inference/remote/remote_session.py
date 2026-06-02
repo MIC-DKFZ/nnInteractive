@@ -14,6 +14,7 @@ import threading
 import warnings
 from typing import List, Optional, Tuple, Union
 
+import blosc2
 import httpx
 import numpy as np
 import torch
@@ -395,7 +396,8 @@ class nnInteractiveRemoteInferenceSession:
             "override_capability_checks": bool(override_capability_checks),
             "interaction_bbox": ([list(b) for b in interaction_bbox] if interaction_bbox is not None else None),
         }
-        resp = self._post_binary(path, meta, pack_array(mask_image))
+        # Interactions (scribble/lasso masks) compress best with NOFILTER; skip auto-selection.
+        resp = self._post_binary(path, meta, pack_array(mask_image, filters=[blosc2.Filter.NOFILTER]))
         self._apply_prediction_response(resp)
 
     def add_initial_seg_interaction(
@@ -420,7 +422,8 @@ class nnInteractiveRemoteInferenceSession:
             "run_prediction": bool(run_prediction),
             "override_capability_checks": bool(override_capability_checks),
         }
-        resp = self._post_binary(PATH_ADD_INITIAL_SEG, meta, pack_array(initial_seg))
+        # Segmentations compress best with NOFILTER; skip auto-selection.
+        resp = self._post_binary(PATH_ADD_INITIAL_SEG, meta, pack_array(initial_seg, filters=[blosc2.Filter.NOFILTER]))
         self._apply_prediction_response(resp)
 
     # ------------------------------------------------------------------ #

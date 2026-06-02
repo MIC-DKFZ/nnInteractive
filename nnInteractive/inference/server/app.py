@@ -46,6 +46,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import blosc2
 import numpy as np
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response, status
@@ -441,7 +442,8 @@ def make_app(
         # Reset so a subsequent call without a prediction can't accidentally re-send a stale region.
         session._last_paste_bbox = None
         return Response(
-            content=pack_array(sub),
+            # Segmentations compress best with NOFILTER; skip auto-selection.
+            content=pack_array(sub, filters=[blosc2.Filter.NOFILTER]),
             media_type=CONTENT_TYPE_OCTET_STREAM,
             headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
         )
@@ -481,10 +483,7 @@ def make_app(
         if nbytes > MAX_TARGET_BUFFER_BYTES:
             raise HTTPException(
                 status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=(
-                    f"target buffer would require {nbytes} bytes, "
-                    f"limit is {MAX_TARGET_BUFFER_BYTES} bytes"
-                ),
+                detail=(f"target buffer would require {nbytes} bytes, " f"limit is {MAX_TARGET_BUFFER_BYTES} bytes"),
             )
 
         return tuple(shape), dtype

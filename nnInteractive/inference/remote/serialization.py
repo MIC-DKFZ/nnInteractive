@@ -47,8 +47,64 @@ _CODEC_ID = {
 _ID_CODEC = {v: k for k, v in _CODEC_ID.items()}
 
 
-def pack_array(arr: np.ndarray, codec: blosc2.Codec = blosc2.Codec.ZSTD, clevel: int = 3) -> bytes:
-    """Serialize a numpy array to a self-describing compressed byte string."""
+# Fraction of each axis used for the center crop that the filter heuristic compresses.
+_SELECT_FILTER_CROP_FRACTION = 0.25
+
+
+def _compress_all(raw: memoryview, total: int, codec: blosc2.Codec, clevel: int, filters: list) -> int:
+    """Compressed byte length of ``raw`` under ``filters``, chunked exactly as pack_array does."""
+    size = 0
+    nchunks = (total + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+    for i in range(nchunks):
+        start = i * _CHUNK_SIZE
+        end = min(start + _CHUNK_SIZE, total)
+        size += len(blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters))
+    return size
+
+
+def _select_filter(arr: np.ndarray, codec: blosc2.Codec, clevel: int) -> "blosc2.Filter":
+    """Pick NOFILTER vs SHUFFLE for ``arr`` by trial-compressing a small centered crop.
+
+    Uses ``compress2`` on the raw bytes — exactly the path pack_array takes — so the decision
+    is consistent with how the whole array is actually compressed. The crop is
+    ``_SELECT_FILTER_CROP_FRACTION`` of each axis (centered), keeping the trial cheap and
+    representative (lands on foreground). Ties go to NOFILTER; any failure falls back to it.
+    """
+    try:
+        crop_shape = [max(1, int(s * _SELECT_FILTER_CROP_FRACTION)) for s in arr.shape]
+        slices = tuple(slice((s - cs) // 2, (s - cs) // 2 + cs) for s, cs in zip(arr.shape, crop_shape))
+        crop = np.ascontiguousarray(arr[slices])
+        raw = memoryview(crop).cast("B")
+        total = raw.nbytes
+
+        best_filter, best_bytes = blosc2.Filter.NOFILTER, None
+        for f in (blosc2.Filter.NOFILTER, blosc2.Filter.SHUFFLE):
+            cb = _compress_all(raw, total, codec, clevel, [f])
+            if best_bytes is None or cb < best_bytes:
+                best_bytes, best_filter = cb, f
+        return best_filter
+    except Exception as e:
+        from warnings import warn
+
+        warn(f"_select_filter failed ({e!r}); falling back to NOFILTER.")
+        return blosc2.Filter.NOFILTER
+
+
+def pack_array(
+    arr: np.ndarray,
+    codec: blosc2.Codec = blosc2.Codec.ZSTD,
+    clevel: int = 3,
+    filters: Optional[list] = None,
+) -> bytes:
+    """Serialize a numpy array to a self-describing compressed byte string.
+
+    ``filters`` is the blosc2 filter pipeline to apply. If ``None`` (the default), the
+    better of NOFILTER/SHUFFLE is auto-selected by trial-compressing a cheap, representative
+    slab — appropriate for images, whose optimum depends on the data. Callers that already
+    know the optimum (interactions and segmentations compress best with NOFILTER) should pass
+    ``[blosc2.Filter.NOFILTER]`` to skip the selection. The chosen filter is self-describing
+    inside the blosc2 frame, so unpack_array (decompress2) needs no changes.
+    """
     arr = np.ascontiguousarray(arr)
     dtype_str = arr.dtype.str.lstrip("<>|=").encode("ascii")
     if arr.dtype.byteorder not in ("=", "|", "<"):
@@ -77,11 +133,17 @@ def pack_array(arr: np.ndarray, codec: blosc2.Codec = blosc2.Codec.ZSTD, clevel:
     raw = memoryview(arr).cast("B")
     total = raw.nbytes
     nchunks = (total + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+
+    if filters is None:
+        # Auto-select the better filter from a small centered crop, using the same
+        # compress2 path as below for consistency.
+        filters = [_select_filter(arr, codec, clevel)]
+
     parts = [header, shape_bytes, struct.pack("<I", nchunks)]
     for i in range(nchunks):
         start = i * _CHUNK_SIZE
         end = min(start + _CHUNK_SIZE, total)
-        chunk = blosc2.compress2(raw[start:end], codec=codec, clevel=clevel)
+        chunk = blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters)
         parts.append(struct.pack("<QQ", end - start, len(chunk)))
         parts.append(chunk)
     return b"".join(parts)
