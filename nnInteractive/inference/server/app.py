@@ -443,7 +443,9 @@ def make_app(
         session._last_paste_bbox = None
         return Response(
             # Segmentations compress best with NOFILTER; skip auto-selection.
-            content=pack_array(sub, filters=[blosc2.Filter.NOFILTER]),
+            content=pack_array(
+                sub, filters=[blosc2.Filter.NOFILTER], nthreads=min(session.torch_n_threads, os.cpu_count())
+            ),
             media_type=CONTENT_TYPE_OCTET_STREAM,
             headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
         )

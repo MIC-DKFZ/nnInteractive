@@ -42,6 +42,16 @@ from nnInteractive.inference.remote._protocol import (
 from nnInteractive.inference.remote.serialization import pack_array, unpack_array
 
 
+def _compression_threads() -> int:
+    """blosc2 thread count for client-side upload compression.
+
+    Full logical CPU count: blosc2 scales measurably onto SMT siblings, so use them all to
+    minimize upload latency. Per-call only (passed to pack_array → compress2), so it never
+    mutates blosc2's global nthreads.
+    """
+    return max(1, os.cpu_count() or 1)
+
+
 class SessionExpiredError(RuntimeError):
     """Raised when the server reports the client's lease no longer exists.
 
@@ -290,7 +300,7 @@ class nnInteractiveRemoteInferenceSession:
     def set_image(self, image: np.ndarray, image_properties: Optional[dict] = None) -> None:
         assert image.ndim == 4, f"expected a 4d image as input, got {image.ndim}d. Shape {image.shape}"
         meta = {"image_properties": image_properties or {}}
-        resp = self._post_binary(PATH_SET_IMAGE, meta, pack_array(image))
+        resp = self._post_binary(PATH_SET_IMAGE, meta, pack_array(image, nthreads=_compression_threads()))
         info = resp.json()
         self.original_image_shape = tuple(info["original_image_shape"])
 
@@ -402,7 +412,9 @@ class nnInteractiveRemoteInferenceSession:
             "interaction_bbox": ([list(b) for b in interaction_bbox] if interaction_bbox is not None else None),
         }
         # Interactions (scribble/lasso masks) compress best with NOFILTER; skip auto-selection.
-        resp = self._post_binary(path, meta, pack_array(mask_image, filters=[blosc2.Filter.NOFILTER]))
+        resp = self._post_binary(
+            path, meta, pack_array(mask_image, filters=[blosc2.Filter.NOFILTER], nthreads=_compression_threads())
+        )
         self._apply_prediction_response(resp)
 
     def add_initial_seg_interaction(
@@ -428,7 +440,11 @@ class nnInteractiveRemoteInferenceSession:
             "override_capability_checks": bool(override_capability_checks),
         }
         # Segmentations compress best with NOFILTER; skip auto-selection.
-        resp = self._post_binary(PATH_ADD_INITIAL_SEG, meta, pack_array(initial_seg, filters=[blosc2.Filter.NOFILTER]))
+        resp = self._post_binary(
+            PATH_ADD_INITIAL_SEG,
+            meta,
+            pack_array(initial_seg, filters=[blosc2.Filter.NOFILTER], nthreads=_compression_threads()),
+        )
         self._apply_prediction_response(resp)
 
     # ------------------------------------------------------------------ #

@@ -51,18 +51,21 @@ _ID_CODEC = {v: k for k, v in _CODEC_ID.items()}
 _SELECT_FILTER_CROP_FRACTION = 0.25
 
 
-def _compress_all(raw: memoryview, total: int, codec: blosc2.Codec, clevel: int, filters: list) -> int:
+def _compress_all(
+    raw: memoryview, total: int, codec: blosc2.Codec, clevel: int, filters: list, nthreads: Optional[int]
+) -> int:
     """Compressed byte length of ``raw`` under ``filters``, chunked exactly as pack_array does."""
+    extra = {} if nthreads is None else {"nthreads": nthreads}
     size = 0
     nchunks = (total + _CHUNK_SIZE - 1) // _CHUNK_SIZE
     for i in range(nchunks):
         start = i * _CHUNK_SIZE
         end = min(start + _CHUNK_SIZE, total)
-        size += len(blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters))
+        size += len(blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters, **extra))
     return size
 
 
-def _select_filter(arr: np.ndarray, codec: blosc2.Codec, clevel: int) -> "blosc2.Filter":
+def _select_filter(arr: np.ndarray, codec: blosc2.Codec, clevel: int, nthreads: Optional[int]) -> "blosc2.Filter":
     """Pick NOFILTER vs SHUFFLE for ``arr`` by trial-compressing a small centered crop.
 
     Uses ``compress2`` on the raw bytes — exactly the path pack_array takes — so the decision
@@ -79,7 +82,7 @@ def _select_filter(arr: np.ndarray, codec: blosc2.Codec, clevel: int) -> "blosc2
 
         best_filter, best_bytes = blosc2.Filter.NOFILTER, None
         for f in (blosc2.Filter.NOFILTER, blosc2.Filter.SHUFFLE):
-            cb = _compress_all(raw, total, codec, clevel, [f])
+            cb = _compress_all(raw, total, codec, clevel, [f], nthreads)
             if best_bytes is None or cb < best_bytes:
                 best_bytes, best_filter = cb, f
         return best_filter
@@ -95,6 +98,7 @@ def pack_array(
     codec: blosc2.Codec = blosc2.Codec.ZSTD,
     clevel: int = 3,
     filters: Optional[list] = None,
+    nthreads: Optional[int] = None,
 ) -> bytes:
     """Serialize a numpy array to a self-describing compressed byte string.
 
@@ -104,6 +108,10 @@ def pack_array(
     know the optimum (interactions and segmentations compress best with NOFILTER) should pass
     ``[blosc2.Filter.NOFILTER]`` to skip the selection. The chosen filter is self-describing
     inside the blosc2 frame, so unpack_array (decompress2) needs no changes.
+
+    ``nthreads`` is the per-call blosc2 thread count for compression. ``None`` (the default)
+    inherits blosc2's global ``nthreads`` (= core count). Passing an explicit value overrides
+    it for this call only, without mutating global state.
     """
     arr = np.ascontiguousarray(arr)
     dtype_str = arr.dtype.str.lstrip("<>|=").encode("ascii")
@@ -137,13 +145,14 @@ def pack_array(
     if filters is None:
         # Auto-select the better filter from a small centered crop, using the same
         # compress2 path as below for consistency.
-        filters = [_select_filter(arr, codec, clevel)]
+        filters = [_select_filter(arr, codec, clevel, nthreads)]
 
+    extra = {} if nthreads is None else {"nthreads": nthreads}
     parts = [header, shape_bytes, struct.pack("<I", nchunks)]
     for i in range(nchunks):
         start = i * _CHUNK_SIZE
         end = min(start + _CHUNK_SIZE, total)
-        chunk = blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters)
+        chunk = blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters, **extra)
         parts.append(struct.pack("<QQ", end - start, len(chunk)))
         parts.append(chunk)
     return b"".join(parts)
