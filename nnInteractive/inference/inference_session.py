@@ -79,6 +79,11 @@ class nnInteractiveInferenceSession:
         self.channel_mapping: dict = {}
         self.supports_initial_label: bool = True
         self.supports_zero_shot_label_refinement: bool = True
+        # License of the loaded model checkpoint. Set when the model is loaded
+        # (read from the LICENSE file in the checkpoint folder, or derived for
+        # legacy checkpoints without one). Exposed so GUIs can display it once
+        # the session is initialized. "!!MISSING!!" means the license is unknown.
+        self.license: Optional[str] = None
 
         # image specific
         self.interactions = None  # blosc2.NDArray once initialized
@@ -117,6 +122,31 @@ class nnInteractiveInferenceSession:
             plans.get("dataset_name") == "Dataset225_nnInteractiveV2"
             and checkpoint.get("init_args", {}).get("configuration") == "3d_fullres_ps192_bs24"
         )
+
+    @classmethod
+    def _load_license(cls, model_training_output_dir: str, plans: dict, checkpoint: dict) -> str:
+        """Determine the license of the model being loaded.
+
+        Reads the ``LICENSE`` file from the checkpoint folder if present.
+        Expected format: the FIRST line is a short license identifier (e.g.
+        ``CC BY-NC-SA 4.0``); any following lines (URL, full text, …) are for
+        human readers and are ignored. Only the first non-empty line is
+        returned, so ``self.license`` stays a short, displayable string.
+
+        If the folder has no ``LICENSE`` file it is most likely a legacy model:
+        the official v1 checkpoint is CC BY-NC-SA 4.0, anything else is reported
+        as ``"!!MISSING!!"`` so callers (e.g. GUIs) can flag the unknown license.
+        """
+        license_file = join(model_training_output_dir, "LICENSE")
+        if isfile(license_file):
+            with open(license_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        return line
+        if cls._is_official_checkpoint(plans, checkpoint):
+            return "CC BY-NC-SA 4.0"
+        return "!!MISSING!!"
 
     def _legacy_default_capability(self) -> dict:
         return {
@@ -1346,6 +1376,16 @@ class nnInteractiveInferenceSession:
         """
         artifacts = self._load_model_artifacts_from_disk(model_training_output_dir, use_fold, checkpoint_name)
         self.initialize_from_loaded_artifacts(artifacts)
+        # With torch.compile the network is compiled lazily on the first forward pass. For a
+        # locally hosted model that lag would otherwise surface on the user's first real
+        # prediction, where it is far more noticeable than during initialization. Trigger the
+        # compilation now with a dummy forward pass so the cost is paid here instead. warmup()
+        # is a no-op when the network is not compiled. The server takes care of its own warmup
+        # explicitly (it shares one compiled network across sessions via
+        # initialize_from_loaded_artifacts), so we only do this on the direct, local entry point.
+        if self.use_torch_compile:
+            print("torch.compile enabled; warming up (compiling) the network now (this is slow once)...")
+            self.warmup()
 
     def _load_model_artifacts_from_disk(
         self,
@@ -1401,12 +1441,11 @@ class nnInteractiveInferenceSession:
         checkpoint = torch.load(
             join(model_training_output_dir, fold_folder, checkpoint_name), map_location=self.device, weights_only=False
         )
-        if self._is_official_checkpoint(plans, checkpoint):
-            print(
-                "License reminder: The official nnInteractive checkpoint is licensed under "
-                "Creative Commons Attribution Non Commercial Share Alike 4.0 (CC BY-NC-SA 4.0). "
-                "See the license note in readme.md (# License)."
-            )
+        self.license = self._load_license(model_training_output_dir, plans, checkpoint)
+        print("=" * 80)
+        print("Model license:")
+        print(self.license)
+        print("=" * 80)
         trainer_name = checkpoint["trainer_name"]
         configuration_name = checkpoint["init_args"]["configuration"]
 
@@ -1452,6 +1491,7 @@ class nnInteractiveInferenceSession:
             "dataset_json": dataset_json,
             "trainer_name": trainer_name,
             "label_manager": plans_manager.get_label_manager(dataset_json),
+            "license": self.license,
         }
 
     def initialize_from_loaded_artifacts(self, artifacts: dict):
@@ -1475,6 +1515,7 @@ class nnInteractiveInferenceSession:
         self.dataset_json = artifacts["dataset_json"]
         self.trainer_name = artifacts["trainer_name"]
         self.label_manager = artifacts["label_manager"]
+        self.license = artifacts["license"]
         if self.use_torch_compile and not isinstance(self.network, OptimizedModule):
             print("Using torch.compile")
             self.network = torch.compile(self.network)

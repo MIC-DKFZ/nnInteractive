@@ -710,4 +710,5 @@ def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
         "patch_size": list(cfg.patch_size) if cfg is not None else None,
         "do_autozoom": bool(session.do_autozoom),
         "inference_session_version": session.INFERENCE_SESSION_VERSION,
+        "license": session.license,
     }

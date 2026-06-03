@@ -192,6 +192,11 @@ class nnInteractiveRemoteInferenceSession:
         self.preferred_scribble_thickness = caps["preferred_scribble_thickness"]
         self.interaction_decay = caps["interaction_decay"]
         self.INFERENCE_SESSION_VERSION = caps["inference_session_version"]
+        # License of the model loaded on the server. Mirrors
+        # nnInteractiveInferenceSession.license so a GUI can display it
+        # regardless of whether it holds a local or remote session.
+        # "!!MISSING!!" means the server could not determine the license.
+        self.license: Optional[str] = caps.get("license")
 
         self.original_image_shape: Optional[Tuple[int, ...]] = None
         self.target_buffer: Union[np.ndarray, torch.Tensor, None] = None
