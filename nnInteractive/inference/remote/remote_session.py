@@ -132,6 +132,13 @@ class nnInteractiveRemoteInferenceSession:
         the server before the client gives up. Default 60s matches observed
         prediction times (100ms..~10s) with headroom for slow links. On
         expiry: ``httpx.ReadTimeout``.
+    set_image_read_timeout:
+        Read timeout (seconds) used *only* for ``set_image``. After the volume
+        is uploaded, the server decompresses and preprocesses the full image
+        before responding, which can take far longer than a prediction on a
+        large volume. ``set_image`` therefore gets its own generous read
+        timeout instead of the much tighter ``read_timeout`` used for
+        predictions. On expiry: ``httpx.ReadTimeout``.
     write_timeout:
         Seconds to finish uploading the request body. ``set_image`` uploads
         the full 4D volume so this is the longest-running upload. On expiry:
@@ -146,6 +153,7 @@ class nnInteractiveRemoteInferenceSession:
         api_key: Optional[str] = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 60.0,
+        set_image_read_timeout: float = 600.0,
         write_timeout: float = 120.0,
         pool_timeout: float = 10.0,
     ):
@@ -165,6 +173,15 @@ class nnInteractiveRemoteInferenceSession:
                 pool=pool_timeout,
             ),
             headers=headers,
+        )
+        # Per-request timeout override for set_image: same connect/write/pool as
+        # the client default, but a much longer read budget for server-side
+        # decompression + preprocessing of the full volume.
+        self._set_image_timeout = httpx.Timeout(
+            connect=connect_timeout,
+            read=set_image_read_timeout,
+            write=write_timeout,
+            pool=pool_timeout,
         )
         self._lease_token: Optional[str] = None
 
@@ -242,12 +259,21 @@ class nnInteractiveRemoteInferenceSession:
         resp.raise_for_status()
         return resp
 
-    def _post_binary(self, path: str, meta: dict, array_bytes: bytes) -> httpx.Response:
+    def _post_binary(
+        self,
+        path: str,
+        meta: dict,
+        array_bytes: bytes,
+        timeout: Union[httpx.Timeout, float, None] = None,
+    ) -> httpx.Response:
         headers = {
             META_HEADER: json.dumps(_to_jsonable(meta), separators=(",", ":")),
             "Content-Type": CONTENT_TYPE_OCTET_STREAM,
         }
-        resp = self._http.post(path, content=array_bytes, headers=headers)
+        # httpx treats timeout=None as "no override" only when the arg is
+        # omitted; pass it through explicitly only when a caller supplied one.
+        kwargs = {} if timeout is None else {"timeout": timeout}
+        resp = self._http.post(path, content=array_bytes, headers=headers, **kwargs)
         _raise_for_lease_errors(resp)
         resp.raise_for_status()
         return resp
@@ -300,7 +326,12 @@ class nnInteractiveRemoteInferenceSession:
     def set_image(self, image: np.ndarray, image_properties: Optional[dict] = None) -> None:
         assert image.ndim == 4, f"expected a 4d image as input, got {image.ndim}d. Shape {image.shape}"
         meta = {"image_properties": image_properties or {}}
-        resp = self._post_binary(PATH_SET_IMAGE, meta, pack_array(image, nthreads=_compression_threads()))
+        resp = self._post_binary(
+            PATH_SET_IMAGE,
+            meta,
+            pack_array(image, nthreads=_compression_threads()),
+            timeout=self._set_image_timeout,
+        )
         info = resp.json()
         self.original_image_shape = tuple(info["original_image_shape"])
 

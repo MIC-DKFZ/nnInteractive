@@ -31,6 +31,15 @@ Concurrency model:
     prediction runs at a time.
   - The acquisition order is always (session lock → gpu lock) so there is no
     deadlock potential.
+  - The endpoints that carry large payloads (``set_image`` and the mask
+    interactions) are ``async`` so they can ``await`` the upload, but their
+    CPU-bound work (blosc2 decompression, image preprocessing, prediction,
+    response compression) is dispatched to a worker thread via
+    ``run_in_threadpool``. This keeps the event loop free during a long
+    ``set_image``/predict so lightweight endpoints — ``/heartbeat``,
+    ``/healthz`` — and the background reaper stay responsive, and so two
+    clients can genuinely preprocess concurrently. Acquiring a session/gpu
+    lock therefore also happens off the loop, never stalling it.
 """
 
 from __future__ import annotations
@@ -50,6 +59,7 @@ import blosc2
 import numpy as np
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response, status
+from starlette.concurrency import run_in_threadpool
 
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
 from nnInteractive.inference.remote._protocol import (
@@ -570,17 +580,24 @@ def make_app(
     async def set_image(request: Request, entry: SessionEntry = lease) -> dict:
         meta = _parse_meta_header(request.headers.get(META_HEADER))
         body = await request.body()
-        image = unpack_array(body)
         image_properties = meta.get("image_properties") or {}
 
-        def _do(session):
-            session.set_image(image, image_properties)
-            # set_image preprocesses in a background thread; force completion so
-            # subsequent calls can safely use original_image_shape.
-            session._finish_preprocessing_and_initialize_interactions()
-            return {"original_image_shape": list(session.original_image_shape)}
+        # Decompression + full-volume preprocessing are CPU-bound and can run
+        # for many seconds on a large image. Run them in a worker thread so the
+        # event loop keeps servicing heartbeats/healthz and the reaper.
+        def _work():
+            image = unpack_array(body)
 
-        return _under_session_lock(entry, _do)
+            def _do(session):
+                session.set_image(image, image_properties)
+                # set_image preprocesses in a background thread; force completion
+                # so subsequent calls can safely use original_image_shape.
+                session._finish_preprocessing_and_initialize_interactions()
+                return {"original_image_shape": list(session.original_image_shape)}
+
+            return _under_session_lock(entry, _do)
+
+        return await run_in_threadpool(_work)
 
     @app.post(PATH_SET_TARGET_BUFFER, dependencies=[auth])
     def set_target_buffer(payload: dict, entry: SessionEntry = lease) -> dict:
@@ -652,41 +669,53 @@ def make_app(
     async def _handle_mask_interaction(request: Request, entry: SessionEntry, kind: str) -> Response:
         meta = _parse_meta_header(request.headers.get(META_HEADER))
         body = await request.body()
-        mask = unpack_array(body)
         run_prediction = bool(meta.get("run_prediction", True))
         interaction_bbox = meta.get("interaction_bbox")
         if interaction_bbox is not None:
             interaction_bbox = [list(b) for b in interaction_bbox]
 
-        def _do(session):
-            method = session.add_scribble_interaction if kind == "scribble" else session.add_lasso_interaction
-            method(
-                mask,
-                bool(meta["include_interaction"]),
-                run_prediction=run_prediction,
-                override_capability_checks=bool(meta.get("override_capability_checks", False)),
-                interaction_bbox=interaction_bbox,
-            )
-            return _build_prediction_response(session, run_prediction)
+        # Decompression + prediction + response compression are CPU/GPU-bound;
+        # run them off the event loop (see set_image).
+        def _work():
+            mask = unpack_array(body)
 
-        return _under_session_and_gpu_lock(entry, _do)
+            def _do(session):
+                method = session.add_scribble_interaction if kind == "scribble" else session.add_lasso_interaction
+                method(
+                    mask,
+                    bool(meta["include_interaction"]),
+                    run_prediction=run_prediction,
+                    override_capability_checks=bool(meta.get("override_capability_checks", False)),
+                    interaction_bbox=interaction_bbox,
+                )
+                return _build_prediction_response(session, run_prediction)
+
+            return _under_session_and_gpu_lock(entry, _do)
+
+        return await run_in_threadpool(_work)
 
     @app.post(PATH_ADD_INITIAL_SEG, dependencies=[auth])
     async def add_initial_seg_interaction(request: Request, entry: SessionEntry = lease) -> Response:
         meta = _parse_meta_header(request.headers.get(META_HEADER))
         body = await request.body()
-        initial_seg = unpack_array(body)
         run_prediction = bool(meta.get("run_prediction", False))
 
-        def _do(session):
-            session.add_initial_seg_interaction(
-                initial_seg=initial_seg,
-                run_prediction=run_prediction,
-                override_capability_checks=bool(meta.get("override_capability_checks", False)),
-            )
-            return _build_prediction_response(session, run_prediction)
+        # Decompression + (optional) prediction are CPU/GPU-bound; run them off
+        # the event loop (see set_image).
+        def _work():
+            initial_seg = unpack_array(body)
 
-        return _under_session_and_gpu_lock(entry, _do)
+            def _do(session):
+                session.add_initial_seg_interaction(
+                    initial_seg=initial_seg,
+                    run_prediction=run_prediction,
+                    override_capability_checks=bool(meta.get("override_capability_checks", False)),
+                )
+                return _build_prediction_response(session, run_prediction)
+
+            return _under_session_and_gpu_lock(entry, _do)
+
+        return await run_in_threadpool(_work)
 
     return app
 
