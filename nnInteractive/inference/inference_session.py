@@ -572,7 +572,10 @@ class nnInteractiveInferenceSession:
                 "filters": [blosc2.Filter.NOFILTER],
                 "nthreads": min(self.torch_n_threads, os.cpu_count()),
             },
-            dparams={"nthreads": 4},
+            # Decompression of this sparse interaction tensor is fastest single-threaded:
+            # blosc2's per-chunk thread sync costs more than it saves here, badly so on
+            # many-core/many-CCD servers (see benchmarks). Multithreading only hurts.
+            dparams={"nthreads": 1},
         )
         self._interactions_shape = shape
 
@@ -647,7 +650,8 @@ class nnInteractiveInferenceSession:
                     "filters": [blosc2.Filter.NOFILTER],
                     "nthreads": os.cpu_count(),
                 },
-                dparams={"nthreads": 4},
+                # See _initialize_interactions: single-threaded decompression is fastest here.
+                dparams={"nthreads": 1},
             )
         self.current_interaction_intensity = 1.0
 
