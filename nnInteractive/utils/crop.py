@@ -190,7 +190,7 @@ def paste_tensor(target, source, bbox, channel_idx=None):
     return target
 
 
-def crop_to_valid(img, bbox):
+def crop_to_valid(img, bbox, out=None):
     """
     Crops the image to the part of the bounding box that lies within the image.
     Supports a 4D tensor of shape (C, X, Y, Z). The bounding box is specified as
@@ -200,6 +200,12 @@ def crop_to_valid(img, bbox):
         img: Input tensor (or blosc2 NDArray) of shape (C, X, Y, Z).
         bbox (list or tuple): Bounding box as a list of three intervals for spatial dims:
                               [[x1, x2], [y1, y2], [z1, z2]].
+        out (np.ndarray, optional): A flat, pre-faulted float16 buffer to decompress a blosc2
+                              crop into, avoiding a fresh allocation + page-fault on every call
+                              ("Path B"). Only used when ``img`` is a blosc2 NDArray exposing
+                              ``get_slice_numpy`` and the crop fits; otherwise ignored and a fresh
+                              array is returned. When used, the returned crop is a VIEW into ``out``
+                              and is only valid until the next call that reuses the same buffer.
 
     Returns:
         cropped: Cropped data of shape (C, cropped_x, cropped_y, cropped_z).
@@ -223,6 +229,26 @@ def crop_to_valid(img, bbox):
         pad_left = -start if start < 0 else 0
         pad_right = end - dim_size if end > dim_size else 0
         pad.append((pad_left, pad_right))
+
+    # Path B: decompress the blosc2 crop straight into a reused, pre-faulted buffer to avoid the
+    # per-call allocation + first-touch page-fault cost. get_slice_numpy is blosc2's internal
+    # decompress-into-buffer method (what __getitem__ calls under the hood); guarded since it is
+    # not a documented public API. Falls back to a fresh allocation if the crop would not fit.
+    if out is not None and not isinstance(img, torch.Tensor) and hasattr(img, "get_slice_numpy"):
+        valid_shape = [ce - cs for cs, ce in crop_indices]
+        output_shape = (img.shape[0], *valid_shape)
+        n = int(np.prod(output_shape, dtype=np.int64))
+        if n <= out.size:
+            view = out[:n].reshape(output_shape)
+            start = (0, *[cs for cs, _ in crop_indices])
+            stop = (img.shape[0], *[ce for _, ce in crop_indices])
+            img.get_slice_numpy(view, (start, stop))
+            return view, pad
+        print(
+            f"WARNING: interaction crop of {n} elements (shape {output_shape}) exceeds the reusable "
+            f"decompression buffer of {out.size} elements; this should never happen. Falling back to "
+            "a fresh allocation."
+        )
 
     # Crop the image on spatial dimensions, leaving the channel dimension intact.
     cropped = img[

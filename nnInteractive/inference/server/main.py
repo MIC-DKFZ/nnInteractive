@@ -62,6 +62,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "to work around a compile/backend issue).",
     )
     p.add_argument(
+        "--interactions-storage",
+        choices=["blosc2", "tensor", "auto"],
+        default="auto",
+        help="Storage backend for the interaction tensor (default: auto). 'blosc2': compact "
+        "in-memory array (low RAM, pays (de)compression per read/write). 'tensor': dense pinned "
+        "CPU float16 torch.Tensor (more RAM, lower per-access overhead). 'auto': per image, use "
+        "'tensor' for images up to 512x512x1024 voxels and 'blosc2' for larger ones.",
+    )
+    p.add_argument(
         "--no-autozoom",
         action="store_true",
         help="Disable adaptive zoom-out (default: enabled)",
@@ -222,6 +231,7 @@ def main(argv=None) -> int:
         torch_n_threads=args.torch_n_threads,
         do_autozoom=not args.no_autozoom,
         use_torch_compile=use_torch_compile,
+        interactions_storage=args.interactions_storage,
         verbose=args.verbose,
         api_key=api_key,
     )

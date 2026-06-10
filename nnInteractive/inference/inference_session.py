@@ -31,12 +31,20 @@ from nnInteractive.utils.inference_helpers import (
     transform_coordinates_noresampling,
     version_to_tuple,
 )
+from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
 from nnInteractive.utils.rounding import round_to_nearest_odd
 
 
 class nnInteractiveInferenceSession:
     INFERENCE_SESSION_VERSION = nnInteractive.__version__
     REFINEMENT_CACHE_GPU_HEADROOM_BYTES = 4 * 1024**3
+    # Maximum adaptive zoom-out factor (see _predict). Also bounds the largest interaction crop,
+    # which sizes the reusable blosc2 decompression buffer.
+    MAX_AUTOZOOM_FACTOR = 4
+    # 'auto' interaction storage threshold: images with at most this many spatial voxels
+    # (512*512*1024) use the dense tensor backend; larger ones use blosc2 to bound RAM.
+    AUTO_TENSOR_MAX_VOXELS = 2**28
+    INTERACTIONS_STORAGE_OPTIONS = ("blosc2", "tensor", "auto")
     # Interactions implemented by this inference session.
     SUPPORTED_INTERACTION_KEYS = ("scribble", "lasso", "points", "bbox2d", "bbox3d")
 
@@ -47,6 +55,7 @@ class nnInteractiveInferenceSession:
         verbose: bool = False,
         torch_n_threads: int = 8,
         do_autozoom: bool = True,
+        interactions_storage: str = "auto",
     ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
@@ -57,7 +66,22 @@ class nnInteractiveInferenceSession:
         This is recommended for the persistent inference server, where the
         process is long-lived so the one-time compile cost is paid only once and
         amortized across the whole session lifetime.
+
+        ``interactions_storage``: storage backend for the interaction tensor, one of
+        ``"blosc2"``, ``"tensor"`` or ``"auto"`` (default).
+        ``"blosc2"`` keeps it as a compact blosc2 in-memory NDArray (low RAM, pays
+        (de)compression on every read/write). ``"tensor"`` stores it as a dense CPU
+        float16 ``torch.Tensor`` (more RAM, far lower per-access overhead; pinned memory
+        by default, skipped when ``device`` is not CUDA or on Linux kernel 6.11 where
+        pinning is buggy). ``"auto"`` decides per image at initialization from the
+        interaction tensor's voxel count: at most ``AUTO_TENSOR_MAX_VOXELS`` (512*512*1024)
+        spatial voxels uses ``"tensor"``, larger uses ``"blosc2"``.
         """
+        if interactions_storage not in self.INTERACTIONS_STORAGE_OPTIONS:
+            raise ValueError(
+                f"interactions_storage must be one of {self.INTERACTIONS_STORAGE_OPTIONS}, "
+                f"got {interactions_storage!r}."
+            )
         print("session initialized")
 
         self.network = None
@@ -69,6 +93,9 @@ class nnInteractiveInferenceSession:
         self._interactions_shape = None
         self.device = device
         self.use_torch_compile = use_torch_compile
+        self.interactions_storage = interactions_storage
+        # Concrete backend ("blosc2"/"tensor") resolved per image in _initialize_interactions.
+        self._interactions_storage_resolved: Optional[str] = None
         self.interaction_decay = None
         self.current_interaction_intensity: float = 1.0
         self._fp16_max_value = float(torch.finfo(torch.float16).max)
@@ -86,7 +113,10 @@ class nnInteractiveInferenceSession:
         self.license: Optional[str] = None
 
         # image specific
-        self.interactions = None  # blosc2.NDArray once initialized
+        self.interactions = None  # blosc2.NDArray or dense torch.Tensor (see interactions_storage)
+        # Reusable, pre-faulted float16 buffer to decompress blosc2 interaction crops into (Path B).
+        # Allocated per image in _initialize_interactions; None for the dense-tensor backend.
+        self._interactions_read_buffer = None
         self.preprocessed_image: torch.Tensor = None
         self.preprocessed_props = None
         self.target_buffer: Union[np.ndarray, torch.Tensor] = None
@@ -303,18 +333,37 @@ class nnInteractiveInferenceSession:
 
     def _interactions_inplace_maximum(self, channel_idx: int, int_slicer, new_values) -> None:
         """In-place element-wise maximum for a subregion of a channel."""
+        full_slicer = (channel_idx, *int_slicer)
+        if isinstance(self.interactions, torch.Tensor):
+            # Dense torch backend: operate in place without a numpy round-trip.
+            if not isinstance(new_values, torch.Tensor):
+                new_values = torch.as_tensor(new_values)
+            view = self.interactions[full_slicer]
+            torch.maximum(view, new_values.to(view.dtype), out=view)
+            return
         if isinstance(new_values, torch.Tensor):
             new_values = new_values.cpu().numpy().astype(np.float16)
-        full_slicer = (channel_idx, *int_slicer)
         current_sub = np.asarray(self.interactions[full_slicer])
         np.maximum(current_sub, new_values, out=current_sub)
         self.interactions[full_slicer] = current_sub
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
+        if isinstance(self.interactions, torch.Tensor):
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value)
+            self.interactions[channel_idx] = value.to(self.interactions.dtype)
+            return
         if isinstance(value, torch.Tensor):
             value = value.cpu().numpy().astype(np.float16)
         self.interactions[channel_idx] = value
+
+    def _read_interactions_to_device(self, full_slicer, device) -> torch.Tensor:
+        """Read an interaction subregion as a torch.Tensor on ``device``, regardless of backend."""
+        sub = self.interactions[full_slicer]
+        if isinstance(sub, torch.Tensor):
+            return sub.to(device)
+        return torch.from_numpy(np.asarray(sub)).to(device)
 
     def _paste_prediction_to_target_buffer(self, prediction: torch.Tensor, bbox: List[List[int]]) -> None:
         target_bbox = self._interaction_bbox_to_target_bbox(bbox)
@@ -556,11 +605,30 @@ class nnInteractiveInferenceSession:
         self.original_image_shape = None
         self._last_paste_bbox = None
 
-    def _initialize_interactions(self, image_torch: torch.Tensor):
-        shape = (self.num_interaction_channels, *image_torch.shape[1:])
-        if self.verbose:
-            print("Initialize interactions with blosc2 in-memory compression")
-        self.interactions = blosc2.zeros(
+    def _resolve_interactions_storage(self, spatial_shape) -> str:
+        """Resolve the configured storage to a concrete backend ("blosc2" or "tensor").
+
+        For "auto", pick "tensor" for images with at most AUTO_TENSOR_MAX_VOXELS spatial voxels
+        (lower per-access overhead) and "blosc2" for larger ones (to bound RAM).
+        """
+        if self.interactions_storage != "auto":
+            return self.interactions_storage
+        n_voxels = int(np.prod(spatial_shape, dtype=np.int64))
+        return "blosc2" if n_voxels > self.AUTO_TENSOR_MAX_VOXELS else "tensor"
+
+    def _new_interactions_array(self, shape, compression_nthreads: int):
+        """Allocate a zeroed interaction array using the resolved backend.
+
+        "tensor" selects a dense CPU float16 torch.Tensor (more RAM, lower per-access
+        overhead); "blosc2" uses a compact blosc2 in-memory NDArray.
+        """
+        if self._interactions_storage_resolved == "tensor":
+            # Pinning enables faster non-blocking host->device copies, but only helps for a
+            # CUDA target and is buggy on Linux kernel 6.11 (see utils/os_shennanigans).
+            pin = self.device.type == "cuda" and not is_linux_kernel_6_11()
+            tensor = torch.zeros(shape, dtype=torch.float16, device="cpu")
+            return tensor.pin_memory() if pin else tensor
+        return blosc2.zeros(
             shape,
             dtype=np.float16,
             chunks=(1, *[min(64, s) for s in shape[1:]]),
@@ -570,14 +638,49 @@ class nnInteractiveInferenceSession:
                 "codec": blosc2.Codec.LZ4,
                 "clevel": 5,
                 "filters": [blosc2.Filter.NOFILTER],
-                "nthreads": min(self.torch_n_threads, os.cpu_count()),
+                "nthreads": compression_nthreads,
             },
             # Decompression of this sparse interaction tensor is fastest single-threaded:
             # blosc2's per-chunk thread sync costs more than it saves here, badly so on
             # many-core/many-CCD servers (see benchmarks). Multithreading only hurts.
             dparams={"nthreads": 1},
         )
+
+    def _initialize_interactions(self, image_torch: torch.Tensor):
+        shape = (self.num_interaction_channels, *image_torch.shape[1:])
+        self._interactions_storage_resolved = self._resolve_interactions_storage(shape[1:])
+        if self.verbose:
+            backend = "dense torch.Tensor" if self._interactions_storage_resolved == "tensor" else "blosc2 in-memory compression"
+            via_auto = " (auto)" if self.interactions_storage == "auto" else ""
+            print(f"Initialize interactions with {backend}{via_auto}")
+        self.interactions = self._new_interactions_array(shape, min(self.torch_n_threads, os.cpu_count()))
         self._interactions_shape = shape
+        self._interactions_read_buffer = self._new_interactions_read_buffer(shape)
+
+    def _new_interactions_read_buffer(self, shape) -> Optional[np.ndarray]:
+        """Pre-faulted buffer to decompress blosc2 interaction crops into (Path B), or None.
+
+        Sized to the largest possible crop: the patch size scaled by the maximum autozoom factor,
+        capped to the image size. Only allocated for the blosc2 backend that exposes the
+        decompress-into-buffer method; the dense-tensor backend returns views and needs no buffer.
+        """
+        if self._interactions_storage_resolved != "blosc2":
+            return None
+        if not hasattr(self.interactions, "get_slice_numpy"):
+            print(
+                "WARNING: this blosc2 build has no NDArray.get_slice_numpy; cannot reuse a "
+                "decompression buffer for interaction crops. Falling back to a fresh allocation on "
+                "every read (slower). Consider updating blosc2."
+            )
+            return None
+        max_valid = [
+            min(round(p * self.MAX_AUTOZOOM_FACTOR), s)
+            for p, s in zip(self.configuration_manager.patch_size, shape[1:])
+        ]
+        n = self.num_interaction_channels * int(np.prod(max_valid, dtype=np.int64))
+        buffer = np.empty(n, dtype=np.float16)
+        buffer[:] = 0  # first-touch the pages once, up front
+        return buffer
 
     @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
@@ -638,21 +741,7 @@ class nnInteractiveInferenceSession:
         """
         if self.interactions is not None:
             del self.interactions
-            self.interactions = blosc2.zeros(
-                self._interactions_shape,
-                dtype=np.float16,
-                chunks=(1, *[min(64, s) for s in self._interactions_shape[1:]]),
-                blocks=(1, *[min(32, s) for s in self._interactions_shape[1:]]),
-                # Interactions compress better with NOFILTER, which is also faster than SHUFFLE.
-                cparams={
-                    "codec": blosc2.Codec.LZ4,
-                    "clevel": 5,
-                    "filters": [blosc2.Filter.NOFILTER],
-                    "nthreads": os.cpu_count(),
-                },
-                # See _initialize_interactions: single-threaded decompression is fastest here.
-                dparams={"nthreads": 1},
-            )
+            self.interactions = self._new_interactions_array(self._interactions_shape, os.cpu_count())
         self.current_interaction_intensity = 1.0
 
         if self.target_buffer is not None:
@@ -984,7 +1073,9 @@ class nnInteractiveInferenceSession:
         Returns:
 
         """
-        print("Current cratio", self.interactions.cratio)
+        if not isinstance(self.interactions, torch.Tensor):
+            # cratio is a blosc2-only diagnostic; the dense tensor backend has no compression.
+            print("Current cratio", self.interactions.cratio)
 
         assert self.pad_mode_data == "constant", "pad modes other than constant are not implemented here"
         assert len(self.new_interaction_centers) == len(self.new_interaction_zoom_out_factors)
@@ -1000,7 +1091,7 @@ class nnInteractiveInferenceSession:
                 "!!!WE NO LONGER RUN ONE PREDICTION PER CENTER AND ONLY USE THE LAST ADDED INTERACTION AS CENTER!!!"
             )
         prediction_center, zoom_out_factor = self.new_interaction_centers[-1], self.new_interaction_zoom_out_factors[-1]
-        zoom_out_factor = min(4, zoom_out_factor)
+        zoom_out_factor = min(self.MAX_AUTOZOOM_FACTOR, zoom_out_factor)
 
         start_predict = time()
         with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
@@ -1009,7 +1100,9 @@ class nnInteractiveInferenceSession:
             input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction = self._build_network_input(
                 prediction_center, zoom_out_factor
             )
-            pred = self.network(input_for_predict[None])[0].argmax(0).detach()
+            # .contiguous() is required for torch.compile: the input may be a non-contiguous
+            # view (e.g. from the dense-tensor backend), and the compiled graph assumes contiguity.
+            pred = self.network(input_for_predict[None].contiguous())[0].argmax(0).detach()
             del input_for_predict
 
             # detect changes at border. If there are, we enter autozoom
@@ -1026,17 +1119,19 @@ class nnInteractiveInferenceSession:
             start_zoomout = time()
             while has_change and self.do_autozoom:
                 print(f"AutoZoom zoom out factor {zoom_out_factor}")
-                # we allow a max zoom out of 4
-                if zoom_out_factor >= 4:
+                # we allow a max zoom out of MAX_AUTOZOOM_FACTOR
+                if zoom_out_factor >= self.MAX_AUTOZOOM_FACTOR:
                     break
                 else:
                     zoom_out_factor *= zoom_out_growth_factor
-                    zoom_out_factor = min(4, zoom_out_factor)
+                    zoom_out_factor = min(self.MAX_AUTOZOOM_FACTOR, zoom_out_factor)
 
                 input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction_resized = (
                     self._build_network_input(prediction_center, zoom_out_factor)
                 )
-                pred = self.network(input_for_predict[None])[0].argmax(0).detach()
+                # .contiguous() is required for torch.compile: the input may be a non-contiguous
+                # view (e.g. from the dense-tensor backend), and the compiled graph assumes contiguity.
+                pred = self.network(input_for_predict[None].contiguous())[0].argmax(0).detach()
                 del input_for_predict
                 empty_cache(self.device)
 
@@ -1081,7 +1176,9 @@ class nnInteractiveInferenceSession:
 
         # cropping happens on CPU, padding happens on GPU (later)
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
-        interactions_tensor, pad_interaction = crop_to_valid(self.interactions, scaled_bbox)
+        interactions_tensor, pad_interaction = crop_to_valid(
+            self.interactions, scaled_bbox, out=self._interactions_read_buffer
+        )
         # For blosc2, crop_to_valid returns a numpy array; convert to torch (still on CPU).
         if not isinstance(interactions_tensor, torch.Tensor):
             interactions_tensor = torch.from_numpy(np.asarray(interactions_tensor))
@@ -1178,7 +1275,8 @@ class nnInteractiveInferenceSession:
                     dim=0,
                 )
 
-            pred = self.network(patch[None])[0].argmax(0).detach()
+            # .contiguous(): see _predict — required for torch.compile with possibly non-contiguous input.
+            pred = self.network(patch[None].contiguous())[0].argmax(0).detach()
             paste_tensor(
                 cache_interactions,
                 pred.to(cache_interactions.device, dtype=cache_interactions.dtype),
@@ -1265,7 +1363,7 @@ class nnInteractiveInferenceSession:
         pred_slicer = tuple(slice(lb, ub) for lb, ub in pred_bbox)
         local_slicer = tuple(slice(lb, ub) for lb, ub in local_seen_bbox)
 
-        prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *seen_slicer)])).to(self.device)
+        prev_sub = self._read_interactions_to_device((prev_seg_ch, *seen_slicer), self.device)
 
         diff_local[local_slicer] = (pred[pred_slicer] != prev_sub).to(diff_local.dtype)
         del prev_sub
@@ -1284,7 +1382,7 @@ class nnInteractiveInferenceSession:
     def _mark_prev_seg_in_local_diff(self, diff_local: torch.Tensor, planning_bbox: List[List[int]]) -> None:
         prev_seg_ch = self._get_prev_seg_channel()
         planning_slicer = tuple(slice(lb, ub) for lb, ub in planning_bbox)
-        prev_sub = torch.from_numpy(np.asarray(self.interactions[(prev_seg_ch, *planning_slicer)])).to(self.device)
+        prev_sub = self._read_interactions_to_device((prev_seg_ch, *planning_slicer), self.device)
         diff_local[prev_sub > 0.5] = 1
         del prev_sub
 
@@ -1552,8 +1650,12 @@ class nnInteractiveInferenceSession:
         self.network = self.network.to(self.device)
 
     def __del__(self):
-        self._finish_preprocessing_and_initialize_interactions()
-        self.executor.shutdown()
+        # Be robust to a partially-constructed instance (e.g. __init__ raised on bad arguments):
+        # these attributes may not exist yet.
+        if hasattr(self, "preprocess_future"):
+            self._finish_preprocessing_and_initialize_interactions()
+        if hasattr(self, "executor"):
+            self.executor.shutdown()
 
 
 if __name__ == "__main__":

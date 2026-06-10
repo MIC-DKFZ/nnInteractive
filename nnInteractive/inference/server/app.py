@@ -161,6 +161,7 @@ class SessionRegistry:
         torch_n_threads: int,
         do_autozoom: bool,
         use_torch_compile: bool,
+        interactions_storage: str,
         verbose: bool,
     ) -> None:
         self._artifacts = artifacts
@@ -171,6 +172,7 @@ class SessionRegistry:
         self._torch_n_threads = torch_n_threads
         self._do_autozoom = do_autozoom
         self._use_torch_compile = use_torch_compile
+        self._interactions_storage = interactions_storage
         self._verbose = verbose
         self._entries: dict[str, SessionEntry] = {}
         self._mu = threading.Lock()
@@ -199,6 +201,7 @@ class SessionRegistry:
                 verbose=self._verbose,
                 torch_n_threads=self._torch_n_threads,
                 do_autozoom=self._do_autozoom,
+                interactions_storage=self._interactions_storage,
             )
             session.initialize_from_loaded_artifacts(self._artifacts)
             entry = SessionEntry(session)
@@ -300,6 +303,7 @@ def make_app(
     torch_n_threads: int = 8,
     do_autozoom: bool = True,
     use_torch_compile: bool = False,
+    interactions_storage: str = "auto",
     verbose: bool = False,
     api_key: Optional[str] = None,
     sweep_interval_seconds: float = 15.0,
@@ -313,6 +317,7 @@ def make_app(
         torch_n_threads=torch_n_threads,
         do_autozoom=do_autozoom,
         use_torch_compile=use_torch_compile,
+        interactions_storage=interactions_storage,
         verbose=verbose,
     )
     gpu_lock = threading.Lock()
@@ -363,6 +368,7 @@ def make_app(
         verbose=False,
         torch_n_threads=torch_n_threads,
         do_autozoom=do_autozoom,
+        interactions_storage=interactions_storage,
     )
     _capability_session.initialize_from_loaded_artifacts(artifacts)
     _capability_snapshot = _build_capability_snapshot(_capability_session)

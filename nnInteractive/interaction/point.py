@@ -124,6 +124,11 @@ class PointInteraction_stub:
             )
 
             target_slices = (channel_idx, *slices)
+            if isinstance(interaction_map, torch.Tensor):
+                # Dense torch backend: in-place maximum, no numpy round-trip.
+                view = interaction_map[target_slices]
+                torch.maximum(view, strel[structuring_slices].to(view.dtype), out=view)
+                return interaction_map
             current_sub = np.asarray(interaction_map[target_slices])
             strel_np = strel[structuring_slices].numpy().astype(current_sub.dtype)
             np.maximum(current_sub, strel_np, out=current_sub)
