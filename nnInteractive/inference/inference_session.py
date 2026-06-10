@@ -649,10 +649,10 @@ class nnInteractiveInferenceSession:
     def _initialize_interactions(self, image_torch: torch.Tensor):
         shape = (self.num_interaction_channels, *image_torch.shape[1:])
         self._interactions_storage_resolved = self._resolve_interactions_storage(shape[1:])
-        if self.verbose:
+        via_auto = self.interactions_storage == "auto"
+        if self.verbose or via_auto:
             backend = "dense torch.Tensor" if self._interactions_storage_resolved == "tensor" else "blosc2 in-memory compression"
-            via_auto = " (auto)" if self.interactions_storage == "auto" else ""
-            print(f"Initialize interactions with {backend}{via_auto}")
+            print(f"Initialize interactions with {backend}{' (auto)' if via_auto else ''}")
         self.interactions = self._new_interactions_array(shape, min(self.torch_n_threads, os.cpu_count()))
         self._interactions_shape = shape
         self._interactions_read_buffer = self._new_interactions_read_buffer(shape)
