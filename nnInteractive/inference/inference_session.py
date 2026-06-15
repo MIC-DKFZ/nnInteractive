@@ -1581,11 +1581,18 @@ class nnInteractiveInferenceSession:
             )
             trainer_class = nnInteractiveTrainer_stub
 
+        # nnInteractive is always a binary problem (target object vs background): the trainer hardcodes the network to
+        # 2 output channels (see nnInteractiveTrainer.network_num_output_channels) regardless of how many labels the
+        # training dataset.json carries. We must reconstruct with the same count. Using
+        # num_segmentation_heads here would silently work for datasets that happen to have 2 labels but blows up for
+        # checkpoints trained on aggregated datasets whose dataset.json lists thousands of object ids as labels (the
+        # decoder channel sizes depend on the class count, so the state_dict would not load).
+        num_network_output_channels = 2
         network = trainer_class.build_network_architecture(
             plans_manager,
             configuration_manager,
             num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+            num_network_output_channels,
             enable_deep_supervision=False,
         ).to(self.device)
         network.load_state_dict(parameters)
