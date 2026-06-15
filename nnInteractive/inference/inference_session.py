@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
+import sys
 from os import cpu_count
 from time import time
 from typing import Union, List, Tuple, Optional
@@ -92,6 +93,13 @@ class nnInteractiveInferenceSession:
         self.plans_manager = None
         self._interactions_shape = None
         self.device = device
+        if use_torch_compile and sys.platform.startswith("win"):
+            # torch.compile relies on triton, which is not available out of the box on Windows.
+            warnings.warn(
+                "torch.compile is not supported on Windows (triton is not available out of the "
+                "box), forcing use_torch_compile=False."
+            )
+            use_torch_compile = False
         self.use_torch_compile = use_torch_compile
         self.interactions_storage = interactions_storage
         # Concrete backend ("blosc2"/"tensor") resolved per image in _initialize_interactions.
