@@ -81,6 +81,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_SET_DO_AUTOZOOM,
     PATH_SET_IMAGE,
     PATH_SET_TARGET_BUFFER,
+    PATH_UNDO,
 )
 from nnInteractive.inference.remote.serialization import pack_array, unpack_array
 
@@ -634,6 +635,15 @@ def make_app(
 
         return _under_session_lock(entry, _do)
 
+    @app.post(PATH_UNDO, dependencies=[auth])
+    def undo(entry: SessionEntry = lease) -> Response:
+        # Undo does no GPU inference (only CPU decompress/copy), so it must not hold the GPU lock.
+        def _do(session):
+            ran = session.undo()
+            return _build_prediction_response(session, ran_prediction=ran)
+
+        return _under_session_lock(entry, _do)
+
     @app.post(PATH_ADD_BBOX, dependencies=[auth])
     def add_bbox_interaction(payload: dict, entry: SessionEntry = lease) -> Response:
         run_prediction = bool(payload.get("run_prediction", True))
@@ -748,4 +758,5 @@ def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
         "do_autozoom": bool(session.do_autozoom),
         "inference_session_version": session.INFERENCE_SESSION_VERSION,
         "license": session.license,
+        "supports_undo": True,
     }

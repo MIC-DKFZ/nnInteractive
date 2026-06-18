@@ -38,6 +38,8 @@ from nnInteractive.utils.rounding import round_to_nearest_odd
 
 class nnInteractiveInferenceSession:
     INFERENCE_SESSION_VERSION = nnInteractive.__version__
+    # Single-level undo of the last interaction is always available (see undo()).
+    supports_undo: bool = True
     REFINEMENT_CACHE_GPU_HEADROOM_BYTES = 4 * 1024**3
     # Maximum adaptive zoom-out factor (see _predict). Also bounds the largest interaction crop,
     # which sizes the reusable blosc2 decompression buffer.
@@ -132,6 +134,14 @@ class nnInteractiveInferenceSession:
         # Captured inside _paste_prediction_to_target_buffer so remote callers can
         # fetch just the touched region without diffing.
         self._last_paste_bbox: Optional[List[List[int]]] = None
+
+        # Single-level undo. _undo_snapshot holds a blosc2-compressed copy of the state
+        # *before* the most recent interaction (the restore target). _pending_snapshot_future
+        # is an in-flight async snapshot of the current state, kicked off after each prediction
+        # while the user decides on the next prompt; it is promoted into _undo_snapshot at the
+        # start of the next interaction. See _snapshot_state / _commit_pending_snapshot / undo.
+        self._undo_snapshot: Optional[dict] = None
+        self._pending_snapshot_future = None
 
         # this will be set when loading the model (initialize_from_trained_model_folder)
         self.pad_mode_data = self.preferred_scribble_thickness = self.point_interaction = None
@@ -600,6 +610,10 @@ class nnInteractiveInferenceSession:
         self.interactions_future = None
         self.preprocess_future = None
 
+        # Drain any in-flight snapshot before we free the tensors it reads, then drop undo state.
+        self._drain_pending_snapshot()
+        self._undo_snapshot = None
+
         del self.preprocessed_image
         del self.target_buffer
         del self.interactions
@@ -742,11 +756,18 @@ class nnInteractiveInferenceSession:
         del self.interactions_future
         self.interactions_future = None
 
-    def reset_interactions(self):
+    def reset_interactions(self, _preserve_undo: bool = False):
         """
         Use this to reset all interactions and start from scratch for the current image. This includes the initial
         segmentation!
+
+        _preserve_undo is an internal flag: add_initial_seg_interaction() resets interactions as part of
+        applying the new seg, but the undo snapshot it just committed must survive so that interaction
+        remains undoable. Public callers must not set it.
         """
+        if not _preserve_undo:
+            self._drain_pending_snapshot()
+            self._undo_snapshot = None
         if self.interactions is not None:
             del self.interactions
             self.interactions = self._new_interactions_array(self._interactions_shape, os.cpu_count())
@@ -760,6 +781,127 @@ class nnInteractiveInferenceSession:
         self._last_paste_bbox = None
         empty_cache(self.device)
 
+    # ------------------------------- undo --------------------------------- #
+    def _blosc2_cparams(self) -> dict:
+        """LZ4/NOFILTER compression params shared by snapshots (matches _new_interactions_array)."""
+        return {
+            "codec": blosc2.Codec.LZ4,
+            "clevel": 5,
+            "filters": [blosc2.Filter.NOFILTER],
+            "nthreads": min(self.torch_n_threads, os.cpu_count()),
+        }
+
+    @staticmethod
+    def _copy_bbox(bbox: Optional[List[List[int]]]) -> Optional[List[List[int]]]:
+        return None if bbox is None else [list(b) for b in bbox]
+
+    def _snapshot_state(self) -> dict:
+        """Compress the current undoable state into blosc2 NDArrays. Runs in self.executor.
+
+        Always stores blosc2, regardless of the live interactions backend, to bound RAM and reuse
+        the compression machinery. The caller guarantees no mutation happens while this runs
+        (the next interaction blocks on _commit_pending_snapshot; _predict drains first).
+        """
+        cparams = self._blosc2_cparams()
+        if isinstance(self.interactions, torch.Tensor):
+            interactions = blosc2.asarray(
+                np.ascontiguousarray(self.interactions.numpy()), cparams=cparams, dparams={"nthreads": 1}
+            )
+        else:
+            interactions = self.interactions.copy()
+
+        target = None
+        if self.target_buffer is not None:
+            t_np = (
+                self.target_buffer
+                if isinstance(self.target_buffer, np.ndarray)
+                else self.target_buffer.detach().cpu().numpy()
+            )
+            target = blosc2.asarray(np.ascontiguousarray(t_np), cparams=cparams, dparams={"nthreads": 1})
+
+        return {
+            "interactions": interactions,
+            "target": target,
+            "current_interaction_intensity": self.current_interaction_intensity,
+            "last_paste_bbox": self._copy_bbox(self._last_paste_bbox),
+        }
+
+    def _restore_snapshot(self, snap: dict) -> None:
+        """Restore a snapshot produced by _snapshot_state into the live session (synchronous)."""
+        del self.interactions
+        if self._interactions_storage_resolved == "tensor":
+            arr = np.ascontiguousarray(snap["interactions"][:])
+            tensor = torch.from_numpy(arr).to(torch.float16)
+            pin = self.device.type == "cuda" and not is_linux_kernel_6_11()
+            self.interactions = tensor.pin_memory() if pin else tensor.clone()
+        else:
+            self.interactions = snap["interactions"].copy()
+
+        if snap["target"] is not None and self.target_buffer is not None:
+            t_np = snap["target"][:]
+            if isinstance(self.target_buffer, np.ndarray):
+                np.copyto(self.target_buffer, t_np)
+            else:
+                self.target_buffer.copy_(torch.from_numpy(np.ascontiguousarray(t_np)))
+
+        self.current_interaction_intensity = snap["current_interaction_intensity"]
+        self._last_paste_bbox = self._copy_bbox(snap["last_paste_bbox"])
+        self.new_interaction_centers = []
+        self.new_interaction_zoom_out_factors = []
+        empty_cache(self.device)
+
+    def _diff_bbox(self, current, restored_blosc) -> Optional[List[List[int]]]:
+        """Bounding box (original-image coords) of voxels that differ between the live target buffer
+        and the restored one, so undo can ship just the changed region. None if identical."""
+        if current is None or restored_blosc is None:
+            return None
+        cur = current if isinstance(current, np.ndarray) else current.detach().cpu().numpy()
+        diff = cur != restored_blosc[:]
+        if not diff.any():
+            return None
+        coords = np.where(diff)
+        return [[int(c.min()), int(c.max()) + 1] for c in coords]
+
+    def _drain_pending_snapshot(self) -> None:
+        """Block until any in-flight async snapshot finishes and discard it. Used before mutating
+        or freeing the tensors it reads."""
+        if self._pending_snapshot_future is not None:
+            self._pending_snapshot_future.result()
+            self._pending_snapshot_future = None
+
+    def _commit_pending_snapshot(self) -> None:
+        """Promote the in-flight snapshot to the undo target. Called at the start of every
+        add_*_interaction, before any state is mutated. Falls back to a synchronous snapshot of
+        the current state when none is in flight (first interaction, or a prior run_prediction=False)."""
+        if self._pending_snapshot_future is not None:
+            self._undo_snapshot = self._pending_snapshot_future.result()
+            self._pending_snapshot_future = None
+        else:
+            # No async snapshot in flight (first interaction, or the previous add ran with
+            # run_prediction=False). Snapshot the current live state synchronously so the undo
+            # target reflects the state right before this interaction.
+            self._undo_snapshot = self._snapshot_state()
+
+    def undo(self) -> bool:
+        """Revert the most recent interaction, restoring the session to its prior state.
+
+        Single level: only the last interaction can be undone. Returns True if something was undone,
+        False if there was nothing to undo. After undo, the (now current) state becomes undoable again
+        only once a new interaction is added.
+        """
+        if self._undo_snapshot is None:
+            return False
+        self._drain_pending_snapshot()
+        # Diff the live target buffer against the snapshot before restoring, so remote callers can
+        # fetch just the changed region via _last_paste_bbox.
+        diff_bbox = self._diff_bbox(self.target_buffer, self._undo_snapshot["target"])
+        self._restore_snapshot(self._undo_snapshot)
+        self._last_paste_bbox = diff_bbox
+        self._undo_snapshot = None
+        # The restored state is undoable-from-again for the next *new* interaction.
+        self._pending_snapshot_future = self.executor.submit(self._snapshot_state)
+        return True
+
     def add_bbox_interaction(
         self,
         bbox_coords,
@@ -768,6 +910,7 @@ class nnInteractiveInferenceSession:
         override_capability_checks: bool = False,
     ):
         self._finish_preprocessing_and_initialize_interactions()
+        self._commit_pending_snapshot()
         # sanity check
         raw_bbox_size = [i[1] - i[0] for i in bbox_coords]
         if any([i == 0 for i in raw_bbox_size]):
@@ -858,6 +1001,7 @@ class nnInteractiveInferenceSession:
         self._check_capability_or_warn("points", override_capability_checks)
         point_pos_channel, point_neg_channel = self._resolve_channel_pair("points", override_capability_checks)
         self._finish_preprocessing_and_initialize_interactions()
+        self._commit_pending_snapshot()
 
         transformed_coordinates = [
             round(i)
@@ -900,6 +1044,7 @@ class nnInteractiveInferenceSession:
         ), f"interaction_bbox {interaction_bbox} exceeds original image bounds {list(self.original_image_shape[1:])}"
 
         self._finish_preprocessing_and_initialize_interactions()
+        self._commit_pending_snapshot()
 
         lbs_internal = [
             round(i)
@@ -1002,8 +1147,10 @@ class nnInteractiveInferenceSession:
         ), f"Given initial seg must match input image shape. Input image was: {self.original_image_shape[1:]}, given: {initial_seg.shape}"
 
         self._finish_preprocessing_and_initialize_interactions()
+        self._commit_pending_snapshot()
 
-        self.reset_interactions()
+        # Preserve the undo snapshot we just committed: this whole initial-seg op is one undoable step.
+        self.reset_interactions(_preserve_undo=True)
 
         if isinstance(self.target_buffer, np.ndarray):
             self.target_buffer[:] = initial_seg
@@ -1081,6 +1228,8 @@ class nnInteractiveInferenceSession:
         Returns:
 
         """
+        # Make sure no background snapshot is reading the tensors we are about to mutate.
+        self._drain_pending_snapshot()
         if not isinstance(self.interactions, torch.Tensor):
             # cratio is a blosc2-only diagnostic; the dense tensor backend has no compression.
             print("Current cratio", self.interactions.cratio)
@@ -1176,6 +1325,10 @@ class nnInteractiveInferenceSession:
         self.new_interaction_centers = []
         self.new_interaction_zoom_out_factors = []
         empty_cache(self.device)
+
+        # Asynchronously snapshot the now-settled state while the user decides on the next prompt.
+        # The next interaction blocks on this in _commit_pending_snapshot before mutating anything.
+        self._pending_snapshot_future = self.executor.submit(self._snapshot_state)
 
     def _build_network_input(self, prediction_center, zoom_out_factor):
         scaled_patch_size = [round(i * zoom_out_factor) for i in self.configuration_manager.patch_size]

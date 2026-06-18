@@ -38,6 +38,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_SET_DO_AUTOZOOM,
     PATH_SET_IMAGE,
     PATH_SET_TARGET_BUFFER,
+    PATH_UNDO,
 )
 from nnInteractive.inference.remote.serialization import pack_array, unpack_array
 
@@ -224,6 +225,9 @@ class nnInteractiveRemoteInferenceSession:
         # regardless of whether it holds a local or remote session.
         # "!!MISSING!!" means the server could not determine the license.
         self.license: Optional[str] = caps.get("license")
+        # Older servers predate the /undo endpoint and omit this flag; default False so the
+        # GUI can disable undo instead of issuing requests that would 404.
+        self.supports_undo: bool = bool(caps.get("supports_undo", False))
 
         self.original_image_shape: Optional[Tuple[int, ...]] = None
         self.target_buffer: Union[np.ndarray, torch.Tensor, None] = None
@@ -278,22 +282,28 @@ class nnInteractiveRemoteInferenceSession:
         resp.raise_for_status()
         return resp
 
-    def _apply_prediction_response(self, resp: httpx.Response) -> None:
-        """Update self.target_buffer from a server response carrying a bbox diff."""
+    def _apply_prediction_response(self, resp: httpx.Response) -> bool:
+        """Update self.target_buffer from a server response carrying a bbox diff.
+
+        Returns whether the server reported a prediction/undo actually ran, so callers (e.g.
+        undo()) can tell the difference between "applied a change" and "nothing happened". A
+        change can run with an empty bbox (no visible diff), so the return reflects the server's
+        ran_prediction flag, not whether voxels were written.
+        """
         meta_raw = resp.headers.get(META_HEADER)
         if meta_raw is None:
-            return
+            return False
         meta = json.loads(meta_raw)
-        if not meta.get("ran_prediction", False):
-            return
+        ran = bool(meta.get("ran_prediction", False))
         bbox = meta.get("bbox")
-        if bbox is None or self.target_buffer is None:
-            return
+        if not ran or bbox is None or self.target_buffer is None:
+            return ran
         body = resp.content
         if len(body) == 0:
-            return
+            return ran
         diff = unpack_array(body)
         self._write_bbox_into_target_buffer(diff, bbox)
+        return ran
 
     def _write_bbox_into_target_buffer(self, diff: np.ndarray, bbox: List[List[int]]) -> None:
         slicer = tuple(slice(int(lb), int(ub)) for lb, ub in bbox)
@@ -356,6 +366,13 @@ class nnInteractiveRemoteInferenceSession:
             elif isinstance(self.target_buffer, torch.Tensor):
                 self.target_buffer.zero_()
         self._post_json(PATH_RESET_INTERACTIONS, {})
+
+    def undo(self) -> bool:
+        """Revert the most recent interaction. Patches the local target buffer with the changed
+        region returned by the server. Returns True if something was undone, False if there was
+        nothing to undo (mirrors the local session's undo())."""
+        resp = self._post_json(PATH_UNDO, {})
+        return self._apply_prediction_response(resp)
 
     def add_bbox_interaction(
         self,
