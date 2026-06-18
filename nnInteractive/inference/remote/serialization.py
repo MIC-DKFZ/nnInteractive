@@ -52,7 +52,7 @@ _SELECT_FILTER_CROP_FRACTION = 0.25
 
 
 def _compress_all(
-    raw: memoryview, total: int, codec: blosc2.Codec, clevel: int, filters: list, nthreads: Optional[int]
+    raw: memoryview, total: int, codec: blosc2.Codec, clevel: int, filters: list, nthreads: Optional[int], typesize: int
 ) -> int:
     """Compressed byte length of ``raw`` under ``filters``, chunked exactly as pack_array does."""
     extra = {} if nthreads is None else {"nthreads": nthreads}
@@ -61,7 +61,9 @@ def _compress_all(
     for i in range(nchunks):
         start = i * _CHUNK_SIZE
         end = min(start + _CHUNK_SIZE, total)
-        size += len(blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters, **extra))
+        size += len(
+            blosc2.compress2(raw[start:end], typesize=typesize, codec=codec, clevel=clevel, filters=filters, **extra)
+        )
     return size
 
 
@@ -79,10 +81,11 @@ def _select_filter(arr: np.ndarray, codec: blosc2.Codec, clevel: int, nthreads: 
         crop = np.ascontiguousarray(arr[slices])
         raw = memoryview(crop).cast("B")
         total = raw.nbytes
+        typesize = crop.dtype.itemsize
 
         best_filter, best_bytes = blosc2.Filter.NOFILTER, None
         for f in (blosc2.Filter.NOFILTER, blosc2.Filter.SHUFFLE):
-            cb = _compress_all(raw, total, codec, clevel, [f], nthreads)
+            cb = _compress_all(raw, total, codec, clevel, [f], nthreads, typesize)
             if best_bytes is None or cb < best_bytes:
                 best_bytes, best_filter = cb, f
         return best_filter
@@ -142,6 +145,17 @@ def pack_array(
     total = raw.nbytes
     nchunks = (total + _CHUNK_SIZE - 1) // _CHUNK_SIZE
 
+    # Declare the real element size to blosc2. This matters for two reasons:
+    #   1. SHUFFLE only helps when typesize matches the element size (it regroups byte-planes of
+    #      each element), so itemsize gives the best ratio for multi-byte arrays (e.g. float32 images).
+    #   2. It avoids a blosc2 bug: compress2() on an all-zeros buffer whose length is not a multiple
+    #      of typesize emits a "zero special value" frame that decompress2() then cannot read
+    #      (e.g. a 707658-byte all-zero uint8 diff with the default typesize=8). A contiguous array's
+    #      byte length is always a multiple of itemsize, and _CHUNK_SIZE is a multiple of every
+    #      power-of-two itemsize, so every chunk slice stays aligned and the broken path is never hit.
+    # See unpack_array (decompress2 reads typesize from the frame; it needs no matching argument).
+    typesize = arr.dtype.itemsize
+
     if filters is None:
         # Auto-select the better filter from a small centered crop, using the same
         # compress2 path as below for consistency.
@@ -152,7 +166,7 @@ def pack_array(
     for i in range(nchunks):
         start = i * _CHUNK_SIZE
         end = min(start + _CHUNK_SIZE, total)
-        chunk = blosc2.compress2(raw[start:end], codec=codec, clevel=clevel, filters=filters, **extra)
+        chunk = blosc2.compress2(raw[start:end], typesize=typesize, codec=codec, clevel=clevel, filters=filters, **extra)
         parts.append(struct.pack("<QQ", end - start, len(chunk)))
         parts.append(chunk)
     return b"".join(parts)
