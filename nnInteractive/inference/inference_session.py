@@ -46,7 +46,7 @@ class nnInteractiveInferenceSession:
     MAX_AUTOZOOM_FACTOR = 4
     # 'auto' interaction storage threshold: images with at most this many spatial voxels
     # (512*512*1024) use the dense tensor backend; larger ones use blosc2 to bound RAM.
-    AUTO_TENSOR_MAX_VOXELS = 2**28
+    AUTO_TENSOR_MAX_VOXELS = 2**27
     INTERACTIONS_STORAGE_OPTIONS = ("blosc2", "tensor", "auto")
     # Interactions implemented by this inference session.
     SUPPORTED_INTERACTION_KEYS = ("scribble", "lasso", "points", "bbox2d", "bbox3d")
@@ -673,7 +673,11 @@ class nnInteractiveInferenceSession:
         self._interactions_storage_resolved = self._resolve_interactions_storage(shape[1:])
         via_auto = self.interactions_storage == "auto"
         if self.verbose or via_auto:
-            backend = "dense torch.Tensor" if self._interactions_storage_resolved == "tensor" else "blosc2 in-memory compression"
+            backend = (
+                "dense torch.Tensor"
+                if self._interactions_storage_resolved == "tensor"
+                else "blosc2 in-memory compression"
+            )
             print(f"Initialize interactions with {backend}{' (auto)' if via_auto else ''}")
         self.interactions = self._new_interactions_array(shape, min(self.torch_n_threads, os.cpu_count()))
         self._interactions_shape = shape
