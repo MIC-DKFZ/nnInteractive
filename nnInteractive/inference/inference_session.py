@@ -836,8 +836,13 @@ class nnInteractiveInferenceSession:
             self._drain_pending_snapshot()
             self._undo_snapshot = None
         if self.interactions is not None:
-            del self.interactions
-            self.interactions = self._new_interactions_array(self._interactions_shape, os.cpu_count())
+            if isinstance(self.interactions, torch.Tensor):
+                # Same image -> same shape, so reuse the existing (possibly pinned) dense buffer
+                # and just zero it instead of reallocating + re-pinning.
+                self.interactions.zero_()
+            else:
+                del self.interactions
+                self.interactions = self._new_interactions_array(self._interactions_shape, os.cpu_count())
         self.current_interaction_intensity = 1.0
 
         if self.target_buffer is not None:
