@@ -1090,9 +1090,14 @@ class nnInteractiveInferenceSession:
 
         interaction_shape = self.interactions.shape[1:]
         # Map possibly out-of-bounds transformed bbox to overlapping source/target slices so we only
-        # materialize and write the intersecting subregion.
-        clipped_lb = [max(0, lb) for lb in lbs_internal]
-        clipped_ub = [min(ub, s) for ub, s in zip(ubs_internal, interaction_shape)]
+        # materialize and write the intersecting subregion. Both bounds must be clamped to [0, s]:
+        # clamping only one side (e.g. min(ub, s)) leaves a negative stop when the bbox lies entirely
+        # before the volume, and slice(0, <negative>) is interpreted as indexing from the end rather
+        # than as an empty slice, which desyncs the dest/source slice sizes (see the int/src slicers
+        # below). A scribble that falls completely outside the preprocessing crop then collapses to an
+        # empty slice on both sides and is harmlessly skipped.
+        clipped_lb = [min(max(0, lb), s) for lb, s in zip(lbs_internal, interaction_shape)]
+        clipped_ub = [min(max(0, ub), s) for ub, s in zip(ubs_internal, interaction_shape)]
         src_lb = [cl - lb for cl, lb in zip(clipped_lb, lbs_internal)]
         src_ub = [src_lb[d] + (clipped_ub[d] - clipped_lb[d]) for d in range(3)]
         int_slicer = tuple(slice(a, b) for a, b in zip(clipped_lb, clipped_ub))
