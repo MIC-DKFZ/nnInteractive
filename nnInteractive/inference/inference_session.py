@@ -101,6 +101,18 @@ class nnInteractiveInferenceSession:
                 "box), forcing use_torch_compile=False."
             )
             use_torch_compile = False
+        if use_torch_compile and device.type != "cuda":
+            # This network is convolution-dominated, so on CPU almost all time is spent inside
+            # oneDNN/MKLDNN conv kernels. torch.compile's wins (pointwise fusion, lower dispatch
+            # overhead) are marginal there, while the compile itself runs on the same CPU cores
+            # and adds substantial startup latency. Not worth it, so disable it.
+            warnings.warn(
+                f"torch.compile provides little benefit on '{device.type}' (this network is "
+                "convolution-bound, so most time is spent in conv kernels rather than in fusable "
+                "ops) while adding significant compile-time overhead, forcing "
+                "use_torch_compile=False."
+            )
+            use_torch_compile = False
         self.use_torch_compile = use_torch_compile
         self.interactions_storage = interactions_storage
         # Concrete backend ("blosc2"/"tensor") resolved per image in _initialize_interactions.
