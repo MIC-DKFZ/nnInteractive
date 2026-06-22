@@ -719,8 +719,8 @@ class nnInteractiveInferenceSession:
             # Pinning enables faster non-blocking host->device copies, but only helps for a
             # CUDA target and is buggy on Linux kernel 6.11 (see utils/os_shennanigans).
             pin = self.device.type == "cuda" and not is_linux_kernel_6_11()
-            tensor = torch.zeros(shape, dtype=torch.float16, device="cpu")
-            return tensor.pin_memory() if pin else tensor
+            tensor = torch.zeros(shape, dtype=torch.float16, device="cpu", pin_memory=pin)
+            return tensor
         return blosc2.zeros(
             shape,
             dtype=np.float16,
