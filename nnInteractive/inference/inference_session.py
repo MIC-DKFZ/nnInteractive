@@ -10,7 +10,7 @@ import blosc2
 
 import numpy as np
 import torch
-from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice, crop_and_pad_nd
+from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 from batchgenerators.utilities.file_and_folder_operations import load_json, join, subdirs, isfile
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
@@ -29,7 +29,6 @@ from nnInteractive.utils.erosion_dilation import iterative_3x3_same_padding_pool
 from nnInteractive.utils.inference_helpers import (
     infer_num_interaction_channels_from_mapping,
     parse_channel_pair,
-    transform_coordinates_noresampling,
     version_to_tuple,
 )
 from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
@@ -128,7 +127,6 @@ class nnInteractiveInferenceSession:
         # Allocated per image in _initialize_interactions; None for the dense-tensor backend.
         self._interactions_read_buffer = None
         self.preprocessed_image: torch.Tensor = None
-        self.preprocessed_props = None
         self.target_buffer: Union[np.ndarray, torch.Tensor] = None
         # Bbox (in original-image coordinates) of the most recent target_buffer write.
         # Captured inside _paste_prediction_to_target_buffer so remote callers can
@@ -269,11 +267,6 @@ class nnInteractiveInferenceSession:
             for bbox in local_bboxes
         ]
 
-    def _interaction_bbox_to_target_bbox(self, bbox: List[List[int]]) -> List[List[int]]:
-        return [
-            [i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in zip(bbox, self.preprocessed_props["bbox_used_for_cropping"])
-        ]
-
     def _compute_prev_seg_positive_bbox(self) -> Optional[List[List[int]]]:
         prev_seg_ch = self._get_prev_seg_channel()
         spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
@@ -384,13 +377,13 @@ class nnInteractiveInferenceSession:
         return torch.from_numpy(np.asarray(sub)).to(device)
 
     def _paste_prediction_to_target_buffer(self, prediction: torch.Tensor, bbox: List[List[int]]) -> None:
-        target_bbox = self._interaction_bbox_to_target_bbox(bbox)
+        # The target buffer shares the image's coordinate space (no cropping), so the bbox is used directly.
         if isinstance(self.target_buffer, torch.Tensor):
             pred_for_target = prediction.to(self.target_buffer.device)
         else:
             pred_for_target = prediction.to("cpu")
-        paste_tensor(self.target_buffer, pred_for_target, target_bbox)
-        self._last_paste_bbox = target_bbox
+        paste_tensor(self.target_buffer, pred_for_target, bbox)
+        self._last_paste_bbox = bbox
 
     def _estimate_refinement_cache_nbytes(self, cache_bbox: List[List[int]]) -> int:
         cache_voxels = int(np.prod(self._bbox_size(cache_bbox), dtype=np.int64))
@@ -617,11 +610,9 @@ class nnInteractiveInferenceSession:
         del self.preprocessed_image
         del self.target_buffer
         del self.interactions
-        del self.preprocessed_props
         self.preprocessed_image = None
         self.target_buffer = None
         self.interactions = None
-        self.preprocessed_props = None
         self.current_interaction_intensity = 1.0
         empty_cache(self.device)
         self.original_image_shape = None
@@ -711,49 +702,52 @@ class nnInteractiveInferenceSession:
     @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
-        image = torch.from_numpy(image.copy())
+        image = torch.from_numpy(image.copy()).float()
 
-        # Crop to nonzero region.
+        # The image is intentionally NOT cropped: interactions, predictions and the target buffer all
+        # live in the original image's coordinate space (so the previously unreachable zero-valued border
+        # region can be segmented too). We still locate the nonzero region, but only to compute the
+        # normalization statistics over it, so that mean/std match what the model saw during training
+        # (nnU-Net normalizes after cropping to nonzero).
         if self.verbose:
-            print("Cropping input image to nonzero region")
+            print("Locating nonzero region for normalization statistics")
         # torch.where eats RAM / VRAM for breakfast. Avoid!!!
         # nonzero_idx = torch.where(image != 0)
         # # Create bounding box: for each dimension, get the min and max (plus one) of the nonzero indices.
         # bbox = [[i.min().item(), i.max().item() + 1] for i in nonzero_idx]
         # del nonzero_idx
         # instead we sum dimensions
-        s_x = image.sum(axis=(0, 2, 3), dtype=torch.float)
+        s_x = image.sum(axis=(0, 2, 3), dtype=torch.float64)
         wh_x = torch.where(s_x != 0)[0]
         bbox_x = [wh_x.min().item(), wh_x.max().item() + 1]
         del s_x, wh_x
-        s_y = image.sum(axis=(0, 1, 3), dtype=torch.float)
+        s_y = image.sum(axis=(0, 1, 3), dtype=torch.float64)
         wh_y = torch.where(s_y != 0)[0]
         bbox_y = [wh_y.min().item(), wh_y.max().item() + 1]
         del s_y, wh_y
-        s_z = image.sum(axis=(0, 1, 2), dtype=torch.float)
+        s_z = image.sum(axis=(0, 1, 2), dtype=torch.float64)
         wh_z = torch.where(s_z != 0)[0]
         bbox_z = [wh_z.min().item(), wh_z.max().item() + 1]
         del s_z, wh_z
         bbox = [[0, 1], bbox_x, bbox_y, bbox_z]
         empty_cache(self.device)
 
-        slicer = bounding_box_to_slice(bbox)  # Assuming this returns a tuple of slices.
-        image = image[slicer].float()
-        if self.verbose:
-            print(f"Cropped image shape: {image.shape}")
-
-        # As soon as we have the target shape, start initializing the interaction tensor in its own thread.
+        # Start initializing the interaction tensor (full image shape) in its own thread.
         self.interactions_future = self.executor.submit(self._initialize_interactions, image)
 
-        # Normalize the cropped image.
+        # Compute normalization statistics over the nonzero region only, then normalize the FULL image
+        # with them. Zero-valued border voxels become a constant (0 - mean) / std, like interior background.
         if self.verbose:
-            print("Normalizing cropped image")
-        image -= image.mean()
-        image /= image.std()
+            print("Normalizing image using statistics from the nonzero region")
+        slicer = bounding_box_to_slice(bbox)  # Assuming this returns a tuple of slices.
+        crop = image[slicer]
+        mean = crop.mean()
+        std = crop.std()
+        del crop
+        image -= mean
+        image /= std
 
         self.preprocessed_image = image.to("cpu")
-
-        self.preprocessed_props = {"bbox_used_for_cropping": bbox[1:]}
 
         # we need to wait for this here I believe
         self.interactions_future.result()
@@ -954,28 +948,11 @@ class nnInteractiveInferenceSession:
         self._check_capability_or_warn(bbox_kind, override_capability_checks)
         bbox_pos_channel, bbox_neg_channel = self._resolve_channel_pair(bbox_kind, override_capability_checks)
 
-        # Convert user-space coordinates (original image) to the cropped nnU-Net internal space.
-        lbs_transformed = [
-            round(i)
-            for i in transform_coordinates_noresampling(
-                [i[0] for i in bbox_coords], self.preprocessed_props["bbox_used_for_cropping"]
-            )
-        ]
-        ubs_transformed = [
-            round(i)
-            for i in transform_coordinates_noresampling(
-                [i[1] for i in bbox_coords], self.preprocessed_props["bbox_used_for_cropping"]
-            )
-        ]
-        transformed_bbox_coordinates = [[i, j] for i, j in zip(lbs_transformed, ubs_transformed)]
+        # Coordinates are already in the image's coordinate space (no cropping).
+        transformed_bbox_coordinates = [[round(i[0]), round(i[1])] for i in bbox_coords]
 
         if self.verbose:
-            print(
-                f"Adding bounding box coordinates.\n"
-                f"Raw: {bbox_coords}\n"
-                f"Transformed: {transformed_bbox_coordinates}\n"
-                f"Crop Bbox: {self.preprocessed_props['bbox_used_for_cropping']}"
-            )
+            print(f"Adding bounding box coordinates: {transformed_bbox_coordinates}")
 
         # Clip bbox to valid interaction volume and guarantee at least one voxel extent per axis.
         image_shape = self.preprocessed_image.shape  # Assuming shape is (C, H, W, D) or similar
@@ -1027,18 +1004,16 @@ class nnInteractiveInferenceSession:
         self._finish_preprocessing_and_initialize_interactions()
         self._commit_pending_snapshot()
 
-        transformed_coordinates = [
-            round(i)
-            for i in transform_coordinates_noresampling(coordinates, self.preprocessed_props["bbox_used_for_cropping"])
-        ]
+        # Coordinates are already in the image's coordinate space (no cropping).
+        rounded_coordinates = [round(i) for i in coordinates]
 
-        self._add_patch_for_point_interaction(transformed_coordinates)
+        self._add_patch_for_point_interaction(rounded_coordinates)
 
         self._prepare_new_interaction_intensity()
 
         interaction_channel = point_pos_channel if include_interaction else point_neg_channel
         self.point_interaction.place_point(
-            transformed_coordinates,
+            rounded_coordinates,
             self.interactions,
             channel_idx=interaction_channel,
             intensity_scale=self.current_interaction_intensity,
@@ -1070,39 +1045,17 @@ class nnInteractiveInferenceSession:
         self._finish_preprocessing_and_initialize_interactions()
         self._commit_pending_snapshot()
 
-        lbs_internal = [
-            round(i)
-            for i in transform_coordinates_noresampling(
-                [ib[0] for ib in interaction_bbox], self.preprocessed_props["bbox_used_for_cropping"]
-            )
-        ]
-        ubs_internal = [
-            round(i)
-            for i in transform_coordinates_noresampling(
-                [ib[1] for ib in interaction_bbox], self.preprocessed_props["bbox_used_for_cropping"]
-            )
-        ]
+        # interaction_bbox is already in the image's coordinate space (no cropping), and the asserts above
+        # guarantee it lies fully within the interaction volume, so we write it directly at its bounds.
+        lbs = [ib[0] for ib in interaction_bbox]
 
         image_t = torch.from_numpy(image)
-        patch_fn(image_t, offset=lbs_internal)
+        patch_fn(image_t, offset=lbs)
 
         self._prepare_new_interaction_intensity()
 
-        interaction_shape = self.interactions.shape[1:]
-        # Map possibly out-of-bounds transformed bbox to overlapping source/target slices so we only
-        # materialize and write the intersecting subregion. Both bounds must be clamped to [0, s]:
-        # clamping only one side (e.g. min(ub, s)) leaves a negative stop when the bbox lies entirely
-        # before the volume, and slice(0, <negative>) is interpreted as indexing from the end rather
-        # than as an empty slice, which desyncs the dest/source slice sizes (see the int/src slicers
-        # below). A scribble that falls completely outside the preprocessing crop then collapses to an
-        # empty slice on both sides and is harmlessly skipped.
-        clipped_lb = [min(max(0, lb), s) for lb, s in zip(lbs_internal, interaction_shape)]
-        clipped_ub = [min(max(0, ub), s) for ub, s in zip(ubs_internal, interaction_shape)]
-        src_lb = [cl - lb for cl, lb in zip(clipped_lb, lbs_internal)]
-        src_ub = [src_lb[d] + (clipped_ub[d] - clipped_lb[d]) for d in range(3)]
-        int_slicer = tuple(slice(a, b) for a, b in zip(clipped_lb, clipped_ub))
-        src_slicer = tuple(slice(a, b) for a, b in zip(src_lb, src_ub))
-        new_values = image_t[src_slicer].cpu().numpy()
+        int_slicer = tuple(slice(lb, ub) for lb, ub in interaction_bbox)
+        new_values = image_t.cpu().numpy()
         if self.current_interaction_intensity != 1:
             new_values = new_values * self.current_interaction_intensity
         new_values = new_values.astype(np.float16)
@@ -1189,9 +1142,7 @@ class nnInteractiveInferenceSession:
         if isinstance(self.target_buffer, torch.Tensor):
             self.target_buffer[:] = initial_seg
 
-        # crop (as in preprocessing)
-        initial_seg = crop_and_pad_nd(initial_seg, self.preprocessed_props["bbox_used_for_cropping"])
-
+        # initial seg already matches the image's coordinate space (no cropping)
         # initial seg is written into initial seg buffer
         interaction_channel = self._get_prev_seg_channel()
         self._write_interactions_channel(interaction_channel, initial_seg)
