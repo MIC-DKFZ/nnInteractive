@@ -139,6 +139,18 @@ def main(argv=None) -> int:
 
     device = torch.device(args.device)
     use_torch_compile = not args.no_torch_compile
+    if use_torch_compile and device.type != "cuda":
+        # See nnInteractiveInferenceSession.__init__: torch.compile is not worth it on a
+        # convolution-bound network running on CPU. Disable it here too so we skip the
+        # misleading "compiling..." log and the pointless warmup below, and so client
+        # sessions don't each emit the session-level warning.
+        logger.warning(
+            "torch.compile provides little benefit on '%s' (this network is convolution-bound) "
+            "while adding significant compile-time overhead; disabling it. Pass --no-torch-compile "
+            "to silence this.",
+            device.type,
+        )
+        use_torch_compile = False
     api_key = _resolve_api_key(args.api_key)
     if api_key is None:
         logger.warning(

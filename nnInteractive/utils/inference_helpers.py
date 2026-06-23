@@ -1,5 +1,5 @@
 import re
-from typing import List, Tuple, Union
+from typing import Tuple
 
 
 def version_to_tuple(version: str) -> Tuple[int, ...]:
@@ -33,13 +33,3 @@ def infer_num_interaction_channels_from_mapping(channel_mapping: dict) -> int:
 
     # Positive indexing is 0-based, while negative indexing is 1-based-from-end.
     return max(max_positive_index + 1, max_negative_magnitude, 1)
-
-
-def transform_coordinates_noresampling(
-    coords_orig: Union[List[int], Tuple[int, ...]],
-    nnunet_preprocessing_crop_bbox: List[Tuple[int, int]],
-) -> Tuple[int, ...]:
-    """
-    Converts coordinates in the original uncropped image to the internal cropped representation.
-    """
-    return tuple(coords_orig[d] - nnunet_preprocessing_crop_bbox[d][0] for d in range(len(coords_orig)))
