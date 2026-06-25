@@ -32,6 +32,8 @@ Huge thanks to the community for contributing these integrations!
 
 ## 📰 News
 
+- **06/2026**: 🐳 The inference server now ships as a **Docker image** — run nnInteractive on a GPU box with a single `docker run`, no install required. See [`DOCKER.md`](nnInteractive/inference/server/DOCKER.md)
+- **05/2026**: 🌐 **Remote GPU inference** (client/server): drive nnInteractive over HTTP from a machine without a GPU via `nnInteractiveRemoteInferenceSession`, with one server hosting multiple concurrent sessions. See [`SERVER_CLIENT.md`](SERVER_CLIENT.md)
 - **11/2025**: 🌐 New community driven **OHIF integration** released by our colleagues at [CCI Bonn](https://ccibonn.ai/). Try nnInteractive directly in OHIF 👉 [OHIF-AI](https://github.com/CCI-Bonn/OHIF-AI)
 - **07/2025**: 🧩 New ITK-SNAP extension released! Try nnInteractive directly in ITK-SNAP 👉 [Quick Start](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html)
 - **06/2025**: 🏆 We’re thrilled to announce that `nnInteractive` **won the 1st place** in the [CVPR 2025 Challenge on Interactive 3D Segmentation](https://www.codabench.org/competitions/5263/). Huge shoutout to the organizers and all contributors!
@@ -419,6 +421,67 @@ Note that while this repository is available under Apache-2.0 license (see [LICE
 Release model folders ship their own `LICENSE` file whose **first line is the license identifier** (e.g. `CC BY-NC-SA 4.0`); any following lines (such as a link to the full license) are ignored by the tool. At load time this first line is read and exposed as `session.license` so applications can display the model's license prominently. If a checkpoint folder has no `LICENSE` file, the official v1 checkpoint is assumed to be `CC BY-NC-SA 4.0` and any other checkpoint reports `!!MISSING!!`.
 
 # Changelog
+
+### 2.4.2 - 2026-06-23
+
+- Reuse the interactions buffer and pinned-memory buffers for the tensor prompt backend (one fewer memcpy); lowered the blosc2 auto-threshold.
+- Fixed a crash when an image prompt lies entirely outside the cropped region.
+- Disable `torch.compile` on CPU.
+
+### 2.4.0 - 2026-06-19
+
+- Added **undo** support and clearer error messages.
+- Reuse pinned-memory buffers for faster prompt compression; fixed a missing typesize in blosc2 compression.
+- Disable `torch.compile` on Windows (with a warning).
+- Fall back to locating the trainer class in the nnU-Net repo when it is not bundled here.
+
+### 2.3.3 - 2026-06-12
+
+- Choose between torch- and blosc2-backed prompt storage; `auto` (the default) uses a tensor for images smaller than 512×512×1024 and blosc2 otherwise. The blosc2 path is faster thanks to a preallocated output buffer.
+- Heartbeats continue during large image transfers.
+
+### 2.3.1 - 2026-06-03
+
+- The client explicitly sets the number of worker threads.
+
+### 2.3.0 - 2026-06-03
+
+- Expose the model license and print it on init; run the `torch.compile` warmup at init.
+- Validate remote target-buffer requests.
+- Improved blosc2 compression behavior.
+- Added the PyPI publishing workflow.
+
+### 2.2.0 - 2026-05-29
+
+- **`torch.compile` support**, enabled by default for the server and triggered at startup so clients never pay the first-prediction compile cost.
+- The server gained two independent timeouts: a heartbeat liveness check and an inactivity timeout.
+
+### 2.1.0 - 2026-05-28
+
+- **Remote inference server / client** (`nnInteractiveRemoteInferenceSession`): drive nnInteractive over HTTP from a machine without a GPU. One server hosts multiple concurrent client sessions.
+- Large images are chunked during client/server transfer; serialization fixes.
+- Simpler install; fixed a bounding box that could extend beyond the image.
+
+### 2.0.0 - 2026-05-28
+
+- Major inference rework — restructured, more readable code.
+- Compressed (half-precision) interactions are now the only mode; preprocessing runs on the GPU; substantially reduced VRAM for AutoZoom and refinement.
+- New capability / `inference_info.json` format, with bbox sanity and capability checks.
+- Removed the pseudo-lasso path; reformatted the codebase with black.
+
+### 1.1.5 - 2026-04-10
+
+- Compatibility with nnU-Net v2.7.0.
+
+### 1.1.4 - 2026-02-19
+
+- Mask refinement now always covers the entire mask.
+- Added model-license reminders.
+
+### 1.1.3 - 2025-11-28
+
+- Pin `torch < 2.9.0` to avoid a 3D-convolution memory regression.
+- Documentation clarifications (no manual preprocessing in the minimal example).
 
 ### 1.1.2 - 2025-08-02
 
