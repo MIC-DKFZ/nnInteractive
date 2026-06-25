@@ -445,6 +445,21 @@ class nnInteractiveInferenceSession:
         paste_tensor(self.target_buffer, pred_for_target, bbox)
         self._last_paste_bbox = bbox
 
+    def _clipped_last_paste_bbox(self) -> Optional[List[List[int]]]:
+        """Return ``_last_paste_bbox`` clipped to the target buffer's spatial bounds, or None.
+
+        ``_last_paste_bbox`` is stored unclipped: autozoom near an image edge can push the
+        pasted region past the buffer bounds (and below 0). Callers that copy only the changed
+        sub-region need valid, directly-sliceable indices, so we clip to ``[0, shape]`` per axis
+        here without mutating the stored (unclipped) value the server relies on. Returns None if
+        nothing was pasted or there is no target buffer.
+        """
+        bbox = self._last_paste_bbox
+        if bbox is None or self.target_buffer is None:
+            return None
+        shape = self.target_buffer.shape
+        return [[max(int(lb), 0), min(int(ub), int(shape[i]))] for i, (lb, ub) in enumerate(bbox)]
+
     def _estimate_refinement_cache_nbytes(self, cache_bbox: List[List[int]]) -> int:
         cache_voxels = int(np.prod(self._bbox_size(cache_bbox), dtype=np.int64))
         image_nbytes = cache_voxels * torch.empty((), dtype=self.preprocessed_image.dtype).element_size()
@@ -1000,7 +1015,7 @@ class nnInteractiveInferenceSession:
         include_interaction: bool,
         run_prediction: bool = True,
         override_capability_checks: bool = False,
-    ):
+    ) -> Optional[List[List[int]]]:
         self._finish_preprocessing_and_initialize_interactions()
         self._commit_pending_snapshot()
         # sanity check
@@ -1064,7 +1079,8 @@ class nnInteractiveInferenceSession:
         self.interactions[(channel, *slicer)] = self.current_interaction_intensity
 
         if run_prediction:
-            self._predict()
+            return self._predict()
+        return None
 
     def add_point_interaction(
         self,
@@ -1072,7 +1088,7 @@ class nnInteractiveInferenceSession:
         include_interaction: bool,
         run_prediction: bool = True,
         override_capability_checks: bool = False,
-    ):
+    ) -> Optional[List[List[int]]]:
         self._check_capability_or_warn("points", override_capability_checks)
         point_pos_channel, point_neg_channel = self._resolve_channel_pair("points", override_capability_checks)
         self._finish_preprocessing_and_initialize_interactions()
@@ -1093,7 +1109,8 @@ class nnInteractiveInferenceSession:
             intensity_scale=self.current_interaction_intensity,
         )
         if run_prediction:
-            self._predict()
+            return self._predict()
+        return None
 
     def _add_image_interaction(
         self,
@@ -1102,7 +1119,7 @@ class nnInteractiveInferenceSession:
         run_prediction: bool,
         interaction_bbox: Optional[List[List[int]]],
         patch_fn,
-    ):
+    ) -> Optional[List[List[int]]]:
         if interaction_bbox is None:
             interaction_bbox = [[0, s] for s in self.original_image_shape[1:]]
 
@@ -1139,7 +1156,8 @@ class nnInteractiveInferenceSession:
         empty_cache(self.device)
 
         if run_prediction:
-            self._predict()
+            return self._predict()
+        return None
 
     def _add_mask_interaction(
         self,
@@ -1149,12 +1167,12 @@ class nnInteractiveInferenceSession:
         run_prediction: bool,
         override_capability_checks: bool,
         interaction_bbox: Optional[List[List[int]]],
-    ) -> None:
+    ) -> Optional[List[List[int]]]:
         if self.verbose:
             print(f"Add new {interaction_name} of shape {mask_image.shape} and bbox {interaction_bbox}")
         self._check_capability_or_warn(interaction_name, override_capability_checks)
         pos_channel, neg_channel = self._resolve_channel_pair(interaction_name, override_capability_checks)
-        self._add_image_interaction(
+        return self._add_image_interaction(
             mask_image,
             pos_channel if include_interaction else neg_channel,
             run_prediction,
@@ -1169,8 +1187,8 @@ class nnInteractiveInferenceSession:
         run_prediction: bool = True,
         override_capability_checks: bool = False,
         interaction_bbox: Optional[List[List[int]]] = None,
-    ):
-        self._add_mask_interaction(
+    ) -> Optional[List[List[int]]]:
+        return self._add_mask_interaction(
             "scribble",
             scribble_image,
             include_interaction,
@@ -1186,16 +1204,20 @@ class nnInteractiveInferenceSession:
         run_prediction: bool = True,
         override_capability_checks: bool = False,
         interaction_bbox: Optional[List[List[int]]] = None,
-    ):
-        self._add_mask_interaction(
+    ) -> Optional[List[List[int]]]:
+        return self._add_mask_interaction(
             "lasso", lasso_image, include_interaction, run_prediction, override_capability_checks, interaction_bbox
         )
 
     def add_initial_seg_interaction(
         self, initial_seg: np.ndarray, run_prediction: bool = False, override_capability_checks: bool = False
-    ):
+    ) -> Optional[List[List[int]]]:
         """
         WARNING THIS WILL RESET INTERACTIONS!
+
+        Returns the bbox of the changed region when ``run_prediction`` is True; None otherwise.
+        When ``run_prediction`` is False the *entire* target buffer is overwritten with
+        ``initial_seg`` (the caller already holds the full mask), so no sub-region bbox applies.
         """
         self._check_capability_or_warn("initial_label", override_capability_checks)
         assert all(
@@ -1225,9 +1247,10 @@ class nnInteractiveInferenceSession:
         if run_prediction:
             self._add_patch_for_initial_seg_interaction(initial_seg)
             del initial_seg
-            self._predict(force_full_refine=True)
+            return self._predict(force_full_refine=True)
         else:
             del initial_seg
+            return None
 
     @torch.inference_mode()
     def warmup(self) -> bool:
@@ -1266,7 +1289,7 @@ class nnInteractiveInferenceSession:
         return True
 
     @torch.inference_mode()
-    def _predict(self, force_full_refine: bool = False):
+    def _predict(self, force_full_refine: bool = False) -> Optional[List[List[int]]]:
         """
         force_full_refine if True we run the refinement over the whole current prediction and not just the diff map.
         More effort but sometimes needed (refine initial seg)
@@ -1280,7 +1303,10 @@ class nnInteractiveInferenceSession:
         VRAM consumption is not adversely affected.
 
         Returns:
-
+            The bounding box (in target-buffer/image coordinates, clipped to the buffer bounds) of the
+            region written to ``target_buffer`` by this prediction, as ``[[z0, z1], [y0, y1], [x0, x1]]``.
+            GUI/clients that cannot share the underlying buffer can use this to copy only the changed
+            sub-volume instead of the whole array. Returns None when no prediction ran (nothing queued).
         """
         # Make sure no background snapshot is reading the tensors we are about to mutate.
         self._drain_pending_snapshot()
@@ -1293,7 +1319,7 @@ class nnInteractiveInferenceSession:
         prev_seg_channel = self._get_prev_seg_channel()
         if len(self.new_interaction_centers) == 0:
             print("No patch queued for prediction. Nothing to do.")
-            return
+            return None
 
         if len(self.new_interaction_centers) > 1:
             print(
@@ -1383,6 +1409,8 @@ class nnInteractiveInferenceSession:
         # Asynchronously snapshot the now-settled state while the user decides on the next prompt.
         # The next interaction blocks on this in _commit_pending_snapshot before mutating anything.
         self._pending_snapshot_future = self.executor.submit(self._snapshot_state)
+
+        return self._clipped_last_paste_bbox()
 
     def _build_network_input(self, prediction_center, zoom_out_factor):
         scaled_patch_size = [round(i * zoom_out_factor) for i in self.configuration_manager.patch_size]

@@ -231,6 +231,10 @@ class nnInteractiveRemoteInferenceSession:
 
         self.original_image_shape: Optional[Tuple[int, ...]] = None
         self.target_buffer: Union[np.ndarray, torch.Tensor, None] = None
+        # Bbox (clipped, in target-buffer coordinates) of the region the most recent prediction
+        # wrote into target_buffer, mirrored from the server response. None when nothing was
+        # written. Mirrors the local session's API so callers get the changed region either way.
+        self._last_paste_bbox: Optional[List[List[int]]] = None
         self.do_autozoom: bool = bool(caps.get("do_autozoom", True))
 
         # Construction succeeded — start auto-heartbeating to keep the server
@@ -290,6 +294,7 @@ class nnInteractiveRemoteInferenceSession:
         change can run with an empty bbox (no visible diff), so the return reflects the server's
         ran_prediction flag, not whether voxels were written.
         """
+        self._last_paste_bbox = None
         meta_raw = resp.headers.get(META_HEADER)
         if meta_raw is None:
             return False
@@ -298,6 +303,9 @@ class nnInteractiveRemoteInferenceSession:
         bbox = meta.get("bbox")
         if not ran or bbox is None or self.target_buffer is None:
             return ran
+        # Record the changed region so callers can copy just this sub-volume. The server already
+        # clipped this bbox to the buffer bounds, so it is directly sliceable.
+        self._last_paste_bbox = [list(b) for b in bbox]
         body = resp.content
         if len(body) == 0:
             return ran
@@ -380,7 +388,7 @@ class nnInteractiveRemoteInferenceSession:
         include_interaction: bool,
         run_prediction: bool = True,
         override_capability_checks: bool = False,
-    ) -> None:
+    ) -> Optional[List[List[int]]]:
         resp = self._post_json(
             PATH_ADD_BBOX,
             {
@@ -391,6 +399,7 @@ class nnInteractiveRemoteInferenceSession:
             },
         )
         self._apply_prediction_response(resp)
+        return self._last_paste_bbox
 
     def add_point_interaction(
         self,
@@ -398,7 +407,7 @@ class nnInteractiveRemoteInferenceSession:
         include_interaction: bool,
         run_prediction: bool = True,
         override_capability_checks: bool = False,
-    ) -> None:
+    ) -> Optional[List[List[int]]]:
         resp = self._post_json(
             PATH_ADD_POINT,
             {
@@ -409,6 +418,7 @@ class nnInteractiveRemoteInferenceSession:
             },
         )
         self._apply_prediction_response(resp)
+        return self._last_paste_bbox
 
     def add_scribble_interaction(
         self,
@@ -417,8 +427,8 @@ class nnInteractiveRemoteInferenceSession:
         run_prediction: bool = True,
         override_capability_checks: bool = False,
         interaction_bbox: Optional[List[List[int]]] = None,
-    ) -> None:
-        self._post_mask_interaction(
+    ) -> Optional[List[List[int]]]:
+        return self._post_mask_interaction(
             PATH_ADD_SCRIBBLE,
             scribble_image,
             include_interaction,
@@ -434,8 +444,8 @@ class nnInteractiveRemoteInferenceSession:
         run_prediction: bool = True,
         override_capability_checks: bool = False,
         interaction_bbox: Optional[List[List[int]]] = None,
-    ) -> None:
-        self._post_mask_interaction(
+    ) -> Optional[List[List[int]]]:
+        return self._post_mask_interaction(
             PATH_ADD_LASSO,
             lasso_image,
             include_interaction,
@@ -452,7 +462,7 @@ class nnInteractiveRemoteInferenceSession:
         run_prediction: bool,
         override_capability_checks: bool,
         interaction_bbox: Optional[List[List[int]]],
-    ) -> None:
+    ) -> Optional[List[List[int]]]:
         meta = {
             "include_interaction": bool(include_interaction),
             "run_prediction": bool(run_prediction),
@@ -464,13 +474,14 @@ class nnInteractiveRemoteInferenceSession:
             path, meta, pack_array(mask_image, filters=[blosc2.Filter.NOFILTER], nthreads=_compression_threads())
         )
         self._apply_prediction_response(resp)
+        return self._last_paste_bbox
 
     def add_initial_seg_interaction(
         self,
         initial_seg: np.ndarray,
         run_prediction: bool = False,
         override_capability_checks: bool = False,
-    ) -> None:
+    ) -> Optional[List[List[int]]]:
         # Mirror the local session: target_buffer is overwritten with initial_seg
         # before any prediction runs. The server does this on its side; we mirror
         # it client-side so the user's buffer reflects the result immediately,
@@ -494,6 +505,7 @@ class nnInteractiveRemoteInferenceSession:
             pack_array(initial_seg, filters=[blosc2.Filter.NOFILTER], nthreads=_compression_threads()),
         )
         self._apply_prediction_response(resp)
+        return self._last_paste_bbox
 
     # ------------------------------------------------------------------ #
     #                          Lifecycle                                 #
