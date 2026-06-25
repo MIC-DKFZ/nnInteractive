@@ -95,10 +95,26 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 ```
 
 ##### 3. Install this repository
-Either install via pip:
-`pip install nninteractive`
 
-Or clone and install this repository:
+The default install is the **full local + server stack** (in-process inference engine
+*and* the official server):
+
+```bash
+pip install nnInteractive
+```
+
+> [!TIP]
+> **Lightweight, torch-free remote client.** If a machine only needs to *talk to* a remote
+> `nninteractive-server` (via `nnInteractiveRemoteInferenceSession`) and you want to avoid
+> pulling torch / nnU-Net, install the wire stack only with `--no-deps`:
+> ```bash
+> pip install --no-deps nnInteractive
+> pip install numpy httpx blosc2          # the [client] extra's dependency set
+> ```
+> (Pip extras can only *add*, so `nnInteractive[client]` cannot make the normal install
+> lighter — use `--no-deps` for the torch-free client.)
+
+Or clone and install from source:
 ```bash
 git clone https://github.com/MIC-DKFZ/nnInteractive
 cd nnInteractive

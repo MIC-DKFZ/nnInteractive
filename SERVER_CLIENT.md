@@ -27,9 +27,17 @@ concurrency / session model, and common deployment gotchas.
 
 ## Installation
 
-The server and client dependencies (`fastapi`, `uvicorn`, `httpx`) ship with the
-base package, so a single `pip install nnInteractive` covers both roles on the
-GPU machine and the GUI machine.
+- **GPU / server machine:** `pip install nnInteractive` — the default install includes torch,
+  nnU-Net, fastapi and uvicorn, and provides the `nninteractive-server` entry point.
+- **GUI / client machine (lightweight, torch-free):** install the wire stack only with
+  `--no-deps`:
+  ```bash
+  pip install --no-deps nnInteractive
+  pip install numpy httpx blosc2
+  ```
+  This is enough for `nnInteractiveRemoteInferenceSession` and avoids pulling torch / nnU-Net.
+  (Pip extras only add dependencies, so `nnInteractive[client]` cannot make the normal install
+  lighter; it just documents the wire deps used above.)
 
 ## Starting the server
 

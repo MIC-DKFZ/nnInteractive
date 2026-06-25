@@ -1,6 +1,6 @@
 [project]
 name = "nnInteractive"
-version = "2.4.0"
+version = "2.5.0"
 requires-python = ">=3.10"
 description = "Inference code for nnInteractive"
 readme = "readme.md"
@@ -30,6 +30,10 @@ keywords = [
     'nnunet'
 ]
 dependencies = [
+    # Default install is the full local + server stack (in-process inference engine
+    # AND the official server). For a lightweight, torch-free REMOTE client, install
+    # only the wire deps with --no-deps (see the [client] extra and readme.md):
+    #   pip install --no-deps nnInteractive numpy httpx blosc2
     "nnunetv2>=2.7.0",
     "torch>=2.1.2,!=2.9.*",
     "acvl-utils>=0.2.3,<0.3",  # 0.3 may bring breaking changes. Careful!
@@ -39,6 +43,7 @@ dependencies = [
     "httpx>=0.27",
     "blosc2",  # array (de)serialization on the client/server wire
     "huggingface_hub",  # model manifest discovery + checkpoint downloads (model_management)
+    "numpy",
 ]
 
 [project.urls]
@@ -50,11 +55,15 @@ dev = [
     "ruff",
     "pre-commit"
 ]
-# Everything the remote client needs is already in the base dependencies
-# (httpx, blosc2, numpy via nnunetv2). This extra exists so that
-# ``pip install nnInteractive[client]`` is a valid, self-documenting way to ask
-# for the client role; it pins the wire dependencies explicitly.
+# Wire-only dependency set for a lightweight, torch-free REMOTE client. The base
+# install already includes these, so installing this extra normally does NOT make
+# the install lighter (pip extras only add). It documents the exact deps a torch-free
+# client needs and is intended for use with --no-deps, e.g. when embedding the remote
+# client in a host with its own torch policy (such as 3D Slicer):
+#   pip install --no-deps nnInteractive
+#   pip install numpy httpx blosc2
 client = [
+    "numpy",
     "httpx>=0.27",
     "blosc2",
 ]

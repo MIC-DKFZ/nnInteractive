@@ -17,7 +17,14 @@ from typing import List, Optional, Tuple, Union
 import blosc2
 import httpx
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:
+    # torch is an optional dependency for the lightweight client role
+    # (`pip install nnInteractive[client]`). It is only needed when the caller
+    # uses a torch.Tensor target buffer; numpy buffers work without it.
+    torch = None
 
 from nnInteractive.inference.remote._protocol import (
     CONTENT_TYPE_OCTET_STREAM,
@@ -90,8 +97,8 @@ def _extract_detail(resp: httpx.Response) -> Optional[str]:
     return None
 
 
-def _buffer_dtype_str(target_buffer: Union[np.ndarray, torch.Tensor]) -> str:
-    if isinstance(target_buffer, torch.Tensor):
+def _buffer_dtype_str(target_buffer: Union[np.ndarray, "torch.Tensor"]) -> str:
+    if torch is not None and isinstance(target_buffer, torch.Tensor):
         return str(target_buffer.dtype).replace("torch.", "")
     return str(np.dtype(target_buffer.dtype))
 
@@ -230,7 +237,7 @@ class nnInteractiveRemoteInferenceSession:
         self.supports_undo: bool = bool(caps.get("supports_undo", False))
 
         self.original_image_shape: Optional[Tuple[int, ...]] = None
-        self.target_buffer: Union[np.ndarray, torch.Tensor, None] = None
+        self.target_buffer: Union[np.ndarray, "torch.Tensor", None] = None
         # Bbox (clipped, in target-buffer coordinates) of the region the most recent prediction
         # wrote into target_buffer, mirrored from the server response. None when nothing was
         # written. Mirrors the local session's API so callers get the changed region either way.
@@ -316,7 +323,7 @@ class nnInteractiveRemoteInferenceSession:
     def _write_bbox_into_target_buffer(self, diff: np.ndarray, bbox: List[List[int]]) -> None:
         slicer = tuple(slice(int(lb), int(ub)) for lb, ub in bbox)
         tb = self.target_buffer
-        if isinstance(tb, torch.Tensor):
+        if torch is not None and isinstance(tb, torch.Tensor):
             t = torch.from_numpy(diff).to(device=tb.device, dtype=tb.dtype)
             tb[slicer] = t
         else:
@@ -353,7 +360,7 @@ class nnInteractiveRemoteInferenceSession:
         info = resp.json()
         self.original_image_shape = tuple(info["original_image_shape"])
 
-    def set_target_buffer(self, target_buffer: Union[np.ndarray, torch.Tensor]) -> None:
+    def set_target_buffer(self, target_buffer: Union[np.ndarray, "torch.Tensor"]) -> None:
         self.target_buffer = target_buffer
         self._post_json(
             PATH_SET_TARGET_BUFFER,
@@ -371,7 +378,7 @@ class nnInteractiveRemoteInferenceSession:
         if self.target_buffer is not None:
             if isinstance(self.target_buffer, np.ndarray):
                 self.target_buffer.fill(0)
-            elif isinstance(self.target_buffer, torch.Tensor):
+            elif torch is not None and isinstance(self.target_buffer, torch.Tensor):
                 self.target_buffer.zero_()
         self._post_json(PATH_RESET_INTERACTIONS, {})
 
@@ -487,7 +494,7 @@ class nnInteractiveRemoteInferenceSession:
         # it client-side so the user's buffer reflects the result immediately,
         # without needing to ship initial_seg back over the wire.
         if self.target_buffer is not None:
-            if isinstance(self.target_buffer, torch.Tensor):
+            if torch is not None and isinstance(self.target_buffer, torch.Tensor):
                 self.target_buffer[:] = torch.from_numpy(initial_seg).to(
                     device=self.target_buffer.device, dtype=self.target_buffer.dtype
                 )
