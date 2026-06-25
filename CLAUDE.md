@@ -9,8 +9,11 @@ nnInteractive is a 3D interactive medical image segmentation framework. It suppo
 ## Build & Development Commands
 
 ```bash
-# Install from source (editable)
-pip install -e .
+# Install from source (editable). This repo builds TWO distributions that share the
+# `nnInteractive` namespace (see "Two-distribution layout" below): the torch-free client
+# must be installed first because the full package depends on it.
+pip install -e ./client   # nninteractive-client (torch-free wire client)
+pip install -e .          # nnInteractive (full stack; depends on the client)
 
 # Install with dev tools
 pip install -e ".[dev]"
@@ -31,6 +34,38 @@ pre-commit run --all-files
 There is no test suite in this repository.
 
 ## Architecture
+
+### Two-distribution layout (full package + lightweight client)
+
+The repo builds **two pip distributions** that share the single `nnInteractive` import namespace:
+
+- **`nninteractive-client`** — source under `client/`. Ships *only* `nnInteractive.inference.remote`
+  (the torch-free remote client + the shared wire protocol/serialization). Depends on just
+  `numpy`, `httpx`, `blosc2`. Built from `client/pyproject.toml`.
+- **`nnInteractive`** (full) — source at the repo root. Ships everything else (local engine,
+  server, model management, …) and **depends on `nninteractive-client`**. Built from the root
+  `pyproject.toml`.
+
+How the shared namespace works:
+- `nnInteractive` and `nnInteractive.inference` are **PEP 420 namespace packages** — neither
+  has an `__init__.py`; the two distributions populate disjoint files into the same directory.
+  Both builds therefore use `namespaces = true`, and the full build `exclude`s
+  `nnInteractive.inference.remote*` (client-owned) and `nnInteractive.supervoxel*` (separate
+  package). **Do not add an `__init__.py` to either of those two dirs** — it would make the two
+  distributions ship the same file and break the clean split.
+- Because the layout is layered (disjoint files, full *depends on* client), the two coexist
+  cleanly: `pip install nnInteractive` pulls the client; uninstalling the client leaves the full
+  install intact; a client-only machine upgrades with `pip install nnInteractive` (no uninstall).
+- There is **no `nnInteractive.__version__`** (namespace package has no module to carry it).
+  Read the version via `importlib.metadata.version("nnInteractive")` /
+  `version("nninteractive-client")`. `nnInteractiveInferenceSession.INFERENCE_SESSION_VERSION`
+  does exactly this.
+- Full-only imports from a client-only install raise a friendly "`pip install nnInteractive`"
+  error via a last-resort `sys.meta_path` finder registered in
+  `client/nnInteractive/inference/remote/_full_required.py` (installed when the remote client is
+  imported). It is a no-op when the full package is present.
+- The full server (`server/app.py`) imports the wire serialization from
+  `nnInteractive.inference.remote.serialization`, which is now provided by the client dependency.
 
 ### Core Class: `nnInteractiveInferenceSession` (`nnInteractive/inference/inference_session.py`)
 

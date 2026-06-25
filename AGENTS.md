@@ -11,9 +11,10 @@
 Top-level docs include `readme.md`, `SERVER_CLIENT.md`, and `API_CHANGES_v2.md`. Documentation images live in `imgs/`.
 
 ## Build, Test, and Development Commands
-- `pip install -e .`: install the full local inference and server stack in editable mode.
+The repo builds two distributions sharing the `nnInteractive` namespace: `nninteractive-client` (torch-free remote client, source under `client/`) and `nnInteractive` (full stack, root; depends on the client). See "Two-distribution layout" in `CLAUDE.md`.
+- `pip install -e ./client && pip install -e .`: editable dev install (client first, then the full stack which depends on it).
 - `pip install -e ".[dev]"`: add Black, Ruff, and pre-commit tooling.
-- `pip install --no-deps nnInteractive && pip install numpy httpx blosc2`: install the lightweight torch-free remote client stack.
+- `pip install nninteractive-client`: install only the lightweight torch-free remote client (no torch / nnU-Net). `pip install nnInteractive` installs the full stack and pulls the client in automatically.
 - `nninteractive-server --model-dir /path/to/checkpoint --fold all --host 0.0.0.0 --port 1527 --device cuda:0`: run the inference server.
 - `black nnInteractive/`: format Python code; the pre-commit hook uses line length 120.
 - `ruff check nnInteractive/ --fix`: lint and apply safe fixes.

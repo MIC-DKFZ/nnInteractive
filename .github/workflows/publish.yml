@@ -1,16 +1,26 @@
 name: Publish to PyPI
 
-# Build an sdist + wheel and upload them to PyPI whenever a version tag is
-# pushed (e.g. `git tag v2.3.0 && git push origin v2.3.0`).
+# Build an sdist + wheel for BOTH distributions in this repo and upload them to
+# PyPI whenever a version tag is pushed (e.g. `git tag v2.6.0 && git push origin v2.6.0`):
+#   - nninteractive-client  (source under ./client; torch-free remote client)
+#   - nnInteractive         (full stack at repo root; depends on nninteractive-client)
 #
-# The published version comes from `version` in pyproject.toml, NOT from the
-# tag. The "Verify tag matches package version" step below fails the run if the
-# tag and pyproject version disagree, so you can't accidentally publish a
-# mismatched version.
+# The published versions come from `version` in each pyproject.toml, NOT from the
+# tag. The "Verify tag" step fails the run if EITHER package's version disagrees
+# with the tag, so the two are always published in lockstep and can't be mismatched.
+#
+# The client is published FIRST, so that `pip install nnInteractive` (which depends
+# on nninteractive-client) is resolvable the moment the full package appears.
 #
 # Authentication uses PyPI Trusted Publishing (OIDC) — no API token / secret is
-# stored in the repo. See the repo README / release docs for the one-time PyPI
-# setup. To use an API token instead, see the commented block at the bottom.
+# stored in the repo. BOTH projects must have a Trusted Publisher configured for
+# this repo + workflow file `publish.yml`:
+#   - nnInteractive: already configured.
+#   - nninteractive-client: add a *pending publisher* at
+#     https://pypi.org/manage/account/publishing/ (the project does not exist yet);
+#     the first run below creates it and binds the publisher.
+# If you ever add a GitHub `environment:` to the job, both PyPI publisher configs
+# must list the same environment name.
 
 on:
   push:
@@ -23,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       # Required for PyPI Trusted Publishing (OIDC). This is what lets the job
-      # mint a short-lived token instead of using a stored secret.
+      # mint short-lived tokens instead of using a stored secret.
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -33,27 +43,54 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify tag matches package version
+      - name: Verify tag matches both versions and the client pin
         run: |
-          PKG_VERSION="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          echo "Tag: $TAG_VERSION   pyproject version: $PKG_VERSION"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Tag '$GITHUB_REF_NAME' does not match pyproject.toml version '$PKG_VERSION'. Bump the version before tagging."
-            exit 1
-          fi
+          python - "$GITHUB_REF_NAME" <<'PY'
+          import re, sys, tomllib
+          tag = sys.argv[1].removeprefix("v")
+          full = tomllib.load(open("pyproject.toml", "rb"))["project"]
+          client = tomllib.load(open("client/pyproject.toml", "rb"))["project"]
+          errs = []
+          if full["version"] != tag:
+              errs.append(f"pyproject.toml version {full['version']!r} != tag {tag!r}")
+          if client["version"] != tag:
+              errs.append(f"client/pyproject.toml version {client['version']!r} != tag {tag!r}")
+          # nnInteractive pins nninteractive-client in lockstep; the pin must match the tag too.
+          pin = next((d for d in full["dependencies"]
+                      if re.match(r"\s*nninteractive-client", d, re.I)), None)
+          if pin is None:
+              errs.append("nnInteractive does not depend on nninteractive-client")
+          elif pin.replace(" ", "") != f"nninteractive-client=={tag}":
+              errs.append(f"client pin {pin!r} != 'nninteractive-client=={tag}' (bump the pin in lockstep)")
+          for e in errs:
+              print(f"::error::Tag '{sys.argv[1]}': {e}")
+          if errs:
+              sys.exit(1)
+          print(f"OK: both versions and the client pin are {tag}")
+          PY
 
-      - name: Build sdist and wheel
+      - name: Build both distributions
         run: |
           python -m pip install --upgrade pip build
-          python -m build
+          python -m build --outdir dist-client ./client
+          python -m build --outdir dist-full   .
 
-      - name: Publish to PyPI
+      # Publish the client FIRST (the full package depends on it). Each publish
+      # step mints its own OIDC token scoped to the project in its packages-dir.
+      - name: Publish nninteractive-client to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # Trusted Publishing: no `with: password` needed.
-        #
-        # --- API-token alternative -------------------------------------------
-        # Remove the `permissions: id-token: write` block above and uncomment:
-        # with:
-        #   password: ${{ secrets.PYPI_API_TOKEN }}
-        # ---------------------------------------------------------------------
+        with:
+          packages-dir: dist-client/
+
+      - name: Publish nnInteractive to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-full/
+
+# --- API-token alternative (not used; here for reference) --------------------
+# Remove the `permissions: id-token: write` block above and pass a token per
+# publish step instead, e.g.:
+#   with:
+#     packages-dir: dist-client/
+#     password: ${{ secrets.PYPI_API_TOKEN_CLIENT }}
+# ----------------------------------------------------------------------------

@@ -166,7 +166,9 @@ def pack_array(
     for i in range(nchunks):
         start = i * _CHUNK_SIZE
         end = min(start + _CHUNK_SIZE, total)
-        chunk = blosc2.compress2(raw[start:end], typesize=typesize, codec=codec, clevel=clevel, filters=filters, **extra)
+        chunk = blosc2.compress2(
+            raw[start:end], typesize=typesize, codec=codec, clevel=clevel, filters=filters, **extra
+        )
         parts.append(struct.pack("<QQ", end - start, len(chunk)))
         parts.append(chunk)
     return b"".join(parts)

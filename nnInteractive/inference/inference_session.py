@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import version as _package_version
 import os
 import sys
 from os import cpu_count
@@ -20,7 +21,6 @@ from torch import nn
 from torch._dynamo import OptimizedModule
 from torch.nn.functional import interpolate
 
-import nnInteractive
 from nnInteractive.interaction.point import PointInteraction_stub
 from nnInteractive.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
 from nnInteractive.utils.bboxes import generate_bounding_boxes
@@ -36,7 +36,11 @@ from nnInteractive.utils.rounding import round_to_nearest_odd
 
 
 class nnInteractiveInferenceSession:
-    INFERENCE_SESSION_VERSION = nnInteractive.__version__
+    # The session version IS the installed nnInteractive package version (used for
+    # checkpoint compatibility checks and reported to remote clients). `nnInteractive`
+    # is a PEP 420 namespace package (no __init__ to carry __version__), so read it
+    # from the distribution metadata instead.
+    INFERENCE_SESSION_VERSION = _package_version("nnInteractive")
     # Single-level undo of the last interaction is always available (see undo()).
     supports_undo: bool = True
     REFINEMENT_CACHE_GPU_HEADROOM_BYTES = 4 * 1024**3
@@ -1798,8 +1802,14 @@ class nnInteractiveInferenceSession:
             determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
             + self.num_interaction_channels
         )
+        # Locate the trainer dir via the trainer subpackage itself. `nnInteractive` is a PEP 420
+        # namespace package, so `nnInteractive.__path__[0]` is order-dependent and may point at the
+        # client distribution's portion (which has no trainer/); `nnInteractive.trainer` is a real
+        # subpackage with a single, unambiguous path.
+        import nnInteractive.trainer
+
         trainer_class = recursive_find_python_class(
-            join(nnInteractive.__path__[0], "trainer"), trainer_name, "nnInteractive.trainer"
+            nnInteractive.trainer.__path__[0], trainer_name, "nnInteractive.trainer"
         )
         if trainer_class is None:
             # fall back to looking for the trainer in nnunetv2

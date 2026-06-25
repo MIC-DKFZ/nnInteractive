@@ -70,11 +70,18 @@ standard for AI-driven interactive 3D segmentation.
 
 ## Installation
 
-### Prerequisites
+nnInteractive ships as **two pip packages — install only what you need:**
 
-You need a Linux or Windows computer with a Nvidia GPU. 10GB of VRAM is recommended. Small objects should work with \<6GB.
+- **`nninteractive-client`** — lightweight remote client that drives a remote
+  `nninteractive-server` (via `nnInteractiveRemoteInferenceSession`). **No PyTorch, no GPU** —
+  only `numpy` / `httpx` / `blosc2`. Ideal for a GUI or thin client.
+- **`nnInteractive`** — the full stack: the in-process inference engine *and* the official
+  server. Needs **PyTorch and an NVIDIA GPU** (10 GB VRAM recommended; small objects work with
+  \<6 GB). It depends on `nninteractive-client`, so it includes the remote client too.
 
-##### 1. Create a virtual environment:
+Both expose the same `nnInteractive` import namespace, so client code is identical either way.
+
+##### 1. Create a virtual environment
 
 nnInteractive supports Python 3.10+ and works with Conda, pip, or any other virtual environment. Here’s an example using Conda:
 
@@ -83,43 +90,74 @@ conda create -n nnInteractive python=3.12
 conda activate nnInteractive
 ```
 
-##### 2. Install the correct PyTorch for your system
+##### 2a. Lightweight remote client (no PyTorch, no GPU)
 
-Go to the [PyTorch homepage](https://pytorch.org/get-started/locally/) and pick the right configuration.
-Note that since recently PyTorch needs to be installed via pip. This is fine to do within your conda environment.
+If this machine only needs to *talk to* a remote `nninteractive-server`, install just the client:
 
-For Ubuntu with a Nvidia GPU, pick 'stable', 'Linux', 'Pip', 'Python', 'CUDA12.6' (if all drivers are up to date, otherwise use and older version):
+```bash
+pip install nninteractive-client
+```
+
+That's it — no PyTorch step required. You can upgrade to the full stack later with
+`pip install nnInteractive` (no uninstall needed); using a full-only feature (local inference,
+the server) from a client-only install raises a clear error telling you to do so.
+
+##### 2b. Full stack (local inference + server, needs an NVIDIA GPU)
+
+**First** install the correct PyTorch for your system — PyTorch is only needed for this full
+install. Go to the [PyTorch homepage](https://pytorch.org/get-started/locally/) and pick the
+right configuration. For Ubuntu with an NVIDIA GPU and up-to-date drivers, pick 'stable',
+'Linux', 'Pip', 'Python', 'CUDA 12.6' (use an older CUDA if your drivers are older):
 
 ```
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 
-##### 3. Install this repository
-
-The default install is the **full local + server stack** (in-process inference engine
-*and* the official server):
+**Then** install nnInteractive (this also pulls in the remote client):
 
 ```bash
 pip install nnInteractive
 ```
 
-> [!TIP]
-> **Lightweight, torch-free remote client.** If a machine only needs to *talk to* a remote
-> `nninteractive-server` (via `nnInteractiveRemoteInferenceSession`) and you want to avoid
-> pulling torch / nnU-Net, install the wire stack only with `--no-deps`:
-> ```bash
-> pip install --no-deps nnInteractive
-> pip install numpy httpx blosc2          # the [client] extra's dependency set
-> ```
-> (Pip extras can only *add*, so `nnInteractive[client]` cannot make the normal install
-> lighter — use `--no-deps` for the torch-free client.)
+##### Editable / development install (from source)
 
-Or clone and install from source:
+This repository builds **two distributions that share the `nnInteractive` import namespace**
+(via [PEP 420 namespace packages](https://peps.python.org/pep-0420/)):
+
+- **`nninteractive-client`** — the torch-free remote client (`nnInteractive.inference.remote`),
+  with its source under `client/`;
+- **`nnInteractive`** — the full local + server stack, which **depends on** `nninteractive-client`.
+
+Because of that, an editable checkout means installing **both, client first**:
+
 ```bash
 git clone https://github.com/MIC-DKFZ/nnInteractive
 cd nnInteractive
-pip install -e .
+
+# Recommended: clean slate first, so an older pre-split install can't shadow the
+# namespace packages (see the first gotcha below).
+pip uninstall -y nnInteractive nninteractive-client
+
+pip install -e ./client   # nninteractive-client (torch-free wire client)
+pip install -e .          # nnInteractive (full stack; depends on the client)
 ```
+
+**Order matters:** installing the editable client *first* satisfies the full package's
+dependency from your working tree, so `pip install -e .` will not try to download
+`nninteractive-client` from PyPI. If you only develop the remote client, `pip install -e ./client`
+on its own is enough (and stays torch-free).
+
+> [!IMPORTANT]
+> Two consequences of the namespace-package split that can bite during development:
+> - **Do not leave an old, pre-split `nnInteractive` installed.** A monolithic install ships a
+>   real `nnInteractive/__init__.py`, which makes `nnInteractive` a *regular* package and
+>   **shadows** the editable namespace portions — `import nnInteractive.inference.remote` then
+>   fails even though your editable install succeeded. The `pip uninstall` above avoids this.
+> - **Editable installs only take effect at interpreter startup.** They work via an import
+>   finder registered in a `.pth` file that Python reads when it starts, *not* when you run
+>   `pip`. After an editable (re)install, **restart any already-running interpreter** (a Slicer
+>   Python console, a Jupyter kernel, …) — otherwise it won't see the package, and
+>   `importlib.invalidate_caches()` will not help.
 
 ## Getting Started
 Here is a minimalistic script that covers the core functionality of nnInteractive:
@@ -140,20 +178,28 @@ import SimpleITK as sitk
 # are stored under $NNINTERACTIVE_MODEL_DIR (default: ~/.nninteractive).
 from nnInteractive.model_management import ensure_model_available, get_default_model_id
 
-model_id = get_default_model_id()              # e.g. "nnInteractive_v1.0"
-model_path = ensure_model_available(model_id)  # downloads on first use; returns the folder
+# Use the recommended model — i.e. the manifest's default. Don't hard-code a version here, so you
+# automatically track whatever is currently recommended:
+model_id = get_default_model_id()              # resolves to the recommended id, e.g. "nnInteractive_v1.0"
+# To pin a specific model instead, set its id by name (see the ids from
+# `nninteractive-available-models` or nnInteractive.model_management.list_models()):
+#   model_id = "nnInteractive_v1.0"
 
-# (You can also list models programmatically via nnInteractive.model_management.list_models(),
-# or from the shell: `nninteractive-available-models` / `nninteractive-download-model`.)
+# Resolve the id to a local folder: downloads on first use, reuses it afterwards (offline-friendly).
+model_path = ensure_model_available(model_id)
+# ...later passed to the session via session.initialize_from_trained_model_folder(str(model_path)).
 
 # --- Initialize Inference Session ---
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
 
 session = nnInteractiveInferenceSession(
     device=torch.device("cuda:0"),  # Set inference device
-    use_torch_compile=False,  # Experimental: Not tested yet
+    use_torch_compile=False,  # Compiles the net for faster predictions. The one-time (slow) compile
+                              # is paid during initialize_from_trained_model_folder() below (it warms
+                              # up automatically), NOT on your first prompt. Worth it for long-lived
+                              # processes (the server enables it by default) or longer sessions.
     verbose=False,
-    torch_n_threads=os.cpu_count(),  # Use available CPU cores
+    torch_n_threads=os.cpu_count(),  # Use available CPU cores, cap this if your system has a gigantic CPU (64+ cores)
     do_autozoom=True,  # Enables AutoZoom for better patching
 )
 
@@ -179,12 +225,24 @@ target_tensor = torch.zeros(img.shape[1:], dtype=torch.uint8)  # Must be 3D (x, 
 session.set_target_buffer(target_tensor)
 
 # --- Interacting with the Model ---
-# Interactions can be freely chained and mixed in any order. Each interaction refines the segmentation.
-# The model updates the segmentation mask in the target buffer after every interaction.
+# Interactions can be freely chained and mixed in any order. Each interaction refines the
+# segmentation, and the model writes the updated mask straight into your target buffer
+# (in place) after every interaction — you never have to fetch anything back.
+#
+# Normally you just read the target buffer directly (see "Retrieve Results" below). The only
+# reason to look at the return value is if you must propagate the update into your OWN structure
+# (a GUI's label layer, a separate array, ...) and want to avoid copying the whole volume every
+# time: each add_*_interaction(..., run_prediction=True) RETURNS the bounding box of the region it
+# changed, as [[x1, x2], [y1, y2], [z1, z2]] in target-buffer coordinates (None if nothing changed
+# / run_prediction=False), so you can copy just that sub-volume.
 
 # Example: Add a **positive** point interaction
 # POINT_COORDINATES should be a tuple (x, y, z) specifying the point location.
-session.add_point_interaction(POINT_COORDINATES, include_interaction=True)
+changed_bbox = session.add_point_interaction(POINT_COORDINATES, include_interaction=True)
+# Only needed if you mirror the result elsewhere (otherwise ignore it and read target_tensor):
+# if changed_bbox is not None:
+#     (x1, x2), (y1, y2), (z1, z2) = changed_bbox
+#     my_label_volume[x1:x2, y1:y2, z1:z2] = target_tensor[x1:x2, y1:y2, z1:z2]
 
 # Example: Add a **negative** point interaction
 # To make any interaction negative set include_interaction=False
@@ -242,17 +300,19 @@ session.add_lasso_interaction(
 # The model refines the segmentation result incrementally with each new interaction.
 
 # --- Retrieve Results ---
-# The target buffer holds the segmentation result.
-results = session.target_buffer.clone()
-# OR (equivalent)
-results = target_tensor.clone()
+# The result already lives in your target buffer: target_tensor IS session.target_buffer (the
+# same object, written in place). So just read it — no copy needed to inspect it or save it:
+result_np = target_tensor.cpu().numpy()
+# sitk.WriteImage(sitk.GetImageFromArray(result_np), "segmentation.nii.gz")
 
-# Cloning is required because the buffer will be **reused** for the next object.
-# Alternatively, set a new target buffer for each object:
-session.set_target_buffer(torch.zeros(img.shape[1:], dtype=torch.uint8))
+# You only need a COPY if you want to keep this result in memory while you reuse the buffer for
+# the next object, because reset_interactions() / reusing the buffer overwrites it in place:
+# saved = target_tensor.clone()        # torch  (numpy buffer: target_tensor.copy())
 
 # --- Start a New Object Segmentation ---
 session.reset_interactions()  # Clears the target buffer and resets interactions
+# (Alternatively, give each object its own fresh buffer instead of resetting:)
+# session.set_target_buffer(torch.zeros(img.shape[1:], dtype=torch.uint8))
 
 # Now you can start segmenting the next object in the image.
 
@@ -269,29 +329,41 @@ session.set_target_buffer(torch.zeros(NEW_IMAGE.shape[1:], dtype=torch.uint8))
 If the machine running your GUI does not have a powerful GPU, you can run the
 model on a remote box and drive it over HTTP with
 **`nnInteractiveRemoteInferenceSession`** — a drop-in replacement with the same
-public API as the local session. The server loads the model once at startup and
-hosts multiple concurrent client sessions; each client keeps its own image,
-target buffer, and interaction state.
+public API as the local session.
 
-Start the server on the GPU box:
+> [!IMPORTANT]
+> **The client needs a server to talk to.** `nnInteractiveRemoteInferenceSession` does nothing
+> on its own — it requires an `nninteractive-server` **already running on a (GPU) machine you can
+> reach over the network**. Constructing the session connects immediately and raises if the
+> server is unreachable. The lightweight `pip install nninteractive-client` only makes sense in
+> this setup; if you have no server to connect to, use the local session shown above instead.
+
+The server loads the model once at startup and hosts multiple concurrent client sessions; each
+client keeps its own image, target buffer, and interaction state.
+
+Start the server on the GPU box (it downloads the model by name on first use; see
+[`SERVER_CLIENT.md`](SERVER_CLIENT.md) for listing/downloading models and where they are stored):
 
 ```bash
 nninteractive-server \
-    --model-dir /path/to/checkpoint_folder --fold all \
+    --model nnInteractive_v1.0 \
     --host 0.0.0.0 --port 1527 \
     --api-key "$(openssl rand -hex 32)"
 ```
 
-And in the client code, swap the local session for the remote one:
+Then, in the client code, swap the local session for the remote one. No model download or
+`initialize_from_trained_model_folder()` is needed — the server already loaded the model:
 
 ```python
 from nnInteractive.inference.remote import nnInteractiveRemoteInferenceSession
 
+# Requires the server above to be running and reachable at this URL.
 session = nnInteractiveRemoteInferenceSession(
     server_url="http://gpu-box.lab:1527",
     api_key="…",
 )
-# From here on, the API is identical to nnInteractiveInferenceSession.
+# From here on, the API is identical to nnInteractiveInferenceSession
+# (set_image / set_target_buffer / add_*_interaction / ...).
 ```
 
 For full details — installation, authentication, single-user SSH-tunnel setup,

@@ -27,37 +27,75 @@ concurrency / session model, and common deployment gotchas.
 
 ## Installation
 
-- **GPU / server machine:** `pip install nnInteractive` — the default install includes torch,
-  nnU-Net, fastapi and uvicorn, and provides the `nninteractive-server` entry point.
-- **GUI / client machine (lightweight, torch-free):** install the wire stack only with
-  `--no-deps`:
-  ```bash
-  pip install --no-deps nnInteractive
-  pip install numpy httpx blosc2
-  ```
-  This is enough for `nnInteractiveRemoteInferenceSession` and avoids pulling torch / nnU-Net.
-  (Pip extras only add dependencies, so `nnInteractive[client]` cannot make the normal install
-  lighter; it just documents the wire deps used above.)
+There are two distributions, both providing the same `nnInteractive` import namespace:
+
+- **GPU / server machine:** `pip install nnInteractive` — the full stack: torch, nnU-Net,
+  fastapi and uvicorn, the in-process inference engine, and the `nninteractive-server` entry
+  point. It depends on `nninteractive-client`, so it also includes the remote client.
+- **GUI / client machine (lightweight, torch-free):** `pip install nninteractive-client` —
+  a separate, much smaller distribution that pulls in only the wire stack (`numpy`, `httpx`,
+  `blosc2`) and ships just `nnInteractive.inference.remote`. This is all
+  `nnInteractiveRemoteInferenceSession` needs and avoids pulling torch / nnU-Net.
+
+The two are layered, not mutually exclusive: the full package *depends on* the client and
+ships disjoint files, so they coexist cleanly. A client-only machine can be upgraded to the
+full stack at any time with `pip install nnInteractive` — no uninstall, no `--force-reinstall`.
+
+> **Client code is identical either way.** Both distributions expose
+> `from nnInteractive.inference.remote import nnInteractiveRemoteInferenceSession`, so a GUI
+> written against the remote session runs unchanged whether it has the lightweight client or
+> the full package installed. If a client-only install reaches for a full-only feature (local
+> inference, the server, `nninteractive-server`), it gets a clear error telling it to
+> `pip install nnInteractive`. (The `nninteractive-server` command is only provided by the
+> full package.)
+
+> **torch is optional for the client.** `nninteractive-client` does not depend on torch. The
+> remote session works with numpy `target_buffer`s out of the box, and transparently supports
+> `torch.Tensor` buffers too *if* torch happens to be importable in the host (e.g. 3D Slicer).
+
+## Models: list, download, use by name
+
+You don't have to hand the server a checkpoint folder — it can pull official models straight
+from the manifest and you select them **by name**. Models are stored under
+**`$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`)** and downloaded on first use.
+
+```bash
+# See which models exist and which are already downloaded
+nninteractive-available-models
+
+# Optionally pre-download one by id (the server also downloads on first use)
+nninteractive-download-model nnInteractive_v1.0
+```
+
+Both commands (and the server) honor `NNINTERACTIVE_MODEL_DIR` to change where models are
+stored, e.g. `export NNINTERACTIVE_MODEL_DIR=/data/nninteractive_models`.
+
+Use `--model-dir` only for a **custom / local checkpoint folder** that isn't in the manifest
+(and then also pass `--fold`).
 
 ## Starting the server
 
-The server takes the checkpoint path at startup and loads the model once;
-subsequent client requests reuse the loaded model.
+Start the server **by model name** with `--model`; it resolves the model at startup
+(downloading it on first use if needed), loads it once, and subsequent client requests reuse the
+loaded model. Omit `--model` to use the manifest's **default** model.
 
 ```bash
 nninteractive-server \
-    --model-dir /path/to/checkpoint_folder \
-    --fold all \
+    --model nnInteractive_v1.0 \
     --host 0.0.0.0 \
     --port 1527 \
     --device cuda:0 \
     --api-key "$(openssl rand -hex 32)"
 ```
 
+(To serve a custom checkpoint folder instead, swap `--model nnInteractive_v1.0` for
+`--model-dir /path/to/checkpoint_folder --fold all`.)
+
 | Flag | Description |
 |---|---|
-| `--model-dir` | Path to the trained model folder containing `inference_info.json` (or legacy `inference_session_class.json`), `plans.json`, `dataset.json`, and `fold_*/checkpoint_*.pth`. **Required.** |
-| `--fold` | `0`, `1`, …, or `all`. If omitted, the server auto-detects when exactly one `fold_*` folder is present. |
+| `--model` | Official model id from the manifest (e.g. `nnInteractive_v1.0`), downloaded on first use into `$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`). List ids with `nninteractive-available-models`. Mutually exclusive with `--model-dir`. **If neither `--model` nor `--model-dir` is given, the manifest's default model is used.** |
+| `--model-dir` | Path to a **custom** trained model folder containing `inference_info.json` (or legacy `inference_session_class.json`), `plans.json`, `dataset.json`, and `fold_*/checkpoint_*.pth`. Use this only for checkpoints not in the manifest. Mutually exclusive with `--model`; requires `--fold`. |
+| `--fold` | `0`, `1`, …, or `all`. Only relevant with `--model-dir`. If omitted, the server auto-detects when exactly one `fold_*` folder is present. |
 | `--checkpoint` | Checkpoint filename inside the fold folder. Default: `checkpoint_final.pth`. |
 | `--host` | Bind address. `127.0.0.1` (default) — local only; `0.0.0.0` — listen on all interfaces. |
 | `--port` | TCP port. Default: `1527`. |
@@ -341,7 +379,7 @@ Pick a strong, random key (anything 32+ random bytes is fine):
 
 ```bash
 export NN_INTERACTIVE_API_KEY="$(openssl rand -hex 32)"
-nninteractive-server --model-dir /path/to/checkpoint --fold all --host 0.0.0.0 --port 1527
+nninteractive-server --model nnInteractive_v1.0 --host 0.0.0.0 --port 1527
 # (alternatively: pass --api-key "$KEY" on the command line)
 ```
 
@@ -385,7 +423,7 @@ nobody else can claim a session anyway.
 
 ```bash
 nninteractive-server \
-    --model-dir /path/to/checkpoint --fold all \
+    --model nnInteractive_v1.0 \
     --host 127.0.0.1 --port 1527 \
     --max-sessions 1
 ```
@@ -418,7 +456,7 @@ your GPU, and set an API key:
 
 ```bash
 nninteractive-server \
-    --model-dir /path/to/checkpoint --fold all \
+    --model nnInteractive_v1.0 \
     --host 0.0.0.0 --port 1527 \
     --max-sessions 4 \
     --api-key "$(openssl rand -hex 32)"

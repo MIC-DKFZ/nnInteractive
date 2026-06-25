@@ -1,0 +1,56 @@
+[project]
+name = "nninteractive-client"
+version = "2.5.0"
+requires-python = ">=3.10"
+description = "Lightweight, torch-free remote client for nnInteractive (nnInteractiveRemoteInferenceSession)"
+readme = "readme.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Fabian Isensee", email = "f.isensee@dkfz-heidelberg.de"},
+    { name = "Helmholtz Imaging Applied Computer Vision Lab" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+keywords = [
+    'medical image segmentation',
+    'nnInteractive',
+    'remote inference client',
+]
+# Wire-only dependency set: enough to drive a remote nninteractive-server, with
+# no torch / nnU-Net. This is the whole point of the lightweight client — it can
+# be installed into a host that has its own torch policy (e.g. 3D Slicer) or onto
+# a thin client machine with no GPU.
+#
+# torch is intentionally NOT a dependency. The client works with numpy target
+# buffers out of the box; it transparently supports torch.Tensor buffers too, but
+# only if torch happens to already be importable in the host environment.
+dependencies = [
+    "numpy",
+    "httpx>=0.27",
+    "blosc2",  # array (de)serialization on the client/server wire
+]
+
+[project.urls]
+homepage = "https://github.com/MIC-DKFZ/nnInteractive"
+
+[build-system]
+requires = ["setuptools>=67.8.0"]
+build-backend = "setuptools.build_meta"
+
+# The client provides only the `nnInteractive.inference.remote` subtree. The two
+# parent packages (`nnInteractive`, `nnInteractive.inference`) are PEP 420
+# namespace packages shared with the full distribution, so neither ships an
+# __init__.py — that is why namespace discovery is required here.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nnInteractive*"]
+namespaces = true

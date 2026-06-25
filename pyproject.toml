@@ -30,18 +30,23 @@ keywords = [
     'nnunet'
 ]
 dependencies = [
-    # Default install is the full local + server stack (in-process inference engine
-    # AND the official server). For a lightweight, torch-free REMOTE client, install
-    # only the wire deps with --no-deps (see the [client] extra and readme.md):
-    #   pip install --no-deps nnInteractive numpy httpx blosc2
+    # Full install: the in-process inference engine AND the official server, on top
+    # of the complete torch / nnU-Net stack. It depends on `nninteractive-client`,
+    # which provides the torch-free remote client (`nnInteractive.inference.remote`)
+    # and the shared wire protocol/serialization; the two share the `nnInteractive`
+    # namespace via PEP 420 namespace packages.
+    #
+    # If you ONLY need to drive a remote server, install the lightweight client
+    # instead and skip torch entirely:
+    #   pip install nninteractive-client
+    "nninteractive-client==2.5.0",  # torch-free remote client + shared wire protocol (numpy/httpx/blosc2). Pinned in lockstep — bump together with this package's version.
     "nnunetv2>=2.7.0",
     "torch>=2.1.2,!=2.9.*",
     "acvl-utils>=0.2.3,<0.3",  # 0.3 may bring breaking changes. Careful!
     "batchgenerators>=0.25.1",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "httpx>=0.27",
-    "blosc2",  # array (de)serialization on the client/server wire
+    "blosc2",  # used directly by the local engine (point.py, crop.py, inference_session, server)
     "huggingface_hub",  # model manifest discovery + checkpoint downloads (model_management)
     "numpy",
 ]
@@ -54,18 +59,6 @@ dev = [
     "black",
     "ruff",
     "pre-commit"
-]
-# Wire-only dependency set for a lightweight, torch-free REMOTE client. The base
-# install already includes these, so installing this extra normally does NOT make
-# the install lighter (pip extras only add). It documents the exact deps a torch-free
-# client needs and is intended for use with --no-deps, e.g. when embedding the remote
-# client in a host with its own torch policy (such as 3D Slicer):
-#   pip install --no-deps nnInteractive
-#   pip install numpy httpx blosc2
-client = [
-    "numpy",
-    "httpx>=0.27",
-    "blosc2",
 ]
 
 [project.scripts]
@@ -85,3 +78,9 @@ skip = '.git,*.pdf,*.svg'
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nnInteractive*"]
+# `nnInteractive` and `nnInteractive.inference` are PEP 420 namespace packages
+# (no __init__.py) shared with the nninteractive-client distribution, so namespace
+# discovery is required. Exclude the client-owned remote subtree (shipped by
+# nninteractive-client) and the separately-packaged supervoxel module.
+namespaces = true
+exclude = ["nnInteractive.inference.remote*", "nnInteractive.supervoxel*"]
