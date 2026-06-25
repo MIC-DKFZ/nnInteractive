@@ -30,9 +30,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Run an nnInteractive inference server. The model is loaded once at startup.",
     )
     p.add_argument(
+        "--model",
+        default=None,
+        help="Official model id to serve (e.g. nnInteractive_v1.0). Resolved via the model "
+        "manifest and downloaded on first use into $NNINTERACTIVE_MODEL_DIR (default "
+        "~/.nninteractive). Run 'nninteractive-available-models' to list ids. Mutually "
+        "exclusive with --model-dir; if neither is given, the manifest's default model is used.",
+    )
+    p.add_argument(
         "--model-dir",
-        required=True,
-        help="Path to the trained model folder (contains fold_*/checkpoint_*.pth)",
+        default=None,
+        help="Path to a custom trained model folder (contains fold_*/checkpoint_*.pth). "
+        "Mutually exclusive with --model; requires --fold.",
     )
     p.add_argument("--fold", default=None, help="Fold to use (int, 'all', or omit to auto-detect)")
     p.add_argument(
@@ -78,11 +87,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-sessions",
         type=int,
-        default=1,
+        default=3,
         help="Maximum number of concurrent client sessions. Each session holds its own image, "
         "target buffer, and interaction state; the network module (and therefore its weights) "
         "is shared by reference across all sessions — exactly one copy on the GPU. Predictions "
-        "remain GPU-serialized across sessions. Default: 1.",
+        "remain GPU-serialized across sessions. Default: 3.",
     )
     p.add_argument(
         "--idle-timeout-seconds",
@@ -122,6 +131,38 @@ def _resolve_fold(raw: Optional[str]):
         return int(raw)
     except ValueError:
         raise SystemExit(f"--fold must be an integer or 'all', got {raw!r}")
+
+
+def _resolve_model_source(args) -> str:
+    """Return the local model directory to load, downloading an official model if needed.
+
+    * ``--model-dir``: a custom checkpoint folder; the user must also pass ``--fold``.
+    * ``--model``: an official model id, resolved/downloaded via the manifest.
+    * neither: the manifest's default model.
+    ``--model`` and ``--model-dir`` are mutually exclusive.
+    """
+    if args.model and args.model_dir:
+        raise SystemExit("Pass either --model (official id) or --model-dir (custom path), not both.")
+
+    if args.model_dir:
+        if args.fold is None:
+            raise SystemExit("--fold is required when --model-dir (a custom checkpoint folder) is given.")
+        return args.model_dir
+
+    # Official model by id (or the manifest default). Imported lazily so the import
+    # cost / network only happens on this path.
+    from nnInteractive.model_management import (
+        ensure_model_available,
+        get_default_model_id,
+        get_model_root_dir,
+    )
+
+    try:
+        model_id = args.model or get_default_model_id()
+        logger.info("Resolving official model '%s' (model root: %s)", model_id, get_model_root_dir())
+        return str(ensure_model_available(model_id))
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc))
 
 
 def _resolve_api_key(cli_value: Optional[str]) -> Optional[str]:
@@ -175,6 +216,9 @@ def main(argv=None) -> int:
             args.idle_timeout_seconds,
         )
 
+    # Resolve which model folder to serve (downloads an official model if needed).
+    model_dir = _resolve_model_source(args)
+
     # Load the model once into a "loader" session; we keep only the artifacts dict.
     loader = nnInteractiveInferenceSession(
         device=device,
@@ -185,12 +229,12 @@ def main(argv=None) -> int:
     )
     logger.info(
         "Loading checkpoint from %s (fold=%s, checkpoint=%s)",
-        args.model_dir,
+        model_dir,
         args.fold,
         args.checkpoint,
     )
     artifacts = loader._load_model_artifacts_from_disk(
-        model_training_output_dir=args.model_dir,
+        model_training_output_dir=model_dir,
         use_fold=_resolve_fold(args.fold),
         checkpoint_name=args.checkpoint,
     )

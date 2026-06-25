@@ -84,7 +84,7 @@ A trained model folder must contain:
 A trained model folder may also contain:
 - `LICENSE` — the model's license. **Only the first non-empty line is read** and exposed as `session.license` (a short identifier, e.g. `CC BY-NC-SA 4.0`); any following lines (URL, full license text, …) are for human readers and are ignored. If the file is absent the loader falls back to the official-checkpoint heuristic (`_is_official_checkpoint` → `CC BY-NC-SA 4.0`), otherwise it reports `!!MISSING!!`. The license is printed on load and surfaced over the remote `/capabilities` endpoint so GUIs can display it.
 
-Official weights are hosted on HuggingFace at `nnInteractive/nnInteractive`, model name `nnInteractive_v1.0`.
+Official weights are hosted on HuggingFace at `MIC-DKFZ/nnInteractive`. The selectable models are enumerated by a root-level `models.json` manifest; discovery/download is handled by `nnInteractive/model_management.py` (`list_models`, `ensure_model_available`, `get_default_model_id`), which stores models under `$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`). The default model is currently `nnInteractive_v1.0`.
 
 ### Key Modules
 

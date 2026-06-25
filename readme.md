@@ -112,23 +112,23 @@ Here is a minimalistic script that covers the core functionality of nnInteractiv
 import os
 import torch
 import SimpleITK as sitk
-from huggingface_hub import snapshot_download  # Install huggingface_hub if not already installed
 
-# --- Download Trained Model Weights (~400MB) ---
+# --- Download / locate the trained model weights (~400MB) ---
 # License reminder: The official nnInteractive checkpoint is licensed under
 # Creative Commons Attribution Non Commercial Share Alike 4.0 (CC BY-NC-SA 4.0).
-# See the License section of this readme!.
-REPO_ID = "nnInteractive/nnInteractive"
-MODEL_NAME = "nnInteractive_v1.0"  # Updated models may be available in the future
-DOWNLOAD_DIR = "/home/isensee/temp"  # Specify the download directory
+# See the License section of this readme!
+#
+# nnInteractive ships a small model-management API. It fetches the list of available
+# models from Hugging Face (MIC-DKFZ/nnInteractive), downloads only the selected one,
+# reuses it on later runs, and works offline once a model has been downloaded. Models
+# are stored under $NNINTERACTIVE_MODEL_DIR (default: ~/.nninteractive).
+from nnInteractive.model_management import ensure_model_available, get_default_model_id
 
-download_path = snapshot_download(
-    repo_id=REPO_ID,
-    allow_patterns=[f"{MODEL_NAME}/*"],
-    local_dir=DOWNLOAD_DIR
-)
+model_id = get_default_model_id()              # e.g. "nnInteractive_v1.0"
+model_path = ensure_model_available(model_id)  # downloads on first use; returns the folder
 
-# The model is now stored in DOWNLOAD_DIR/MODEL_NAME.
+# (You can also list models programmatically via nnInteractive.model_management.list_models(),
+# or from the shell: `nninteractive-available-models` / `nninteractive-download-model`.)
 
 # --- Initialize Inference Session ---
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
@@ -142,8 +142,7 @@ session = nnInteractiveInferenceSession(
 )
 
 # Load the trained model
-model_path = os.path.join(DOWNLOAD_DIR, MODEL_NAME)
-session.initialize_from_trained_model_folder(model_path)
+session.initialize_from_trained_model_folder(str(model_path))
 
 # --- Load Input Image (Example with SimpleITK) ---
 # DO NOT preprocess the image in any way. Give it to nnInteractive as it is! DO NOT apply level window, DO NOT normalize 
@@ -309,7 +308,7 @@ Link: [![arXiv](https://img.shields.io/badge/arXiv-2503.08373-b31b1b.svg)](https
 
 
 # License
-Note that while this repository is available under Apache-2.0 license (see [LICENSE](./LICENSE)), the [model checkpoint](https://huggingface.co/nnInteractive/nnInteractive) is `Creative Commons Attribution Non Commercial Share Alike 4.0`! 
+Note that while this repository is available under Apache-2.0 license (see [LICENSE](./LICENSE)), the [model checkpoint](https://huggingface.co/MIC-DKFZ/nnInteractive) is `Creative Commons Attribution Non Commercial Share Alike 4.0`! 
 
 Release model folders ship their own `LICENSE` file whose **first line is the license identifier** (e.g. `CC BY-NC-SA 4.0`); any following lines (such as a link to the full license) are ignored by the tool. At load time this first line is read and exposed as `session.license` so applications can display the model's license prominently. If a checkpoint folder has no `LICENSE` file, the official v1 checkpoint is assumed to be `CC BY-NC-SA 4.0` and any other checkpoint reports `!!MISSING!!`.
 

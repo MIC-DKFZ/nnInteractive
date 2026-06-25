@@ -38,6 +38,7 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "httpx>=0.27",
     "blosc2",  # array (de)serialization on the client/server wire
+    "huggingface_hub",  # model manifest discovery + checkpoint downloads (model_management)
 ]
 
 [project.urls]
@@ -60,6 +61,8 @@ client = [
 
 [project.scripts]
 nninteractive-server = "nnInteractive.inference.server.main:main"
+nninteractive-available-models = "nnInteractive.model_management:available_models_cli"
+nninteractive-download-model = "nnInteractive.model_management:download_model_cli"
 
 [build-system]
 requires = ["setuptools>=67.8.0"]
