@@ -371,6 +371,24 @@ multi-user deployment behind a reverse proxy, concurrency/session model, idle
 expiry and heartbeats, GUI integration notes, and troubleshooting — see
 [`SERVER_CLIENT.md`](SERVER_CLIENT.md).
 
+### Run the server in Docker
+
+Prefer not to install anything? The server is also published as a Docker image
+on the GitHub Container Registry. The default image has the model **baked in**,
+so it runs with a single command (a GPU host with the NVIDIA Container Toolkit
+is required):
+
+```bash
+docker run --gpus all -p 1527:1527 \
+    -e NN_INTERACTIVE_API_KEY="$(openssl rand -hex 32)" \
+    ghcr.io/mic-dkfz/nninteractive-server:latest
+```
+
+A `lite` tag is also available if you'd rather mount your own checkpoint folder
+at `/model` instead of using the baked-in weights. For both flavours,
+configuration options, and how to build the image yourself, see
+[`DOCKER.md`](nnInteractive/inference/server/DOCKER.md).
+
 ## nnInteractive SuperVoxels
 
 As part of the `nnInteractive` framework, we provide a dedicated module for **supervoxel generation** based on [SAM](https://github.com/facebookresearch/segment-anything) and [SAM2](https://github.com/facebookresearch/sam2). This replaces traditional superpixel methods (e.g., SLIC) with **foundation model–powered 3D pseudo-labels**.
