@@ -1,0 +1,103 @@
+name: Publish Docker image
+
+# Build the nnInteractive server image and push it to the GitHub Container
+# Registry (GHCR) whenever a version tag is pushed (e.g. `git tag v2.4.3 &&
+# git push origin v2.4.3`) — the same trigger as publish.yml, so one tag ships
+# both the PyPI wheel and the Docker image.
+#
+# As with publish.yml, the published version comes from `version` in
+# pyproject.toml, NOT from the tag: the "Verify tag matches package version"
+# step fails the run if they disagree, so a mismatched image can't be pushed.
+#
+# Two images are built from one multi-stage Dockerfile
+# (nnInteractive/inference/server/Dockerfile):
+#   * baked  -> tags: latest, <version>, <version>-<model>   (weights inside the image)
+#   * lite   -> tags: lite, <version>-lite                   (mount your own weights)
+#
+# The baked model is chosen by MODEL_NAME below. Code version and model version
+# are decoupled: bumping to a new checkpoint is a one-line change here.
+#
+# Auth uses the built-in GITHUB_TOKEN (see `permissions:` below) — no stored
+# registry secret to manage. One-time setup: after the first push, open the
+# package at https://github.com/orgs/MIC-DKFZ/packages and set its visibility to
+# Public (and optionally link it to this repo) so anyone can pull it.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  # GHCR image names must be lowercase, so the org is mic-dkfz (not MIC-DKFZ).
+  IMAGE: ghcr.io/mic-dkfz/nninteractive-server
+  # The model baked into the `baked`/`latest` image. Change this (and re-tag) to
+  # ship a different checkpoint without touching any code.
+  MODEL_NAME: nnInteractive_v1.0
+
+jobs:
+  build-and-publish:
+    name: Build and publish Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      # Read the repo to build; write packages to push to GHCR with GITHUB_TOKEN.
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches package version
+        run: |
+          PKG_VERSION="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "Tag: $TAG_VERSION   pyproject version: $PKG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match pyproject.toml version '$PKG_VERSION'. Bump the version before tagging."
+            exit 1
+          fi
+          echo "VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the lite (runtime) image first so its layers populate the build
+      # cache that the baked image then reuses for free.
+      - name: Build and push lite image (mount your own weights)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: nnInteractive/inference/server/Dockerfile
+          target: runtime
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:lite
+            ${{ env.IMAGE }}:${{ env.VERSION }}-lite
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push baked image (weights inside the image)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: nnInteractive/inference/server/Dockerfile
+          target: baked
+          push: true
+          build-args: |
+            MODEL_NAME=${{ env.MODEL_NAME }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:${{ env.VERSION }}-${{ env.MODEL_NAME }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

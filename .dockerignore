@@ -1,0 +1,35 @@
+# Keep the Docker build context small. The server image only needs the package
+# source plus readme.md and LICENSE (referenced by pyproject.toml), so exclude
+# everything that would otherwise bloat the context or invalidate layer caches.
+
+.git
+.github
+.gitignore
+.vscode
+.idea
+
+# The supervoxel module is a separate, optional package (its own pyproject /
+# setup.py, bundled SAM2 tree) and is not used by the inference server. It is
+# by far the largest thing in the repo — keep it out of the context entirely.
+nnInteractive/supervoxel
+
+# Python caches and build artifacts
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.eggs
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Local virtualenvs and editor cruft
+.venv
+venv
+*.swp
+.DS_Store
+
+# Docker files themselves don't need to be inside the image
+**/Dockerfile
+.dockerignore
