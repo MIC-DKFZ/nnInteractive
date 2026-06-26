@@ -2,7 +2,7 @@
 
 The lightweight ``nninteractive-client`` distribution ships only the torch-free
 remote client (``nnInteractive.inference.remote``). Everything else — the local
-in-process inference engine, the server, model management — lives in the full
+ inference engine, the server, model management — lives in the full
 ``nnInteractive`` distribution. When code in a client-only environment imports
 one of those modules, a bare ``ModuleNotFoundError: No module named
 'nnInteractive.inference.inference_session'`` is unhelpful.
@@ -28,7 +28,7 @@ from importlib.abc import MetaPathFinder
 # the error message. A module matches if its fully-qualified name equals a
 # prefix or starts with ``prefix + "."`` (so submodules are covered too).
 _FULL_ONLY = {
-    "nnInteractive.inference.inference_session": "local (in-process) inference",
+    "nnInteractive.inference.inference_session": "local inference",
     "nnInteractive.inference.server": "the inference server",
     "nnInteractive.inference.cvpr2025_challenge_baseline": "the CVPR2025 challenge baseline",
     "nnInteractive.model_management": "model discovery / download",

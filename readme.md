@@ -75,7 +75,7 @@ nnInteractive ships as **two pip packages — install only what you need:**
 - **`nninteractive-client`** — lightweight remote client that drives a remote
   `nninteractive-server` (via `nnInteractiveRemoteInferenceSession`). **No PyTorch, no GPU** —
   only `numpy` / `httpx` / `blosc2`. Ideal for a GUI or thin client.
-- **`nnInteractive`** — the full stack: the in-process inference engine *and* the official
+- **`nnInteractive`** — the full stack: the local inference engine *and* the official
   server. Needs **PyTorch and an NVIDIA GPU** (10 GB VRAM recommended; small objects work with
   \<6 GB). It depends on `nninteractive-client`, so it includes the remote client too.
 

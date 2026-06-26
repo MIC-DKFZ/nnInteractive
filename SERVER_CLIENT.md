@@ -30,7 +30,7 @@ concurrency / session model, and common deployment gotchas.
 There are two distributions, both providing the same `nnInteractive` import namespace:
 
 - **GPU / server machine:** `pip install nnInteractive` — the full stack: torch, nnU-Net,
-  fastapi and uvicorn, the in-process inference engine, and the `nninteractive-server` entry
+  fastapi and uvicorn, the local inference engine, and the `nninteractive-server` entry
   point. It depends on `nninteractive-client`, so it also includes the remote client.
 - **GUI / client machine (lightweight, torch-free):** `pip install nninteractive-client` —
   a separate, much smaller distribution that pulls in only the wire stack (`numpy`, `httpx`,
