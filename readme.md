@@ -422,6 +422,16 @@ Release model folders ship their own `LICENSE` file whose **first line is the li
 
 # Changelog
 
+<details>
+<summary>Click to expand the full version history</summary>
+
+### 2.5.0 - 2026-06-26
+
+- **Lightweight, torch-free `nninteractive-client` package**: the remote client now ships as its own distribution so GUIs / thin clients can drive a remote server without pulling in torch or nnU-Net. It shares the `nnInteractive` import namespace with the full package; the full package depends on it and pins it in lockstep.
+- **Model discovery / download by id**: official models are enumerated by a Hugging Face manifest (`MIC-DKFZ/nnInteractive`) and downloaded on demand into `$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`). New `nninteractive-available-models` / `nninteractive-download-model` CLI entry points, and the server gained `--model <id>` to serve an official model by name (`--model-dir` is no longer required). Default `--max-sessions` raised from 1 to 3.
+- Predictions and every `add_*_interaction()` call now return the bounding box of the changed region (clipped to the target buffer), so clients that cannot share the buffer can copy only the changed sub-volume.
+- Added a **Docker** build for the server.
+
 ### 2.4.2 - 2026-06-23
 
 - Reuse the interactions buffer and pinned-memory buffers for the tensor prompt backend (one fewer memcpy); lowered the blosc2 auto-threshold.
@@ -500,6 +510,8 @@ Release model folders ship their own `LICENSE` file whose **first line is the li
   - sometimes caused blocky predictions
   - may cause failure to update segmentation map if changes were minor and AutoZoom was triggered
 - ✅ API compatible with 1.0.1
+
+</details>
 
 ## Acknowledgments
 
