@@ -12,7 +12,6 @@ import argparse
 import logging
 import os
 import sys
-import time
 from typing import Optional
 
 import torch
@@ -243,29 +242,36 @@ def main(argv=None) -> int:
     loader.executor.shutdown(wait=False)
     del loader
 
-    if use_torch_compile:
-        # Compile the network once and run a single dummy forward pass so the
-        # lazy torch.compile compilation happens here at startup rather than on
-        # the first client's first prediction. We promote the resulting single
-        # OptimizedModule back into the shared artifacts dict, so every client
-        # session references that same compiled module (and the warmed compile
-        # cache) instead of re-wrapping the raw module.
-        logger.info("torch.compile enabled; compiling network and warming up (the first compile is slow)...")
+    if use_torch_compile or device.type == "cuda":
+        # Run a single dummy forward pass at startup so the cost of the first pass is
+        # paid here rather than on the first client's first prediction.
+        #
+        # * With torch.compile, this triggers the lazy (slow, once) compilation. We
+        #   promote the resulting single OptimizedModule back into the shared artifacts
+        #   dict so every client session references that same compiled module (and the
+        #   warmed compile cache) instead of re-wrapping the raw module.
+        # * Without torch.compile, the dummy pass still warms the CUDA device — cuDNN
+        #   selects/autotunes its convolution algorithms and the caching allocator grows
+        #   its memory pool. That state is process/device-global, so warming it via one
+        #   short-lived session benefits every later client session.
+        if use_torch_compile:
+            logger.info("torch.compile enabled; compiling network and warming up (the first compile is slow)...")
+        else:
+            logger.info("Warming up the device with a dummy forward pass...")
         warmup_session = nnInteractiveInferenceSession(
             device=device,
-            use_torch_compile=True,
+            use_torch_compile=use_torch_compile,
             verbose=args.verbose,
             torch_n_threads=args.torch_n_threads,
             do_autozoom=not args.no_autozoom,
         )
         warmup_session.initialize_from_loaded_artifacts(artifacts)
-        artifacts["network"] = warmup_session.network
-        t0 = time.monotonic()
+        if use_torch_compile:
+            # initialize_from_loaded_artifacts wrapped the network in torch.compile;
+            # share that single compiled module across all client sessions.
+            artifacts["network"] = warmup_session.network
+        # warmup() prints its own timing/completion line.
         warmup_session.warmup()
-        logger.info(
-            "warmup forward pass complete in %.1fs; clients' first prediction will be fast",
-            time.monotonic() - t0,
-        )
         warmup_session.executor.shutdown(wait=False)
         del warmup_session
 

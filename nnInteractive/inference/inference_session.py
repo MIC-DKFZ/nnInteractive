@@ -98,6 +98,14 @@ class nnInteractiveInferenceSession:
         self.plans_manager = None
         self._interactions_shape = None
         self.device = device
+        if device.type == "cuda":
+            # Every forward pass this session runs has the same fixed input shape
+            # ([1, num_input_channels + num_interaction_channels, *patch_size]; see warmup()),
+            # so cuDNN benchmark mode autotunes the convolution algorithms once on the first
+            # pass and reuses the fastest ones thereafter. For fixed input shapes this is pure
+            # upside; warmup() pays that autotuning cost at startup instead of on the first
+            # real prediction.
+            torch.backends.cudnn.benchmark = True
         if use_torch_compile and sys.platform.startswith("win"):
             # torch.compile relies on triton, which is not available out of the box on Windows.
             warnings.warn(
@@ -1257,40 +1265,54 @@ class nnInteractiveInferenceSession:
             return None
 
     @torch.inference_mode()
-    def warmup(self) -> bool:
-        """Run a single dummy forward pass to trigger lazy ``torch.compile`` compilation up front.
+    def warmup(self) -> None:
+        """Run a single dummy forward pass to pay one-off first-pass costs up front.
 
-        With ``torch.compile`` enabled the network is compiled lazily on its first
-        forward pass, which would otherwise make the user's *first* real prediction
-        slow. Every prediction path — the initial coarse pass, the zoom-out
-        iterations, and the refinement patches — feeds the network an input of
-        identical shape ``[1, num_input_channels + num_interaction_channels,
-        *patch_size]`` (``_build_network_input`` always resizes the crop to
-        ``patch_size``, and refinement crops at exactly ``patch_size``). So a single
-        dummy pass at that shape populates the compile cache and every subsequent
-        real prediction is fast.
+        This serves two purposes:
 
-        Returns ``True`` if a warmup pass was run, ``False`` if it was a no-op
-        (network not compiled — there is nothing to pre-compile, so a dummy pass
-        would not save the user any time). Mirrors ``_predict``'s autocast/
-        inference-mode context and the float32 input dtype that ``torch.cat``
-        produces when concatenating the float32 image with the fp16 interactions.
+        * **torch.compile**: with compilation enabled the network is compiled
+          lazily on its first forward pass, which would otherwise make the user's
+          *first* real prediction slow. The dummy pass triggers that compilation
+          here instead.
+        * **Device initialization (CUDA)**: even *without* ``torch.compile`` the
+          first forward pass on a fresh CUDA device pays one-off costs — cuDNN
+          autotunes/selects its convolution algorithms (``cudnn.benchmark`` is
+          enabled for CUDA in ``__init__`` and fires here), the caching allocator
+          grows its memory pool, and the CUDA context/kernels are loaded. Running
+          the dummy pass at startup pays those costs here rather than on the user's
+          first prediction.
+
+        Every prediction path — the initial coarse pass, the zoom-out iterations,
+        and the refinement patches — feeds the network an input of identical shape
+        ``[1, num_input_channels + num_interaction_channels, *patch_size]``
+        (``_build_network_input`` always resizes the crop to ``patch_size``, and
+        refinement crops at exactly ``patch_size``). So a single dummy pass at that
+        shape populates the compile cache and the cuDNN algorithm cache for every
+        subsequent real prediction.
+
+        Does nothing when there is nothing to gain: the network is neither compiled
+        (no compile cache to populate) nor on a CUDA device (no cuDNN autotuning /
+        allocator pool / context init to warm), so a dummy pass would not save the
+        user any time. Mirrors ``_predict``'s autocast/inference-mode context and
+        the float32 input dtype that ``torch.cat`` produces when concatenating the
+        float32 image with the fp16 interactions.
         """
         if self.network is None or self.configuration_manager is None:
             raise RuntimeError("warmup() requires an initialized network; call initialize_* first")
-        if not isinstance(self.network, OptimizedModule):
-            return False
+        if not isinstance(self.network, OptimizedModule) and self.device.type != "cuda":
+            return
         num_input_channels = (
             determine_num_input_channels(self.plans_manager, self.configuration_manager, self.dataset_json)
             + self.num_interaction_channels
         )
         patch_size = self.configuration_manager.patch_size
         dummy = torch.zeros((1, num_input_channels, *patch_size), dtype=torch.float32, device=self.device)
+        start = time()
         with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
             self.network(dummy)
         del dummy
         empty_cache(self.device)
-        return True
+        print(f"warmup forward pass complete in {time() - start:.1f}s; the first prediction will be fast")
 
     @torch.inference_mode()
     def _predict(self, force_full_refine: bool = False) -> Optional[List[List[int]]]:
@@ -1721,16 +1743,17 @@ class nnInteractiveInferenceSession:
         """
         artifacts = self._load_model_artifacts_from_disk(model_training_output_dir, use_fold, checkpoint_name)
         self.initialize_from_loaded_artifacts(artifacts)
-        # With torch.compile the network is compiled lazily on the first forward pass. For a
-        # locally hosted model that lag would otherwise surface on the user's first real
-        # prediction, where it is far more noticeable than during initialization. Trigger the
-        # compilation now with a dummy forward pass so the cost is paid here instead. warmup()
-        # is a no-op when the network is not compiled. The server takes care of its own warmup
-        # explicitly (it shares one compiled network across sessions via
-        # initialize_from_loaded_artifacts), so we only do this on the direct, local entry point.
+        # Pay the one-off cost of the first forward pass now, at initialization, rather than on
+        # the user's first real prediction where it is far more noticeable. With torch.compile
+        # this triggers the (slow, once) lazy compilation; without it, the dummy forward pass
+        # still warms a fresh CUDA device (cuDNN algorithm selection / benchmark, allocator
+        # memory pool, CUDA context). warmup() is a no-op when there is nothing to gain (not
+        # compiled and not on CUDA). The server takes care of its own warmup explicitly (it
+        # shares one network across sessions via initialize_from_loaded_artifacts), so we only
+        # do this on the direct, local entry point.
         if self.use_torch_compile:
             print("torch.compile enabled; warming up (compiling) the network now (this is slow once)...")
-            self.warmup()
+        self.warmup()
 
     def _load_model_artifacts_from_disk(
         self,
