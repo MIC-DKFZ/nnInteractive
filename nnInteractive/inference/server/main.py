@@ -197,6 +197,16 @@ def main(argv=None) -> int:
 
     device = torch.device(args.device)
     use_torch_compile = not args.no_torch_compile
+    if use_torch_compile and sys.platform.startswith("win"):
+        # See nnInteractiveInferenceSession.__init__: torch.compile relies on triton, which
+        # is not available out of the box on Windows. The session constructor would disable
+        # it anyway; mirror the check here so we skip the misleading "compiling..." log and
+        # the per-session warnings, matching the CPU branch below.
+        logger.warning(
+            "torch.compile is not supported on Windows (triton is not available out of the "
+            "box); disabling it. Pass --no-torch-compile to silence this."
+        )
+        use_torch_compile = False
     if use_torch_compile and device.type != "cuda":
         # See nnInteractiveInferenceSession.__init__: torch.compile is not worth it on a
         # convolution-bound network running on CPU. Disable it here too so we skip the
