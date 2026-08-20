@@ -942,7 +942,13 @@ class nnInteractiveInferenceSession:
         Interactions compress better with NOFILTER, which is also faster than SHUFFLE."""
         return {
             "codec": blosc2.Codec.LZ4,
-            "clevel": 5,
+            # Level 1, not 5: the interactions tensor is mostly zeros, so the
+            # compressed size is unchanged (0.4 MB either way on a 2.9 GB
+            # 8x694x512x512 fp16 tensor, measured) while compression drops
+            # 271 ms -> 80 ms. The async post-predict snapshot runs while the
+            # next interaction may already be arriving, so a ~3.4x shorter
+            # CPU burst directly shrinks that contention window.
+            "clevel": 1,
             "filters": [blosc2.Filter.NOFILTER],
             "nthreads": min(self.torch_n_threads, os.cpu_count()) if nthreads is None else nthreads,
         }
