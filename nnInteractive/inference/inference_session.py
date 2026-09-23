@@ -1383,7 +1383,10 @@ class nnInteractiveInferenceSession:
           enabled for CUDA in ``__init__`` and fires here), the caching allocator
           grows its memory pool, and the CUDA context/kernels are loaded. Running
           the dummy pass at startup pays those costs here rather than on the user's
-          first prediction.
+          first prediction. Note that cuDNN's benchmark cache is **thread-local**: call
+          ``warmup()`` from the thread that will run the predictions, otherwise that
+          thread re-pays the autotuning on its first pass (the server therefore runs both
+          on one dedicated GPU thread).
 
         Every prediction path — the initial coarse pass, the zoom-out iterations,
         and the refinement patches — feeds the network an input of identical shape

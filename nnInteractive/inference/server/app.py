@@ -8,8 +8,8 @@ each session's ``self.network`` is a plain Python reference to that single
 module — there is exactly one network and one copy of the weights on the GPU
 regardless of session count. Per-session state (image, target buffer,
 interactions tensor) is isolated. Safety of sharing relies on (a) inference
-running under ``@torch.inference_mode()`` and (b) a global ``gpu_lock``
-serializing predict-capable endpoints, so no two sessions ever touch the
+running under ``@torch.inference_mode()`` and (b) all predict-capable work
+running on a single dedicated GPU thread, so no two sessions ever touch the
 module concurrently and nothing mutates it after construction.
 
 Each client identifies itself via a lease token issued by ``POST /claim``. The
@@ -25,15 +25,21 @@ Concurrency model:
   - Each session has its own ``threading.Lock`` that serializes the per-session
     mutating endpoints (so a single client can't tear its own state with
     parallel calls).
-  - A single global ``gpu_lock`` serializes the predict-capable endpoints
-    (``add_*_interaction``) across *all* sessions, because the GPU is one
+  - The predict-capable endpoints (``add_*_interaction``, ``predict``) hand
+    their GPU-bound work to one long-lived GPU thread (``make_gpu_executor``),
+    which serializes it across *all* sessions, because the GPU is one
     resource. Two clients can preprocess images concurrently but only one
-    prediction runs at a time. The gpu lock is held only for the GPU-bound
-    interaction/prediction itself; building the response (bbox copy + blosc2
-    compression, pure per-session CPU work) happens after it is released so it
-    never stalls other sessions' predictions (see _run_gpu_then_build_response).
-  - The acquisition order is always (session lock → gpu lock) so there is no
-    deadlock potential.
+    prediction runs at a time. Only the interaction/prediction itself runs on
+    the GPU thread; building the response (bbox copy + blosc2 compression,
+    pure per-session CPU work) happens back on the request thread so it never
+    stalls other sessions' predictions (see _run_gpu_then_build_response).
+    A single thread (rather than a lock around whatever worker thread serves
+    the request) matters because cuDNN's benchmark cache is thread-local: the
+    startup warmup runs on this same thread, so its autotuning results are
+    reused by every prediction instead of being re-paid by each fresh worker.
+  - The request thread holds its session lock while waiting on the GPU thread;
+    the GPU thread never takes a session lock, so there is no deadlock
+    potential.
   - The endpoints that carry large payloads (``set_image`` and the mask
     interactions) are ``async`` so they can ``await`` the upload, but their
     CPU-bound work (blosc2 decompression, image preprocessing, prediction,
@@ -55,6 +61,7 @@ import os
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -311,6 +318,29 @@ class SessionRegistry:
         return max(0.0, self._idle_timeout_seconds - (time.monotonic() - entry.last_active_at))
 
 
+def make_gpu_executor(device: torch.device) -> ThreadPoolExecutor:
+    """Create the single long-lived thread that runs every forward pass of the server.
+
+    cuDNN's benchmark cache is thread-local: algorithms autotuned in one thread are not
+    reused by another. Request handlers run on anyio's worker pool, whose threads are
+    created and retired on demand, so without a dedicated thread each fresh worker re-pays
+    the autotuning (~1s+) on its first prediction despite the startup warmup. Run the warmup
+    on this executor too (see ``main``) so its results stick. Being a single worker, it also
+    serializes predictions across sessions.
+    """
+    initializer = None
+    if device.type == "cuda" and device.index is not None:
+        # The current CUDA device is thread-local too; pin it so bare torch.cuda calls on
+        # this thread target the server's device rather than cuda:0.
+        initializer = torch.cuda.set_device
+    return ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="nninteractive-gpu",
+        initializer=initializer,
+        initargs=(device,) if initializer is not None else (),
+    )
+
+
 def make_app(
     artifacts: dict,
     device: torch.device,
@@ -325,7 +355,15 @@ def make_app(
     api_key: Optional[str] = None,
     sweep_interval_seconds: float = 15.0,
     enable_undo: bool = True,
+    gpu_executor: Optional[ThreadPoolExecutor] = None,
 ) -> FastAPI:
+    """Build the server app.
+
+    ``gpu_executor``: single-worker executor that runs all GPU-bound work (see
+    ``make_gpu_executor``). Pass the one the startup warmup ran on so the warmed cuDNN state
+    is reused; if ``None`` a fresh one is created. The app takes ownership and shuts it down
+    on exit.
+    """
     registry = SessionRegistry(
         artifacts=artifacts,
         max_sessions=max_sessions,
@@ -339,7 +377,8 @@ def make_app(
         verbose=verbose,
         enable_undo=enable_undo,
     )
-    gpu_lock = threading.Lock()
+    if gpu_executor is None:
+        gpu_executor = make_gpu_executor(device)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -372,6 +411,7 @@ def make_app(
             except (asyncio.CancelledError, Exception):
                 pass
             registry.close_all()
+            gpu_executor.shutdown(wait=True)
 
     app = FastAPI(title="nnInteractive Inference Server", lifespan=lifespan)
 
@@ -526,18 +566,16 @@ def make_app(
 
     def _run_gpu_then_build_response(entry: SessionEntry, gpu_fn) -> Response:
         """Run ``gpu_fn(session)`` (the GPU-bound interaction/prediction; returns
-        ``ran_prediction``) under session lock + global GPU lock, then build the prediction
-        response *after releasing the GPU lock* (still under the session lock): the response
+        ``ran_prediction``) on the GPU thread while holding the session lock, then build the
+        prediction response back on this thread (still under the session lock): the response
         is pure per-session CPU work (bbox copy + blosc2 compression, potentially 100s of ms
-        for large regions) and must not stall other sessions' predictions. Acquisition order
-        is always session-then-gpu to avoid deadlocks.
+        for large regions) and must not stall other sessions' predictions.
 
         Like ``_under_session_lock``, this marks real user activity."""
         entry.mark_active()
         with entry.lock:
             try:
-                with gpu_lock:
-                    ran_prediction = gpu_fn(entry.session)
+                ran_prediction = gpu_executor.submit(gpu_fn, entry.session).result()
                 return _build_prediction_response(entry.session, ran_prediction=ran_prediction)
             except (ValueError, AssertionError) as e:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -651,7 +689,7 @@ def make_app(
 
     @app.post(PATH_UNDO, dependencies=[auth])
     def undo(entry: SessionEntry = lease) -> Response:
-        # Undo does no GPU inference (only CPU decompress/copy), so it must not hold the GPU lock.
+        # Undo does no GPU inference (only CPU decompress/copy), so it must not queue on the GPU thread.
         def _do(session):
             ran = session.undo()
             return _build_prediction_response(session, ran_prediction=ran)

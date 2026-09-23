@@ -241,9 +241,9 @@ its buffers) is shared by reference across every session. There is exactly
 one network and one copy of the weights resident on the GPU regardless of
 how many sessions are active. This gives multiple researchers on one GPU box
 independent state without duplicating the model. Sharing is safe because
-inference runs under `@torch.inference_mode()` and a global GPU lock
-serializes predict-capable endpoints, so two sessions never touch the
-network concurrently and nothing mutates it after startup.
+inference runs under `@torch.inference_mode()` and all predict-capable
+endpoints run their GPU work on one dedicated GPU thread, so two sessions never
+touch the network concurrently and nothing mutates it after startup.
 
 ### How a client gets a session
 
@@ -265,10 +265,16 @@ never see the lease token** — it's a private implementation detail.
 
 Two clients each calling `add_point_interaction(..., run_prediction=True)` at the
 same moment will see one of the two predictions wait briefly for the other to
-finish. This is by design — there is only one GPU. Non-prediction calls
-(`set_image`, `set_target_buffer`, `reset_interactions`, `add_*_interaction(...,
-run_prediction=False)`) do not contend on this lock and run concurrently across
-sessions.
+finish. This is by design — there is only one GPU. Calls that don't go through
+the GPU thread (`set_image`, `set_target_buffer`, `reset_interactions`, `undo`)
+run concurrently across sessions. `add_*_interaction(..., run_prediction=False)`
+still queues on the GPU thread, but it is quick because no prediction runs.
+
+That thread is also where the startup warmup runs. cuDNN keeps its benchmark
+(autotuning) cache per thread, so running every forward pass on the same
+long-lived thread means the warmup's autotuning is reused by all predictions
+instead of being paid again (~1 s) whenever a request lands on a new worker
+thread.
 
 If predictions feel slow under concurrent load, the answer is more GPUs (run one
 `nninteractive-server` per GPU on different ports), not raising `--max-sessions`.

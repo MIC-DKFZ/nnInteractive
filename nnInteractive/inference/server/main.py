@@ -18,7 +18,7 @@ import torch
 import uvicorn
 
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
-from nnInteractive.inference.server.app import make_app
+from nnInteractive.inference.server.app import make_app, make_gpu_executor
 
 logger = logging.getLogger("nninteractive.server")
 
@@ -270,6 +270,10 @@ def main(argv=None) -> int:
     loader.executor.shutdown(wait=False)
     del loader
 
+    # Every forward pass (the warmup below and all client predictions) runs on this one thread:
+    # cuDNN's benchmark cache is thread-local, so warming up anywhere else would not help.
+    gpu_executor = make_gpu_executor(device)
+
     if use_torch_compile or device.type == "cuda":
         # Run a single dummy forward pass at startup so the cost of the first pass is
         # paid here rather than on the first client's first prediction.
@@ -280,8 +284,9 @@ def main(argv=None) -> int:
         #   warmed compile cache) instead of re-wrapping the raw module.
         # * Without torch.compile, the dummy pass still warms the CUDA device — cuDNN
         #   selects/autotunes its convolution algorithms and the caching allocator grows
-        #   its memory pool. That state is process/device-global, so warming it via one
-        #   short-lived session benefits every later client session.
+        #   its memory pool. The allocator pool is process-global, but the cuDNN algorithm
+        #   cache is per thread, hence running the warmup on the shared GPU thread; that way
+        #   warming via one short-lived session benefits every later client session.
         if use_torch_compile:
             logger.info("torch.compile enabled; compiling network and warming up (the first compile is slow)...")
         else:
@@ -299,7 +304,7 @@ def main(argv=None) -> int:
             # share that single compiled module across all client sessions.
             artifacts["network"] = warmup_session.network
         # warmup() prints its own timing/completion line.
-        warmup_session.warmup()
+        gpu_executor.submit(warmup_session.warmup).result()
         warmup_session.executor.shutdown(wait=False)
         del warmup_session
 
@@ -325,6 +330,7 @@ def main(argv=None) -> int:
         verbose=args.verbose,
         api_key=api_key,
         enable_undo=not args.no_undo,
+        gpu_executor=gpu_executor,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
