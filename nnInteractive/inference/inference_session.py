@@ -850,9 +850,10 @@ class nnInteractiveInferenceSession:
     def _new_interactions_read_buffer(self, shape) -> Optional[np.ndarray]:
         """Pre-faulted buffer to decompress blosc2 interaction crops into (Path B), or None.
 
-        Sized to the largest possible crop: the patch size scaled by the maximum autozoom factor,
-        capped to the image size. Only allocated for the blosc2 backend that exposes the
-        decompress-into-buffer method; the dense-tensor backend returns views and needs no buffer.
+        Sized for the larger of: all channels of one patch-sized crop (zoom 1), or ONE channel of the largest
+        AutoZoom crop (the patch size scaled by the maximum autozoom factor, capped to the image size). Only
+        allocated for the blosc2 backend that exposes the decompress-into-buffer method; the dense-tensor backend
+        returns views and needs no buffer.
         """
         if self._interactions_storage_resolved != "blosc2":
             return None
@@ -863,11 +864,17 @@ class nnInteractiveInferenceSession:
                 "every read (slower). Consider updating blosc2."
             )
             return None
+        # Two users: the zoom-1 path reads all channels of one patch-sized crop; the AutoZoom path reads ONE channel
+        # at a time of a crop up to MAX_AUTOZOOM_FACTOR x the patch (see _build_network_input). Size for the larger.
+        patch = [min(p, s) for p, s in zip(self.configuration_manager.patch_size, shape[1:])]
         max_valid = [
             min(round(p * self.MAX_AUTOZOOM_FACTOR), s)
             for p, s in zip(self.configuration_manager.patch_size, shape[1:])
         ]
-        n = self.num_interaction_channels * int(np.prod(max_valid, dtype=np.int64))
+        n = max(
+            self.num_interaction_channels * int(np.prod(patch, dtype=np.int64)),
+            int(np.prod(max_valid, dtype=np.int64)),
+        )
         buffer = np.empty(n, dtype=np.float16)
         buffer[:] = 0  # first-touch the pages once, up front
         return buffer
@@ -1571,36 +1578,56 @@ class nnInteractiveInferenceSession:
 
         # cropping happens on CPU, padding happens on GPU (later)
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
-        interactions_tensor, pad_interaction = crop_to_valid(
-            self.interactions, scaled_bbox, out=self._interactions_read_buffer
-        )
-        # For blosc2, crop_to_valid returns a numpy array; convert to torch (still on CPU).
-        if not isinstance(interactions_tensor, torch.Tensor):
-            interactions_tensor = torch.from_numpy(np.asarray(interactions_tensor))
+        zoomed = not all([i == j for i, j in zip(self.configuration_manager.patch_size, scaled_patch_size)])
 
-        previous_prediction = interactions_tensor[prev_seg_channel : prev_seg_channel + 1]
+        # blosc2 + AutoZoom: decompress ONE channel at a time into the read buffer, which is therefore only sized
+        # for one channel at the largest crop (see _new_interactions_read_buffer). The zoomed path below processes
+        # channels one by one anyway. Dense tensors (crops are free views) and the zoom-1 path (one patch-sized
+        # crop) read all channels at once.
+        read_per_channel = zoomed and not isinstance(self.interactions, torch.Tensor)
+        if read_per_channel:
+            interactions_tensor = None
+            # the interactions share the image's spatial shape, so the padding is identical
+            pad_interaction = pad_image
+        else:
+            interactions_tensor, pad_interaction = crop_to_valid(
+                self.interactions, scaled_bbox, out=self._interactions_read_buffer
+            )
+            # For blosc2, crop_to_valid returns a numpy array; convert to torch (still on CPU).
+            if not isinstance(interactions_tensor, torch.Tensor):
+                interactions_tensor = torch.from_numpy(np.asarray(interactions_tensor))
+            previous_prediction = interactions_tensor[prev_seg_channel : prev_seg_channel + 1]
+
+        def read_channel(c: int, full_crop: torch.Tensor | None = interactions_tensor) -> torch.Tensor:
+            """CPU tensor [1, *crop] of interaction channel c. With read_per_channel it is a view into the shared
+            read buffer, valid only until the next read_channel call: move it to the device first (a contiguous
+            pageable .to() is synchronous w.r.t. the host)."""
+            if full_crop is not None:
+                return full_crop[c : c + 1]
+            sub, _ = crop_to_valid(
+                self.interactions, scaled_bbox, out=self._interactions_read_buffer, channels=(c, c + 1)
+            )
+            return torch.from_numpy(np.asarray(sub))
 
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
-        if not all([i == j for i, j in zip(self.configuration_manager.patch_size, scaled_patch_size)]):
+        if zoomed:
             patch_size = self.configuration_manager.patch_size
             max_pool_ks = round_to_nearest_odd(zoom_out_factor * 2 - 1)
             dilation_channels = set(self._get_dilation_channels_for_resample()) if max_pool_ks > 1 else set()
             needs_pad_interaction = any(x for pair in pad_interaction for x in pair)
 
-            previous_prediction = self._to_device(previous_prediction)
+            previous_prediction = self._to_device(read_channel(prev_seg_channel))
             if needs_pad_interaction:
                 previous_prediction = pad_cropped(previous_prediction, pad_interaction)
             previous_prediction = interpolate(previous_prediction[None], patch_size, mode="nearest")[0, 0]
 
             # Process interaction channels one at a time to avoid materialising the full
             # [num_ch, scaled_patch_size³] tensor on GPU. Peak VRAM ≈ one channel at scaled size.
-            num_interaction_ch = interactions_tensor.shape[0]
-            interactions_out = torch.empty(
-                [num_interaction_ch, *patch_size], dtype=interactions_tensor.dtype, device=self.device
-            )
+            num_interaction_ch = self.num_interaction_channels
+            interactions_out = torch.empty([num_interaction_ch, *patch_size], dtype=torch.float16, device=self.device)
             for i in range(num_interaction_ch):
-                ch = self._to_device(interactions_tensor[i : i + 1])
+                ch = self._to_device(read_channel(i))
                 if needs_pad_interaction:
                     ch = pad_cropped(ch, pad_interaction)
                 if i in dilation_channels:
