@@ -1,5 +1,7 @@
 import threading
+from collections.abc import Callable
 
+import numpy as np
 import torch
 
 from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
@@ -76,6 +78,38 @@ class PinnedStager:
             staged.copy_(src[start:end])  # synchronous (multithreaded) gather into pinned memory
             dst[start:end].copy_(staged, non_blocking=True)  # asynchronous DMA on the current stream
             self._events[b].record()
+
+    def fill_to(self, dst: torch.Tensor, fill: Callable[[np.ndarray, int, int], None]) -> None:
+        """Produce the content of device tensor ``dst`` block by block along dim 0 directly in pinned memory.
+
+        ``fill(view, r0, r1)`` must write rows ``r0:r1`` of the result into ``view``, a contiguous numpy array of
+        shape ``(r1 - r0, *dst.shape[1:])`` backed by one pinned half (e.g. a blosc2 decompression straight into
+        it). Each block is DMA'd asynchronously while the next one is produced in the other half, so the
+        producer (typically memory-bound decompression) overlaps with the transfer and no intermediate host copy
+        of the whole region is ever made. ``dst`` must be contiguous and on ``self.device``; one row along dim 0
+        must fit into one half.
+        """
+        if not dst.is_contiguous():
+            raise ValueError("fill_to requires a contiguous destination")
+        if dst.numel() == 0:
+            return
+        row_bytes = dst[0].numel() * dst.element_size()
+        if row_bytes > self.half_bytes:
+            raise ValueError(f"one row of {row_bytes} bytes exceeds the staging half of {self.half_bytes} bytes")
+        rows_per_block = self.half_bytes // row_bytes
+        with self._lock, torch.cuda.device(self.device):
+            if self._halves is None:
+                self._lazy_init()
+            n = dst.shape[0]
+            for start in range(0, n, rows_per_block):
+                end = min(n, start + rows_per_block)
+                b = self._next
+                self._next = 1 - b
+                self._events[b].synchronize()  # the previous DMA out of this half has finished
+                staged = self._halves[b][: (end - start) * row_bytes].view(dst.dtype).view(end - start, *dst.shape[1:])
+                fill(staged.numpy(), start, end)  # synchronous producer writes straight into pinned memory
+                dst[start:end].copy_(staged, non_blocking=True)  # asynchronous DMA on the current stream
+                self._events[b].record()
 
 
 _STAGERS: dict[str, PinnedStager] = {}
