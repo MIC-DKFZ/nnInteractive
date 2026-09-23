@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Sequence
 import numpy as np
 import torch
@@ -5,7 +6,11 @@ import torch.nn.functional as F
 
 
 def crop_and_pad_into_buffer(
-    target_tensor: torch.Tensor, bbox: Sequence[Sequence[int]], source_tensor, source_leading_slice=None
+    target_tensor: torch.Tensor,
+    bbox: Sequence[Sequence[int]],
+    source_tensor,
+    source_leading_slice=None,
+    to_device: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> None:
     """
     Copies a sub-region from source_tensor into target_tensor based on a bounding box.
@@ -20,6 +25,8 @@ def crop_and_pad_into_buffer(
         source_leading_slice: Optional slice to apply to the first leading dimension of the source
             instead of slice(None). Useful for reading a subset of channels from a blosc2 NDArray
             without decompressing channel 0.
+        to_device: Optional function used to move the (CPU) subregion to the target tensor's device when the
+            two differ, e.g. the session's pinned-staging copy. Defaults to ``.to(target_tensor.device)``.
 
     Behavior:
         For each dimension that the bbox covers (i.e. the last len(bbox) dims of source_tensor):
@@ -71,7 +78,12 @@ def crop_and_pad_into_buffer(
     if not isinstance(sub_source, torch.Tensor):
         sub_source = torch.from_numpy(np.asarray(sub_source))
     # Transfer only this subregion to the target tensor's device.
-    sub_source = sub_source.to(target_tensor.device) if isinstance(target_tensor, torch.Tensor) else sub_source.cpu()
+    if not isinstance(target_tensor, torch.Tensor):
+        sub_source = sub_source.cpu()
+    elif to_device is not None and sub_source.device != target_tensor.device:
+        sub_source = to_device(sub_source)
+    else:
+        sub_source = sub_source.to(target_tensor.device)
     # Write the data into the preallocated target_tensor.
     target_tensor[tuple(target_slices)] = sub_source
 

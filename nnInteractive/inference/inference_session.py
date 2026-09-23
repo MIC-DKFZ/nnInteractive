@@ -31,8 +31,8 @@ from nnInteractive.utils.inference_helpers import (
     parse_channel_pair,
     version_to_tuple,
 )
-from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
 from nnInteractive.utils.rounding import round_to_nearest_odd
+from nnInteractive.utils.staging import get_stager
 
 
 class nnInteractiveInferenceSession:
@@ -457,12 +457,26 @@ class nnInteractiveInferenceSession:
             value = value.cpu().numpy().astype(np.float16)
         self.interactions[channel_idx] = value
 
+    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Copy a CPU tensor (typically a non-contiguous crop) to the compute device.
+
+        Non-contiguous CPU crops go through the process-wide pinned staging buffer (utils/staging.py), which
+        gathers and transfers them in fixed-size slabs; everything else is a plain ``.to``. The result is
+        always a new tensor on ``self.device``.
+        """
+        stager = get_stager(self.device) if tensor.device.type == "cpu" else None
+        if stager is None:
+            return tensor.to(self.device)
+        return stager.copy_to(tensor)
+
     def _read_interactions_to_device(self, full_slicer, device) -> torch.Tensor:
         """Read an interaction subregion as a torch.Tensor on ``device``, regardless of backend."""
         sub = self.interactions[full_slicer]
-        if isinstance(sub, torch.Tensor):
-            return sub.to(device)
-        return torch.from_numpy(np.asarray(sub)).to(device)
+        if not isinstance(sub, torch.Tensor):
+            sub = torch.from_numpy(np.asarray(sub))
+        if torch.device(device).type == self.device.type:
+            return self._to_device(sub)
+        return sub.to(device)
 
     def _paste_prediction_to_target_buffer(self, prediction: torch.Tensor, bbox: List[List[int]]) -> None:
         # The target buffer shares the image's coordinate space (no cropping), so the bbox is used directly.
@@ -545,7 +559,7 @@ class nnInteractiveInferenceSession:
         # crop_and_pad_into_buffer calls below. No pin_memory for a CPU cache: pinning multiple GB
         # costs seconds (cudaHostAlloc page-pinning) and would not even speed up the per-patch
         # reads, which are non-contiguous slices that cannot DMA directly from pinned memory --
-        # they are staged through small reusable pinned buffers in _refine_coarse_with_local_cache.
+        # they are staged through the small process-wide pinned buffer (utils/staging.py).
         cache_image = torch.empty(cache_shape, dtype=self.preprocessed_image.dtype, device=cache_device)
         cache_interactions = torch.empty(
             (self.num_interaction_channels, *cache_shape), dtype=torch.float16, device=cache_device
@@ -554,8 +568,8 @@ class nnInteractiveInferenceSession:
         self._zero_out_of_image_cache_border_(cache_image, cache_bbox, spatial_shape)
         self._zero_out_of_image_cache_border_(cache_interactions, cache_bbox, spatial_shape)
 
-        crop_and_pad_into_buffer(cache_image, cache_bbox, self.preprocessed_image[0])
-        crop_and_pad_into_buffer(cache_interactions, cache_bbox, self.interactions)
+        crop_and_pad_into_buffer(cache_image, cache_bbox, self.preprocessed_image[0], to_device=self._to_device)
+        crop_and_pad_into_buffer(cache_interactions, cache_bbox, self.interactions, to_device=self._to_device)
         # .type comparison: torch.device("cuda") != torch.device("cuda:0"), but both mean "the
         # compute device" here (_select_refinement_cache_device only returns self.device or cpu).
         # Must stay consistent with the same check in _refine_coarse_with_local_cache, which
@@ -800,11 +814,12 @@ class nnInteractiveInferenceSession:
         overhead); "blosc2" uses a compact blosc2 in-memory NDArray.
         """
         if self._interactions_storage_resolved == "tensor":
-            # Pinning enables faster non-blocking host->device copies, but only helps for a
-            # CUDA target and is buggy on Linux kernel 6.11 (see utils/os_shennanigans).
-            pin = self.device.type == "cuda" and not is_linux_kernel_6_11()
-            tensor = torch.zeros(shape, dtype=torch.float16, device="cpu", pin_memory=pin)
-            return tensor
+            # Deliberately NOT pinned. Only crops of this tensor ever go to the GPU, and those are
+            # non-contiguous views that cannot DMA from pinned memory directly; they are staged through a
+            # small fixed pinned buffer instead (utils/staging.py). Pinning the whole tensor bought no
+            # speed but cost RAM: torch's caching host allocator rounds pinned blocks up to a power of two
+            # and never returns freed blocks to the OS, so RAM grew with every image of a new size.
+            return torch.zeros(shape, dtype=torch.float16, device="cpu")
         return blosc2.zeros(
             shape,
             dtype=np.float16,
@@ -1011,7 +1026,7 @@ class nnInteractiveInferenceSession:
             and tuple(self.interactions.shape) == tuple(snap_inter.shape)
         )
         if reuse:
-            dst = self.interactions.numpy()  # zero-copy view of the existing (pinned) buffer
+            dst = self.interactions.numpy()  # zero-copy view of the existing buffer
             if hasattr(snap_inter, "get_slice_numpy"):
                 # Decompress the whole snapshot directly into dst (no temporary array).
                 snap_inter.get_slice_numpy(dst, ((0,) * dst.ndim, tuple(snap_inter.shape)))
@@ -1022,9 +1037,9 @@ class nnInteractiveInferenceSession:
             # Shape/backend changed (e.g. blosc2 backend): rebuild from scratch.
             del self.interactions
             if self._interactions_storage_resolved == "tensor":
-                tensor = torch.from_numpy(np.ascontiguousarray(snap_inter[:]))
-                pin = self.device.type == "cuda" and not is_linux_kernel_6_11()
-                self.interactions = tensor.pin_memory() if pin else tensor.clone()
+                # snap_inter[:] decompresses into a fresh array, so the tensor owns its memory. Not pinned,
+                # for the same reason as in _new_interactions_array.
+                self.interactions = torch.from_numpy(np.ascontiguousarray(snap_inter[:]))
             else:
                 self.interactions = snap_inter.copy()
 
@@ -1573,7 +1588,7 @@ class nnInteractiveInferenceSession:
             dilation_channels = set(self._get_dilation_channels_for_resample()) if max_pool_ks > 1 else set()
             needs_pad_interaction = any(x for pair in pad_interaction for x in pair)
 
-            previous_prediction = previous_prediction.to(self.device, non_blocking=True)
+            previous_prediction = self._to_device(previous_prediction)
             if needs_pad_interaction:
                 previous_prediction = pad_cropped(previous_prediction, pad_interaction)
             previous_prediction = interpolate(previous_prediction[None], patch_size, mode="nearest")[0, 0]
@@ -1585,7 +1600,7 @@ class nnInteractiveInferenceSession:
                 [num_interaction_ch, *patch_size], dtype=interactions_tensor.dtype, device=self.device
             )
             for i in range(num_interaction_ch):
-                ch = interactions_tensor[i : i + 1].to(self.device, non_blocking=True)
+                ch = self._to_device(interactions_tensor[i : i + 1])
                 if needs_pad_interaction:
                     ch = pad_cropped(ch, pad_interaction)
                 if i in dilation_channels:
@@ -1597,7 +1612,7 @@ class nnInteractiveInferenceSession:
 
             # Keep image and interaction tensors in identical spatial frames before concatenation.
             # Interactions use area downsampling (with selective dilation beforehand), image uses trilinear.
-            crop_img = crop_img.to(self.device, non_blocking=True)
+            crop_img = self._to_device(crop_img)
             if any(x for pair in pad_image for x in pair):
                 crop_img = pad_cropped(crop_img, pad_image)
             crop_img = interpolate(crop_img[None], patch_size, mode="trilinear")[0]
@@ -1605,9 +1620,12 @@ class nnInteractiveInferenceSession:
             empty_cache(self.device)
         else:
             # zoom_out_factor == 1: transfer both tensors to GPU, then pad if needed
-            crop_img = crop_img.to(self.device, non_blocking=True)
-            interactions_tensor = interactions_tensor.to(self.device, non_blocking=True)
-            previous_prediction = previous_prediction.to(self.device, non_blocking=True)
+            crop_img = self._to_device(crop_img)
+            interactions_tensor = self._to_device(interactions_tensor)
+            # previous_prediction is a channel of the interactions crop that was just transferred: copy it on
+            # the device instead of sending the same data over PCIe a second time. A separate tensor (clone,
+            # not a view) because the interaction channels are normalized in place below.
+            previous_prediction = interactions_tensor[prev_seg_channel : prev_seg_channel + 1].clone()
             if any(x for pair in pad_image for x in pair):
                 crop_img = pad_cropped(crop_img, pad_image)
             if any(x for pair in pad_interaction for x in pair):
@@ -1671,14 +1689,9 @@ class nnInteractiveInferenceSession:
             paste_tensor(cache_interactions, coarse_sub, inject_local_bbox, channel_idx=prev_seg_channel)
             del coarse_sub
 
-        # A CPU cache pays a host->device transfer per patch. The patch slices are non-contiguous
-        # views, which torch copies through a freshly allocated pageable staging area (making
-        # non_blocking a no-op). Gathering into small reusable pinned staging buffers instead
-        # turns the H2D copy into a true DMA and avoids the per-patch allocation.
-        use_pinned_staging = (
-            cache_image.device.type == "cpu" and self.device.type == "cuda" and not is_linux_kernel_6_11()
-        )
-        stage_image = stage_interactions = None
+        # A CPU cache pays a host->device transfer per patch. The patch slices are non-contiguous views; they
+        # go through the process-wide pinned staging buffer (self._to_device, utils/staging.py), which turns
+        # the copy into a true DMA without allocating per patch.
 
         for refinement_bbox in bboxes_ordered:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
@@ -1695,20 +1708,8 @@ class nnInteractiveInferenceSession:
                 # views, the cat is the only copy.
                 patch = torch.cat((image_patch, interactions_patch), dim=0)
             else:
-                if use_pinned_staging:
-                    if stage_image is None or stage_image.shape != image_patch.shape:
-                        stage_image = torch.empty(image_patch.shape, dtype=image_patch.dtype, pin_memory=True)
-                        stage_interactions = torch.empty(
-                            interactions_patch.shape, dtype=interactions_patch.dtype, pin_memory=True
-                        )
-                    # Overwriting the staging buffers is safe: the synchronous D2H copy of the
-                    # previous iteration's prediction (below) synchronized the stream, so the
-                    # previous H2D copies out of these buffers have completed.
-                    stage_image.copy_(image_patch)
-                    stage_interactions.copy_(interactions_patch)
-                    image_patch, interactions_patch = stage_image, stage_interactions
-                image_gpu = image_patch.to(self.device, non_blocking=use_pinned_staging)
-                interactions_gpu = interactions_patch.to(self.device, non_blocking=use_pinned_staging)
+                image_gpu = self._to_device(image_patch)
+                interactions_gpu = self._to_device(interactions_patch)
                 # A CPU cache is stored unnormalized (see _build_refinement_local_cache): normalize
                 # the per-patch copy on the compute device, where the fp16 division is cheap.
                 self._normalize_interaction_channels_for_network_(interactions_gpu)
@@ -1718,8 +1719,7 @@ class nnInteractiveInferenceSession:
             # .contiguous(): see _predict — required for torch.compile with possibly non-contiguous input.
             pred = self.network(patch[None].contiguous())[0].argmax(0).detach()
             # Convert on the compute device before any transfer: fp16 is 4x smaller than the int64
-            # argmax output. For a CPU cache the synchronous D2H copy in the paste below doubles as
-            # the stream sync that makes reusing the pinned staging buffers safe.
+            # argmax output.
             pred = pred.to(dtype=cache_interactions.dtype)
             paste_tensor(
                 cache_interactions, pred.to(cache_interactions.device), local_bbox, channel_idx=prev_seg_channel
