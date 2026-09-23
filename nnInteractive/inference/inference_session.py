@@ -864,8 +864,12 @@ class nnInteractiveInferenceSession:
         # fixes layout in a single pass; only when it was a no-op (already contiguous float32)
         # is an explicit copy needed. The old `image.copy()` + `.float()` copied twice for
         # non-float32 inputs (e.g. int16 CT), a transient full-volume RAM spike.
+        # Check memory overlap, not identity: for ndarray subclasses (np.memmap) or a
+        # non-canonical float32 dtype (e.g. explicit '<f4' from MedVol/napari-nifti),
+        # ascontiguousarray returns a *new view* of the same buffer, and normalizing that
+        # in place would overwrite the caller's image (e.g. the napari layer turns grey).
         image_np = np.ascontiguousarray(image, dtype=np.float32)
-        if image_np is image:
+        if np.may_share_memory(image_np, image):
             image_np = image_np.copy()
         image = torch.from_numpy(image_np)
 

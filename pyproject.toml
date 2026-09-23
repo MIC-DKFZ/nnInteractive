@@ -1,6 +1,6 @@
 [project]
 name = "nnInteractive"
-version = "2.5.1"
+version = "2.5.2"
 requires-python = ">=3.10"
 description = "Inference code for nnInteractive"
 readme = "readme.md"
@@ -39,7 +39,7 @@ dependencies = [
     # If you ONLY need to drive a remote server, install the lightweight client
     # instead and skip torch entirely:
     #   pip install nninteractive-client
-    "nninteractive-client==2.5.1",  # torch-free remote client + shared wire protocol (numpy/httpx/blosc2). Pinned in lockstep — bump together with this package's version.
+    "nninteractive-client==2.5.2",  # torch-free remote client + shared wire protocol (numpy/httpx/blosc2). Pinned in lockstep — bump together with this package's version.
     "nnunetv2>=2.7.0",
     "torch>=2.1.2,!=2.9.*",
     "acvl-utils>=0.2.3,<0.3",  # 0.3 may bring breaking changes. Careful!
