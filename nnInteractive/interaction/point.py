@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Tuple, Optional
+from typing import Callable, Tuple, Optional
 
 import numpy as np
 import torch
@@ -78,6 +78,7 @@ class PointInteraction_stub:
         binarize: bool = False,
         intensity_scale: float = 1.0,
         channel_idx: Optional[int] = None,
+        before_write: Optional[Callable[[tuple], None]] = None,
     ) -> torch.Tensor:
         """
         Places a point on the interaction map around the specified position.
@@ -91,6 +92,9 @@ class PointInteraction_stub:
         channel_idx (int, optional): If provided, interaction_map is treated as a 4D blosc2 NDArray
                                      and only the structuring element subregion is read/written for
                                      channel channel_idx. Avoids decompressing the full channel.
+        before_write (callable, optional): channel_idx path only. Called with the target slices
+                                     (channel_idx, *spatial slices) right before they are written, e.g. to
+                                     save their previous contents for undo.
 
         Returns:
         The updated interaction map (torch.Tensor for the default path; blosc2 NDArray for channel_idx path).
@@ -134,6 +138,8 @@ class PointInteraction_stub:
             return interaction_map
 
         target_slices = (channel_idx, *slices)
+        if before_write is not None:
+            before_write(target_slices)
         if isinstance(interaction_map, torch.Tensor):
             # Dense torch backend: in-place maximum, no numpy round-trip.
             view = interaction_map[target_slices]

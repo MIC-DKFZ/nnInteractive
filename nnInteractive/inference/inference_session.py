@@ -1,4 +1,4 @@
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version as _package_version
 import os
 import sys
@@ -73,12 +73,12 @@ class nnInteractiveInferenceSession:
         amortized across the whole session lifetime.
 
         ``enable_undo``: keep single-level undo of the last interaction available
-        (default ``True``; see ``undo()``). Undo works by snapshotting the
-        interaction tensor and target buffer before each interaction, which costs
-        extra RAM (a compressed copy of both) and some background CPU per
-        prediction. Set to ``False`` when you know you will never call ``undo()``
-        to skip that overhead entirely; ``undo()`` then always returns ``False``
-        and ``supports_undo`` reports ``False``.
+        (default ``True``; see ``undo()``). Undo works by saving a compressed copy of
+        every region the interaction overwrites (interaction channels and target
+        buffer) just before it is written, which costs a few ms per prediction and
+        the RAM of those compressed regions. Set to ``False`` when you know you will
+        never call ``undo()`` to skip that overhead entirely; ``undo()`` then always
+        returns ``False`` and ``supports_undo`` reports ``False``.
 
         ``interactions_storage``: storage backend for the interaction tensor, one of
         ``"blosc2"``, ``"tensor"`` or ``"auto"`` (default).
@@ -164,16 +164,17 @@ class nnInteractiveInferenceSession:
         # fetch just the touched region without diffing.
         self._last_paste_bbox: Optional[List[List[int]]] = None
 
-        # Single-level undo. When disabled (enable_undo=False) no snapshots are taken at all, so
-        # undo() always returns False and none of the snapshot RAM/CPU cost is paid.
-        # _undo_snapshot holds a blosc2-compressed copy of the state *before* the most recent
-        # interaction (the restore target). _pending_snapshot_future is an in-flight async snapshot
-        # of the current state, kicked off after each prediction while the user decides on the next
-        # prompt; it is promoted into _undo_snapshot at the start of the next interaction. See
-        # _snapshot_state / _commit_pending_snapshot / undo.
+        # Single-level undo. When disabled (enable_undo=False) nothing is ever recorded, so undo()
+        # always returns False and none of the RAM/CPU cost is paid.
+        # _undo_log records the most recent interaction (started by _begin_undo_log at the top of every
+        # add_*_interaction): the scalar state before it plus the pre-image of every region it overwrote,
+        # in write order. undo() restores the pre-images in reverse. None means there is nothing to undo.
+        # See _begin_undo_log / _record_interactions_region / undo.
         self.supports_undo: bool = enable_undo
-        self._undo_snapshot: Optional[dict] = None
-        self._pending_snapshot_future = None
+        self._undo_log: Optional[dict] = None
+        # Interaction channels that may be nonzero (written since the interactions were last zeroed).
+        # Operations that rewrite whole channels (renormalization, initial seg) only need to save these.
+        self._dirty_channels: set = set()
 
         # this will be set when loading the model (initialize_from_trained_model_folder)
         self.pad_mode_data = self.preferred_scribble_thickness = self.point_interaction = None
@@ -426,12 +427,15 @@ class nnInteractiveInferenceSession:
             )
             return
         scale = self._interaction_renorm_target / self.current_interaction_intensity
+        # fp16 scaling is not exactly invertible, so undo needs the channels' pre-image.
+        self._record_interactions_channels(channels_to_scale)
         for ch in channels_to_scale:
             self.interactions[ch] *= scale
         self.current_interaction_intensity = self._interaction_renorm_target
 
     def _interactions_inplace_maximum(self, channel_idx: int, int_slicer, new_values) -> None:
         """In-place element-wise maximum for a subregion of a channel."""
+        self._record_interactions_region(channel_idx, int_slicer)
         full_slicer = (channel_idx, *int_slicer)
         if isinstance(self.interactions, torch.Tensor):
             # Dense torch backend: operate in place without a numpy round-trip.
@@ -448,6 +452,7 @@ class nnInteractiveInferenceSession:
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
+        self._record_interactions_channel_overwrite(channel_idx)
         if isinstance(self.interactions, torch.Tensor):
             if not isinstance(value, torch.Tensor):
                 value = torch.as_tensor(value)
@@ -837,9 +842,8 @@ class nnInteractiveInferenceSession:
         self.interactions_future = None
         self.preprocess_future = None
 
-        # Drain any in-flight snapshot before we free the tensors it reads, then drop undo state.
-        self._drain_pending_snapshot()
-        self._undo_snapshot = None
+        self._undo_log = None
+        self._dirty_channels = set()
 
         del self.preprocessed_image
         del self.target_buffer
@@ -900,6 +904,7 @@ class nnInteractiveInferenceSession:
             )
             print(f"Initialize interactions with {backend}{' (auto)' if via_auto else ''}")
         self.interactions = self._new_interactions_array(shape, min(self.torch_n_threads, os.cpu_count()))
+        self._dirty_channels = set()
         self._interactions_shape = shape
         self._interactions_read_buffer = self._new_interactions_read_buffer(shape)
 
@@ -997,12 +1002,11 @@ class nnInteractiveInferenceSession:
         segmentation!
 
         _preserve_undo is an internal flag: add_initial_seg_interaction() resets interactions as part of
-        applying the new seg, but the undo snapshot it just committed must survive so that interaction
-        remains undoable. Public callers must not set it.
+        applying the new seg, but the undo log it just started (holding the pre-reset state) must survive so
+        that interaction remains undoable. Public callers must not set it.
         """
         if not _preserve_undo:
-            self._drain_pending_snapshot()
-            self._undo_snapshot = None
+            self._undo_log = None
         if self.interactions is not None:
             if isinstance(self.interactions, torch.Tensor):
                 # Same image -> same shape, so reuse the existing (possibly pinned) dense buffer
@@ -1011,6 +1015,7 @@ class nnInteractiveInferenceSession:
             else:
                 del self.interactions
                 self.interactions = self._new_interactions_array(self._interactions_shape, os.cpu_count())
+        self._dirty_channels = set()
         self.current_interaction_intensity = 1.0
 
         if self.target_buffer is not None:
@@ -1023,113 +1028,150 @@ class nnInteractiveInferenceSession:
 
     def _blosc2_cparams(self, nthreads: Optional[int] = None) -> dict:
         """LZ4/NOFILTER compression params shared by the live interaction array
-        (_new_interactions_array) and the undo snapshots (_snapshot_state).
+        (_new_interactions_array) and the undo pre-images (_compress_pre_image).
         Interactions compress better with NOFILTER, which is also faster than SHUFFLE."""
         return {
             "codec": blosc2.Codec.LZ4,
             # Level 1, not 5: the interactions tensor is mostly zeros, so the
             # compressed size is unchanged (0.4 MB either way on a 2.9 GB
             # 8x694x512x512 fp16 tensor, measured) while compression drops
-            # 271 ms -> 80 ms. The async post-predict snapshot runs while the
-            # next interaction may already be arriving, so a ~3.4x shorter
-            # CPU burst directly shrinks that contention window.
+            # 271 ms -> 80 ms.
             "clevel": 1,
             "filters": [blosc2.Filter.NOFILTER],
             "nthreads": min(self.torch_n_threads, os.cpu_count()) if nthreads is None else nthreads,
         }
 
     # ------------------------------- undo --------------------------------- #
+    # Single-level undo via an undo log: every add_*_interaction starts a fresh log (_begin_undo_log), and
+    # each write to the interactions or the target buffer first saves the pre-image of the region it is
+    # about to overwrite. undo() restores those pre-images in reverse order, which reproduces the state
+    # before the interaction exactly. Compared with snapshotting the whole state after every prediction,
+    # the cost scales with the size of the change, not the image. Global operations (renormalization,
+    # initial seg) save whole channels, but only the ones that can be nonzero (_dirty_channels).
 
-    @staticmethod
-    def _copy_bbox(bbox: Optional[List[List[int]]]) -> Optional[List[List[int]]]:
-        return None if bbox is None else [list(b) for b in bbox]
-
-    def _snapshot_state(self) -> dict:
-        """Compress the current undoable state into blosc2 NDArrays. Runs in self.executor.
-
-        Always stores blosc2, regardless of the live interactions backend, to bound RAM and reuse
-        the compression machinery. The caller guarantees no mutation happens while this runs
-        (the next interaction blocks on _commit_pending_snapshot; _predict drains first).
-        """
-        cparams = self._blosc2_cparams()
-        if isinstance(self.interactions, torch.Tensor):
-            # .numpy() is a zero-copy view of the (contiguous, possibly pinned) buffer; asarray reads
-            # it directly while compressing, so there is no extra host-side memcopy. blosc2 picks
-            # sensible chunks/blocks for the (C, X, Y, Z) shape and infers typesize from the dtype.
-            interactions = blosc2.asarray(self.interactions.numpy(), cparams=cparams, dparams={"nthreads": 1})
-        else:
-            interactions = self.interactions.copy()
-
-        target = None
-        if self.target_buffer is not None:
-            t_np = (
-                self.target_buffer
-                if isinstance(self.target_buffer, np.ndarray)
-                else self.target_buffer.detach().cpu().numpy()
-            )
-            target = blosc2.asarray(np.ascontiguousarray(t_np), cparams=cparams, dparams={"nthreads": 1})
-
-        return {
-            "interactions": interactions,
-            "target": target,
+    def _begin_undo_log(self) -> None:
+        """Start the undo log of a new interaction, discarding the previous one. Called at the top of every
+        add_*_interaction, before any state is mutated. No-op when undo is disabled."""
+        if not self.supports_undo:
+            return
+        self._undo_log = {
             "current_interaction_intensity": self.current_interaction_intensity,
-            "last_paste_bbox": self._copy_bbox(self._last_paste_bbox),
+            "dirty_channels": set(self._dirty_channels),
+            "records": [],
         }
 
-    def _restore_snapshot(self, snap: dict, target_np: Optional[np.ndarray] = None) -> None:
-        """Restore a snapshot produced by _snapshot_state into the live session (synchronous).
+    def _compress_pre_image(self, region):
+        """Compressed copy of an array region (numpy array or torch view) for the undo log. A CPU region is
+        compressed straight from the (possibly non-contiguous) view; a region on the GPU is cloned there."""
+        if isinstance(region, torch.Tensor):
+            if region.device.type != "cpu":
+                return region.clone()
+            region = region.numpy()
+        return blosc2.asarray(np.asarray(region), cparams=self._blosc2_cparams(), dparams={"nthreads": 1})
 
-        ``target_np``: optionally the already-decompressed ``snap["target"]``, so a caller that
-        needed it anyway (undo's diff) doesn't pay for a second decompression."""
-        snap_inter = snap["interactions"]
-        # Fast path: the live buffer already has the right shape/backend (always true within an
-        # image), so decompress straight into it instead of allocating + pinning a fresh multi-GB
-        # tensor on every undo. For a 4 GB fp16 buffer this is ~0.3s vs ~3s (the pin_memory() of a
-        # fresh allocation dominates the old path).
-        reuse = (
-            self._interactions_storage_resolved == "tensor"
-            and isinstance(self.interactions, torch.Tensor)
-            and tuple(self.interactions.shape) == tuple(snap_inter.shape)
-        )
-        if reuse:
-            dst = self.interactions.numpy()  # zero-copy view of the existing buffer
-            if hasattr(snap_inter, "get_slice_numpy"):
-                # Decompress the whole snapshot directly into dst (no temporary array).
-                snap_inter.get_slice_numpy(dst, ((0,) * dst.ndim, tuple(snap_inter.shape)))
+    @staticmethod
+    def _decompress_pre_image(data):
+        return data if isinstance(data, torch.Tensor) else data[:]
+
+    @staticmethod
+    def _bbox_to_clipped_slicer(bbox: List[List[int]], spatial_shape) -> Optional[tuple]:
+        """Slicer of ``bbox`` clipped to ``spatial_shape`` (the region paste_tensor writes), or None."""
+        clipped = nnInteractiveInferenceSession._clip_bbox_to_shape(bbox, spatial_shape)
+        return None if clipped is None else bounding_box_to_slice(clipped)
+
+    def _record_interactions_region(self, channel: int, spatial_slicer: tuple) -> None:
+        """Save the pre-image of ``interactions[channel][spatial_slicer]`` before it is written.
+        ``spatial_slicer`` must lie inside the image (as the write sites guarantee)."""
+        self._dirty_channels.add(channel)
+        if self._undo_log is None:
+            return
+        spatial_slicer = tuple(spatial_slicer)
+        region = self.interactions[(channel, *spatial_slicer)]
+        if 0 in region.shape:
+            return  # nothing will be written
+        self._undo_log["records"].append(("interactions", channel, spatial_slicer, self._compress_pre_image(region)))
+
+    def _record_interactions_channels(self, channels: List[int], array_replaced: bool = False) -> None:
+        """Save the pre-image of whole interaction channels before a global operation rewrites them. Channels
+        that cannot be nonzero are skipped. ``array_replaced``: the operation swaps in a new blosc2 array
+        instead of writing into the current one (reset_interactions), so the current one can be kept as is."""
+        if self._undo_log is None:
+            return
+        if not isinstance(self.interactions, torch.Tensor) and array_replaced:
+            # blosc2, array about to be swapped out: keep the current one itself (free; covers all channels).
+            self._undo_log["records"].append(("interactions_array", None, None, self.interactions))
+            return
+        channels = [c for c in channels if c in self._dirty_channels]
+        if len(channels) == 0:
+            return
+        if not isinstance(self.interactions, torch.Tensor):
+            # blosc2: a copy of the compressed array is far cheaper than decompressing channels.
+            self._undo_log["records"].append(("interactions_array", None, None, self.interactions.copy()))
+            return
+        for c in channels:
+            self._record_interactions_region(c, (slice(None),) * (self.interactions.ndim - 1))
+
+    def _record_interactions_channel_overwrite(self, channel: int) -> None:
+        """Save the pre-image of a whole channel before it is overwritten. A channel that cannot be nonzero
+        gets a marker instead of a copy (undo zeroes it)."""
+        if self._undo_log is not None and channel not in self._dirty_channels:
+            self._dirty_channels.add(channel)
+            self._undo_log["records"].append(("zero_channel", channel, None, None))
+            return
+        self._record_interactions_region(channel, (slice(None),) * (self.interactions.ndim - 1))
+
+    def _record_target_region(self, spatial_slicer: tuple) -> None:
+        """Save the pre-image of ``target_buffer[spatial_slicer]`` before it is written."""
+        if self._undo_log is None or self.target_buffer is None:
+            return
+        spatial_slicer = tuple(spatial_slicer)
+        region = self.target_buffer[spatial_slicer]
+        if 0 in region.shape:
+            return  # nothing will be written
+        self._undo_log["records"].append(("target", None, spatial_slicer, self._compress_pre_image(region)))
+
+    def _restore_undo_record(self, record) -> None:
+        kind, channel, spatial_slicer, pre_image = record
+        if kind == "interactions_array":
+            self.interactions = pre_image
+            return
+        if kind == "zero_channel":
+            if isinstance(self.interactions, torch.Tensor):
+                self.interactions[channel].zero_()
             else:
-                # Older blosc2 without get_slice_numpy: one temp decompress + copy into the buffer.
-                dst[:] = snap_inter[:]
+                self.interactions[channel] = 0
+            return
+        if kind == "target":
+            dst, slicer = self.target_buffer, spatial_slicer
         else:
-            # Shape/backend changed (e.g. blosc2 backend): rebuild from scratch.
-            del self.interactions
-            if self._interactions_storage_resolved == "tensor":
-                # snap_inter[:] decompresses into a fresh array, so the tensor owns its memory. Not pinned,
-                # for the same reason as in _new_interactions_array.
-                self.interactions = torch.from_numpy(np.ascontiguousarray(snap_inter[:]))
-            else:
-                self.interactions = snap_inter.copy()
+            dst, slicer = self.interactions, (channel, *spatial_slicer)
+        if not isinstance(dst, torch.Tensor):
+            # numpy target buffer or blosc2 interactions
+            dst[slicer] = self._decompress_pre_image(pre_image)
+            return
+        view = dst[slicer]
+        if view.device.type == "cpu" and view.is_contiguous() and hasattr(pre_image, "get_slice_numpy"):
+            # e.g. a whole dense channel: decompress straight into it, no temporary
+            view_np = view.numpy()
+            pre_image.get_slice_numpy(view_np, ((0,) * view_np.ndim, tuple(view_np.shape)))
+        else:
+            values = self._decompress_pre_image(pre_image)
+            if not isinstance(values, torch.Tensor):
+                values = torch.from_numpy(values)
+            view.copy_(values)
 
-        if snap["target"] is not None and self.target_buffer is not None:
-            t_np = target_np if target_np is not None else snap["target"][:]
-            if isinstance(self.target_buffer, np.ndarray):
-                np.copyto(self.target_buffer, t_np)
-            else:
-                self.target_buffer.copy_(torch.from_numpy(np.ascontiguousarray(t_np)))
+    @staticmethod
+    def _slicer_to_bbox(spatial_slicer: tuple, spatial_shape) -> List[List[int]]:
+        return [list(sl.indices(int(s))[:2]) for sl, s in zip(spatial_slicer, spatial_shape)]
 
-        self.current_interaction_intensity = snap["current_interaction_intensity"]
-        self._last_paste_bbox = self._copy_bbox(snap["last_paste_bbox"])
-        self.new_interaction_centers = []
-        self.new_interaction_zoom_out_factors = []
-        empty_cache(self.device)
-
-    def _diff_bbox(self, current, restored: Optional[np.ndarray]) -> Optional[List[List[int]]]:
-        """Bounding box (original-image coords) of voxels that differ between the live target buffer
-        and the restored (decompressed) one, so undo can ship just the changed region. None if
-        identical."""
-        if current is None or restored is None:
-            return None
-        cur = current if isinstance(current, np.ndarray) else current.detach().cpu().numpy()
-        diff = cur != restored
+    def _diff_bbox(self, current, restored) -> Optional[List[List[int]]]:
+        """Bounding box (local to the arrays) of voxels that differ between two equally shaped arrays, so
+        undo can ship just the changed region. None if identical."""
+        if isinstance(current, torch.Tensor):
+            current = current.detach().cpu().numpy()
+        if isinstance(restored, torch.Tensor):
+            restored = restored.detach().cpu().numpy()
+        diff = current != restored
         # Axis projections instead of np.where: np.where materializes 3 int64 index arrays with
         # one entry per differing voxel just to take min/max; np.any projections yield the same
         # bbox from three tiny 1D arrays (same trick as _nonzero_spatial_bbox).
@@ -1142,58 +1184,57 @@ class nnInteractiveInferenceSession:
             bbox.append([int(nz[0]), int(nz[-1]) + 1])
         return bbox
 
-    def _drain_pending_snapshot(self) -> None:
-        """Block until any in-flight async snapshot finishes and discard it. Used before mutating
-        or freeing the tensors it reads."""
-        if self._pending_snapshot_future is not None:
-            self._pending_snapshot_future.result()
-            self._pending_snapshot_future = None
-
-    def _commit_pending_snapshot(self) -> None:
-        """Promote the in-flight snapshot to the undo target. Called at the start of every
-        add_*_interaction, before any state is mutated. Falls back to a synchronous snapshot of
-        the current state when none is in flight (first interaction, or a prior run_prediction=False)."""
-        if not self.supports_undo:
-            # Undo disabled: never snapshot, so no undo target is ever established.
-            return
-        if self._pending_snapshot_future is not None:
-            self._undo_snapshot = self._pending_snapshot_future.result()
-            self._pending_snapshot_future = None
-        else:
-            # No async snapshot in flight (first interaction, or the previous add ran with
-            # run_prediction=False). Snapshot the current live state synchronously so the undo
-            # target reflects the state right before this interaction.
-            self._undo_snapshot = self._snapshot_state()
-
     def undo(self) -> bool:
         """Revert the most recent interaction, restoring the session to its prior state.
 
         Single level: only the last interaction can be undone. Returns True if something was undone,
         False if there was nothing to undo. After undo, the (now current) state becomes undoable again
         only once a new interaction is added. Always returns False when the session was created with
-        enable_undo=False (no snapshots are taken in that case).
+        enable_undo=False (nothing is recorded in that case).
         """
-        # When undo is disabled, no snapshot is ever taken, so this check also covers that case.
-        if self._undo_snapshot is None:
+        # When undo is disabled, no log is ever started, so this check also covers that case.
+        if self._undo_log is None:
             return False
-        self._drain_pending_snapshot()
-        snap = self._undo_snapshot
-        self._undo_snapshot = None
-        # Decompress the snapshot target once; both the diff and the restore need it.
-        target_np = snap["target"][:] if snap["target"] is not None else None
-        # Diff the live target buffer against the snapshot before restoring, so remote callers can
-        # fetch just the changed region via _last_paste_bbox.
-        diff_bbox = self._diff_bbox(self.target_buffer, target_np)
-        self._restore_snapshot(snap, target_np=target_np)
+        log = self._undo_log
+        self._undo_log = None
+        records = log["records"]
+
+        # Remote callers fetch just the changed region via _last_paste_bbox: diff the target buffer before
+        # and after the restore, over the hull of the restored target regions (nothing else changes).
+        target_hull = None
+        if self.target_buffer is not None:
+            spatial_shape = self.target_buffer.shape
+            target_hull = self._union_bboxes(
+                *(self._slicer_to_bbox(r[2], spatial_shape) for r in records if r[0] == "target")
+            )
+        if target_hull is not None:
+            hull_slicer = bounding_box_to_slice(target_hull)
+            before = self.target_buffer[hull_slicer]
+            before = before.clone() if isinstance(before, torch.Tensor) else before.copy()
+
+        # A whole-array record restores every interaction channel, so the interaction records written after
+        # the earliest one would only be overwritten again: skip them.
+        first_array = next((i for i, r in enumerate(records) if r[0] == "interactions_array"), len(records))
+        for i in reversed(range(len(records))):
+            if i > first_array and records[i][0] != "target":
+                continue
+            self._restore_undo_record(records[i])
+
+        diff_bbox = None
+        if target_hull is not None:
+            local_diff = self._diff_bbox(before, self.target_buffer[hull_slicer])
+            del before
+            if local_diff is not None:
+                diff_bbox = self._offset_bboxes([local_diff], target_hull)[0]
+
+        self.current_interaction_intensity = log["current_interaction_intensity"]
+        # A superset is safe: restored channels may be nonzero again.
+        self._dirty_channels |= log["dirty_channels"]
+        self.new_interaction_centers = []
+        self.new_interaction_zoom_out_factors = []
         self._last_paste_bbox = diff_bbox
-        # The restored state is undoable-from-again for the next *new* interaction. ``snap``
-        # already IS the compressed form of the state we just restored (snapshot dicts are never
-        # mutated), so hand it back as an already-completed future instead of recompressing the
-        # whole interaction tensor. Its stale last_paste_bbox field is inert: undo() and _predict
-        # both overwrite _last_paste_bbox right after any future restore.
-        completed = Future()
-        completed.set_result(snap)
-        self._pending_snapshot_future = completed
+        del log, records
+        empty_cache(self.device)
         return True
 
     def add_bbox_interaction(
@@ -1204,7 +1245,7 @@ class nnInteractiveInferenceSession:
         override_capability_checks: bool = False,
     ) -> Optional[List[List[int]]]:
         self._finish_preprocessing_and_initialize_interactions()
-        self._commit_pending_snapshot()
+        self._begin_undo_log()
         # sanity check
         raw_bbox_size = [i[1] - i[0] for i in bbox_coords]
         if any([i == 0 for i in raw_bbox_size]):
@@ -1263,6 +1304,7 @@ class nnInteractiveInferenceSession:
         # place bbox
         slicer = bounding_box_to_slice(transformed_bbox_coordinates)
         channel = bbox_pos_channel if include_interaction else bbox_neg_channel
+        self._record_interactions_region(channel, slicer)
         self.interactions[(channel, *slicer)] = self.current_interaction_intensity
 
         if run_prediction:
@@ -1279,7 +1321,7 @@ class nnInteractiveInferenceSession:
         self._check_capability_or_warn("points", override_capability_checks)
         point_pos_channel, point_neg_channel = self._resolve_channel_pair("points", override_capability_checks)
         self._finish_preprocessing_and_initialize_interactions()
-        self._commit_pending_snapshot()
+        self._begin_undo_log()
 
         # Coordinates are already in the image's coordinate space (no cropping).
         rounded_coordinates = [round(i) for i in coordinates]
@@ -1294,6 +1336,7 @@ class nnInteractiveInferenceSession:
             self.interactions,
             channel_idx=interaction_channel,
             intensity_scale=self.current_interaction_intensity,
+            before_write=lambda target_slices: self._record_interactions_region(target_slices[0], target_slices[1:]),
         )
         if run_prediction:
             return self._predict()
@@ -1327,7 +1370,7 @@ class nnInteractiveInferenceSession:
             )
 
         self._finish_preprocessing_and_initialize_interactions()
-        self._commit_pending_snapshot()
+        self._begin_undo_log()
 
         # interaction_bbox is already in the image's coordinate space (no cropping), and the checks above
         # guarantee it lies fully within the interaction volume, so we write it directly at its bounds.
@@ -1421,9 +1464,13 @@ class nnInteractiveInferenceSession:
             )
 
         self._finish_preprocessing_and_initialize_interactions()
-        self._commit_pending_snapshot()
+        self._begin_undo_log()
 
-        # Preserve the undo snapshot we just committed: this whole initial-seg op is one undoable step.
+        # This whole initial-seg op is one undoable step. It zeroes every interaction channel and overwrites
+        # the entire target buffer, so their pre-images are saved whole (only channels that can be nonzero).
+        self._record_interactions_channels(list(range(self.num_interaction_channels)), array_replaced=True)
+        if self.target_buffer is not None:
+            self._record_target_region((slice(None),) * self.target_buffer.ndim)
         self.reset_interactions(_preserve_undo=True)
 
         if isinstance(self.target_buffer, np.ndarray):
@@ -1522,8 +1569,6 @@ class nnInteractiveInferenceSession:
             GUI/clients that cannot share the underlying buffer can use this to copy only the changed
             sub-volume instead of the whole array. Returns None when no prediction ran (nothing queued).
         """
-        # Make sure no background snapshot is reading the tensors we are about to mutate.
-        self._drain_pending_snapshot()
         if not isinstance(self.interactions, torch.Tensor):
             # cratio is a blosc2-only diagnostic; the dense tensor backend has no compression.
             print("Current cratio", self.interactions.cratio)
@@ -1595,6 +1640,13 @@ class nnInteractiveInferenceSession:
 
             if zoom_out_factor == 1:
                 # simply place pred in the prev_seg channel and target buffer
+                paste_slicer = self._bbox_to_clipped_slicer(scaled_bbox, self.interactions.shape[1:])
+                if paste_slicer is not None:
+                    self._record_interactions_region(prev_seg_channel, paste_slicer)
+                if self.target_buffer is not None:
+                    paste_slicer = self._bbox_to_clipped_slicer(scaled_bbox, self.target_buffer.shape)
+                    if paste_slicer is not None:
+                        self._record_target_region(paste_slicer)
                 paste_tensor(self.interactions, pred.half(), scaled_bbox, channel_idx=prev_seg_channel)
                 self._paste_prediction_to_target_buffer(pred, scaled_bbox)
                 print("No refinement necessary")
@@ -1621,12 +1673,6 @@ class nnInteractiveInferenceSession:
         self.new_interaction_centers = []
         self.new_interaction_zoom_out_factors = []
         empty_cache(self.device)
-
-        # Asynchronously snapshot the now-settled state while the user decides on the next prompt.
-        # The next interaction blocks on this in _commit_pending_snapshot before mutating anything.
-        # Skipped entirely when undo is disabled.
-        if self.supports_undo:
-            self._pending_snapshot_future = self.executor.submit(self._snapshot_state)
 
         return self._clipped_last_paste_bbox()
 
@@ -1839,6 +1885,14 @@ class nnInteractiveInferenceSession:
         # individually keeps every un-refined voxel at its previous full-resolution value; the coarse cache is
         # discarded below.
         final_prev_seg = cache_interactions[prev_seg_channel]
+        # Undo: one pre-image of the (in-image part of the) hull covers all the overlapping pastes below.
+        hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, spatial_shape)
+        if hull_slicer is not None:
+            self._record_interactions_region(prev_seg_channel, hull_slicer)
+        if self.target_buffer is not None:
+            hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, self.target_buffer.shape)
+            if hull_slicer is not None:
+                self._record_target_region(hull_slicer)
         for refinement_bbox in bboxes_ordered:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
             local_slicer = bounding_box_to_slice(local_bbox)
