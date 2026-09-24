@@ -47,8 +47,9 @@ Concurrency model:
     ``run_in_threadpool``. This keeps the event loop free during a long
     ``set_image``/predict so lightweight endpoints — ``/heartbeat``,
     ``/healthz`` — and the background reaper stay responsive, and so two
-    clients can genuinely preprocess concurrently. Acquiring a session/gpu
-    lock therefore also happens off the loop, never stalling it.
+    clients can genuinely preprocess concurrently. Acquiring a session lock
+    and waiting for the GPU thread therefore also happen off the loop, never
+    stalling it.
 """
 
 from __future__ import annotations
@@ -361,8 +362,7 @@ def make_app(
 
     ``gpu_executor``: single-worker executor that runs all GPU-bound work (see
     ``make_gpu_executor``). Pass the one the startup warmup ran on so the warmed cuDNN state
-    is reused; if ``None`` a fresh one is created. The app takes ownership and shuts it down
-    on exit.
+    is reused; if ``None`` a fresh one is created. It is not shut down when the app stops.
     """
     registry = SessionRegistry(
         artifacts=artifacts,
@@ -410,8 +410,11 @@ def make_app(
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+            # Let GPU jobs already queued finish before their sessions are torn down (the executor is
+            # FIFO with one worker, so this no-op runs last). The executor itself stays usable: its
+            # idle thread is joined at interpreter exit, and the app can be started again.
+            await asyncio.get_running_loop().run_in_executor(gpu_executor, lambda: None)
             registry.close_all()
-            gpu_executor.shutdown(wait=True)
 
     app = FastAPI(title="nnInteractive Inference Server", lifespan=lifespan)
 

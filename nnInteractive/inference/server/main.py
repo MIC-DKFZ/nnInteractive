@@ -74,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["blosc2", "tensor", "auto"],
         default="auto",
         help="Storage backend for the interaction tensor (default: auto). 'blosc2': compact "
-        "in-memory array (low RAM, pays (de)compression per read/write). 'tensor': dense pinned "
+        "in-memory array (low RAM, pays (de)compression per read/write). 'tensor': dense "
         "CPU float16 torch.Tensor (more RAM, lower per-access overhead). 'auto': per image, use "
         "'tensor' for images up to 512x512x1024 voxels and 'blosc2' for larger ones.",
     )

@@ -34,7 +34,7 @@ def iterative_3x3_same_padding_pool3d(x, kernel_size: int, use_min_pool: bool = 
     extended by replicating its border voxels.
 
     Args:
-        x (Tensor): Input tensor of shape (N, C, D, H, W)
+        x (Tensor): Input tensor of shape (N, C, D, H, W) or unbatched (C, D, H, W)
         kernel_size (int): Odd window size, the same for all three dimensions.
         use_min_pool (bool): Min instead of max pooling (erosion instead of dilation).
         slab_depth (int): Number of output slices along D computed at once (bounds the temporaries).
@@ -52,6 +52,9 @@ def iterative_3x3_same_padding_pool3d(x, kernel_size: int, use_min_pool: bool = 
     assert kernel_size % 2 == 1, "Only works with odd kernels"
     if kernel_size == 1:
         return x.clone()
+    if x.ndim == 4:
+        # unbatched input, as accepted by F.max_pool3d
+        return iterative_3x3_same_padding_pool3d(x[None], kernel_size, use_min_pool, slab_depth)[0]
     r = (kernel_size - 1) // 2
     op = torch.minimum if use_min_pool else torch.maximum
     depth = x.shape[2]

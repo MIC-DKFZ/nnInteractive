@@ -85,9 +85,9 @@ class nnInteractiveInferenceSession:
         ``"blosc2"``, ``"tensor"`` or ``"auto"`` (default).
         ``"blosc2"`` keeps it as a compact blosc2 in-memory NDArray (low RAM, pays
         (de)compression on every read/write). ``"tensor"`` stores it as a dense CPU
-        float16 ``torch.Tensor`` (more RAM, far lower per-access overhead; pinned memory
-        by default, skipped when ``device`` is not CUDA or on Linux kernel 6.11 where
-        pinning is buggy). ``"auto"`` decides per image at initialization from the
+        float16 ``torch.Tensor`` (more RAM, far lower per-access overhead; not pinned,
+        transfers to the GPU go through a small fixed pinned staging buffer, see
+        ``nnInteractive.utils.staging``). ``"auto"`` decides per image at initialization from the
         interaction tensor's voxel count: at most ``AUTO_TENSOR_MAX_VOXELS`` (512*512*1024)
         spatial voxels uses ``"tensor"``, larger uses ``"blosc2"``.
         """
@@ -1080,8 +1080,8 @@ class nnInteractiveInferenceSession:
             self._undo_log = None
         if self.interactions is not None:
             if isinstance(self.interactions, torch.Tensor):
-                # Same image -> same shape, so reuse the existing (possibly pinned) dense buffer
-                # and just zero it instead of reallocating + re-pinning.
+                # Same image -> same shape, so reuse the existing dense buffer and just zero it
+                # instead of reallocating.
                 self.interactions.zero_()
             else:
                 del self.interactions
@@ -1124,10 +1124,13 @@ class nnInteractiveInferenceSession:
         """Start the undo log of a new interaction, discarding the previous one. Called at the top of every
         add_*_interaction, before any state is mutated. No-op when undo is disabled."""
         if not self.supports_undo:
+            # Also drop a log left over from before undo was disabled, so it neither grows nor stays undoable.
+            self._undo_log = None
             return
         self._undo_log = {
             "current_interaction_intensity": self.current_interaction_intensity,
             "dirty_channels": set(self._dirty_channels),
+            "queued": (list(self.new_interaction_centers), list(self.new_interaction_zoom_out_factors)),
             "records": [],
         }
 
@@ -1135,11 +1138,10 @@ class nnInteractiveInferenceSession:
     def _undoable_interaction(self):
         """Scope of one add_*_interaction (entered after its input validation): starts the interaction's undo log
         and makes the interaction atomic. If it raises (e.g. an OOM during the prediction), everything it
-        already changed is rolled back from its undo log and the previous interaction's undo log, prediction
-        queue and changed-region bbox are reinstated, so the failed call leaves the session as it was. Without
-        undo (enable_undo=False) nothing is recorded and a failed call is not rolled back."""
+        already changed (including the prediction queue) is rolled back from its undo log and the previous
+        interaction's undo log and changed-region bbox are reinstated, so the failed call leaves the session as it
+        was. Without undo (enable_undo=False) nothing is recorded and a failed call is not rolled back."""
         previous_log = self._undo_log
-        queued = (list(self.new_interaction_centers), list(self.new_interaction_zoom_out_factors))
         last_paste_bbox = self._last_paste_bbox
         self._begin_undo_log()
         try:
@@ -1153,7 +1155,6 @@ class nnInteractiveInferenceSession:
                     self._undo_log = None
                     raise
                 self._undo_log = previous_log
-                self.new_interaction_centers, self.new_interaction_zoom_out_factors = queued
                 self._last_paste_bbox = last_paste_bbox
             raise
 
@@ -1338,8 +1339,9 @@ class nnInteractiveInferenceSession:
         self.current_interaction_intensity = log["current_interaction_intensity"]
         # A superset is safe: restored channels may be nonzero again.
         self._dirty_channels |= log["dirty_channels"]
-        self.new_interaction_centers = []
-        self.new_interaction_zoom_out_factors = []
+        # Predictions still pending before the undone interaction stay pending (their prompts are still there).
+        centers, zoom_out_factors = log["queued"]
+        self.new_interaction_centers, self.new_interaction_zoom_out_factors = list(centers), list(zoom_out_factors)
         self._last_paste_bbox = diff_bbox
         del log, records
         empty_cache(self.device)
@@ -2189,8 +2191,8 @@ class nnInteractiveInferenceSession:
         the same weight tensors on the GPU. This is safe as long as callers
         treat these objects as read-only after construction; in the multi-
         session server that is enforced by running inference under
-        ``@torch.inference_mode()`` and serializing predict calls with a
-        global GPU lock.
+        ``@torch.inference_mode()`` and running every predict call on one
+        dedicated GPU thread.
 
         Note: this also mutates ``self`` (applies capability, sets pad/decay/
         thickness) because ``num_interaction_channels`` is required to build the

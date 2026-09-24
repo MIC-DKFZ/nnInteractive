@@ -76,7 +76,7 @@ Session-based inference engine (~2000 lines) that manages state across multiple 
 - **Background threading**: Image preprocessing and interaction initialization run in a ThreadPoolExecutor (max 2 workers) via futures
 - **AutoZoom**: Adaptive patch selection with border change detection; zooms out up to 4x if predictions touch crop boundaries
 - **Refinement**: After coarse prediction, difference maps identify regions needing fine-grained re-prediction
-- **Memory management**: Selective CPU/GPU transfers, pre-allocated tensors, half-precision interactions, pinned memory (disabled on Linux kernel 6.11)
+- **Memory management**: Selective CPU/GPU transfers, pre-allocated tensors, half-precision interactions (not pinned); non-contiguous GPU transfers stream through one fixed pinned staging buffer (`utils/staging.py`, disabled on Linux kernel 6.11)
 
 **Important API constraints**:
 - `use_torch_compile` is supported. The session default is `False`, but the **server enables it by default** (disable with `--no-torch-compile`). When enabled, the first prediction is slow (lazy compilation on the first forward pass) but subsequent ones are faster; the one-time compile cost is amortized across the long-lived server process. `nnInteractiveInferenceSession.warmup()` runs a single dummy forward pass at the network's only input shape (`[1, num_input_channels + num_interaction_channels, *patch_size]` — every prediction path uses this shape) to trigger compilation up front; the server calls it at startup so clients never see the first-prediction delay
@@ -126,6 +126,7 @@ Official weights are hosted on HuggingFace at `MIC-DKFZ/nnInteractive`. The sele
 - **`nnInteractive/interaction/point.py`**: Point interaction with spherical structuring elements and distance transforms. `build_point()` uses `lru_cache` for structuring element reuse.
 - **`nnInteractive/trainer/nnInteractiveTrainer.py`**: Minimal stub extending nnUNetv2. Used only for architecture reconstruction from checkpoints. Adds 7 extra input channels (`num_input_channels + 7`) on top of image channels.
 - **`nnInteractive/utils/crop.py`**: Tensor cropping/padding with boundary handling (`crop_and_pad_into_buffer`, `paste_tensor`, `crop_to_valid`, `pad_cropped`)
+- **`nnInteractive/utils/staging.py`**: `PinnedStager` — one 128 MB pinned buffer per process and device, double-buffered, streams crops of any size to the GPU in slabs (`copy_to` / `copy_into`; `fill_to` decompresses blosc2 straight into it). `get_stager()` returns `None` when staging is unavailable (non-CUDA device, Linux 6.11)
 - **`nnInteractive/utils/bboxes.py`**: Greedy set cover algorithm for generating refinement patch bounding boxes from difference maps; falls back to random sampling when recursion depth exceeds `max_depth`
 - **`nnInteractive/utils/erosion_dilation.py`**: `iterative_3x3_same_padding_pool3d` — used for dilation of point/scribble channels before downsampling (zoom-out) and for morphological opening of the diff map
 - **`nnInteractive/utils/checkpoint_cleansing.py`**: Utility to strip optimizer state and trainer class from checkpoints before release

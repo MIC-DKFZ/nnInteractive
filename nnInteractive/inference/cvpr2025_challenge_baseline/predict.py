@@ -71,8 +71,8 @@ def run_inference(
         verbose=False,
         torch_n_threads=os.cpu_count(),
         do_autozoom=True,
-        # This script never calls undo(); skip the per-interaction snapshot cost
-        # (every run_prediction=False add would otherwise compress the full state).
+        # This script never calls undo(); skip recording the undo log (compressed
+        # pre-images of every region an interaction or prediction overwrites).
         enable_undo=False,
     )
     session.initialize_from_trained_model_folder(
