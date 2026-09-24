@@ -87,10 +87,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-undo",
         action="store_true",
         help="Disable single-level undo for all sessions server-wide (default: enabled). Undo "
-        "snapshots the interaction tensor and target buffer before each interaction, costing extra "
-        "RAM per session and some background CPU per prediction. Pass this to skip that overhead "
-        "when clients never undo; the /undo endpoint then always reports nothing to undo. Undo is "
-        "a server-startup decision — there is no per-client toggle.",
+        "saves a compressed copy of every region an interaction overwrites (interaction channels and "
+        "target buffer) just before it is written, costing a few ms per prediction and the RAM of those "
+        "compressed regions until the next interaction. Pass this to skip that overhead when clients "
+        "never undo; the /undo endpoint then always reports nothing to undo. Undo is a server-startup "
+        "decision — there is no per-client toggle.",
     )
     p.add_argument(
         "--max-sessions",

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from importlib.metadata import version as _package_version
 import os
 import sys
@@ -435,10 +436,10 @@ class nnInteractiveInferenceSession:
 
     def _interactions_inplace_maximum(self, channel_idx: int, int_slicer, new_values) -> None:
         """In-place element-wise maximum for a subregion of a channel."""
-        self._record_interactions_region(channel_idx, int_slicer)
         full_slicer = (channel_idx, *int_slicer)
         if isinstance(self.interactions, torch.Tensor):
             # Dense torch backend: operate in place without a numpy round-trip.
+            self._record_interactions_region(channel_idx, int_slicer)
             if not isinstance(new_values, torch.Tensor):
                 new_values = torch.as_tensor(new_values)
             view = self.interactions[full_slicer]
@@ -447,6 +448,8 @@ class nnInteractiveInferenceSession:
         if isinstance(new_values, torch.Tensor):
             new_values = new_values.cpu().numpy().astype(np.float16)
         current_sub = np.asarray(self.interactions[full_slicer])
+        # the region is decompressed anyway for the read-modify-write: its pre-image is compressed from it
+        self._record_interactions_region(channel_idx, int_slicer, current=current_sub)
         np.maximum(current_sub, new_values, out=current_sub)
         self.interactions[full_slicer] = current_sub
 
@@ -466,8 +469,9 @@ class nnInteractiveInferenceSession:
         """Copy a CPU tensor (typically a non-contiguous crop) to the compute device.
 
         Non-contiguous CPU crops go through the process-wide pinned staging buffer (utils/staging.py), which
-        gathers and transfers them in fixed-size slabs; everything else is a plain ``.to``. The result is
-        always a new tensor on ``self.device``.
+        gathers and transfers them in fixed-size slabs; everything else is a plain ``.to``. NOTE: like ``.to``,
+        this returns ``tensor`` itself (no copy) when it already lives on ``self.device`` (e.g. a CPU session), so
+        never modify the result in place when ``tensor`` is a view of persistent state.
         """
         stager = get_stager(self.device) if tensor.device.type == "cpu" else None
         if stager is None:
@@ -506,33 +510,99 @@ class nnInteractiveInferenceSession:
         shape = [ub - lb for lb, ub in valid]
         if out is None:
             out = torch.empty(shape, dtype=torch.float16, device=self.device)
-        (z0, _), (y0, y1), (x0, x1) = valid
+        lbs = [lb for lb, _ in valid]
 
-        def fill(view: np.ndarray, r0: int, r1: int) -> None:
-            self.interactions.get_slice_numpy(view[None], ((channel, z0 + r0, y0, x0), (channel + 1, z0 + r1, y1, x1)))
+        def fill(view: np.ndarray, lo: tuple, hi: tuple) -> None:
+            # lo/hi: the block of ``out`` to produce, local to ``valid``
+            start = (channel, *[lb + i for lb, i in zip(lbs, lo)])
+            stop = (channel + 1, *[lb + i for lb, i in zip(lbs, hi)])
+            self.interactions.get_slice_numpy(view[None], (start, stop))
 
         get_stager(self.device).fill_to(out, fill)
         return out
 
-    def _read_interactions_to_device(self, full_slicer, device) -> torch.Tensor:
-        """Read an interaction subregion as a torch.Tensor on ``device``, regardless of backend."""
-        if (
-            torch.device(device).type == self.device.type
-            and self._blosc2_staging_available()
-            and isinstance(full_slicer[0], int)
-            and all(isinstance(s, slice) and s.step in (None, 1) for s in full_slicer[1:])
-        ):
-            valid = [[s.start, s.stop] for s in full_slicer[1:]]
-            if all(0 <= lb < ub <= dim for (lb, ub), dim in zip(valid, self.interactions.shape[1:])):
-                return self._blosc2_channel_to_device(full_slicer[0], valid)
-        sub = self.interactions[full_slicer]
-        if not isinstance(sub, torch.Tensor):
-            sub = torch.from_numpy(np.asarray(sub))
-        if torch.device(device).type == self.device.type:
-            return self._to_device(sub)
-        return sub.to(device)
+    def _interactions_region_into(self, channels: Tuple[int, int], valid: List[List[int]], dst: torch.Tensor) -> None:
+        """Copy interaction channels ``channels[0]:channels[1]`` over the in-image region ``valid`` ([[lb, ub]] * 3)
+        into ``dst`` (shape ``[n_channels, *region]``, on the compute device or the CPU, possibly a strided view
+        such as the interior of a zero-padded buffer or a region of the refinement cache).
 
-    def _paste_prediction_to_target_buffer(self, prediction: torch.Tensor, bbox: List[List[int]]) -> None:
+        The one place that reads interaction regions, for every backend:
+        - dense tensor: the CPU view is copied into ``dst`` (through the pinned staging buffer for the device).
+        - blosc2 to the device with pinned staging: each channel is decompressed straight into pinned memory and
+          on to ``dst`` (_blosc2_channel_to_device), no host copy of the region.
+        - blosc2 otherwise: one channel at a time, decompressed directly into ``dst`` where that is a contiguous
+          CPU region, else into the reusable read buffer (when it fits) and copied from there.
+        ``dst`` never aliases the stored interactions, so callers may modify it in place.
+        """
+        if dst.numel() == 0:
+            return
+        c0, c1 = channels
+        spatial = bounding_box_to_slice(valid)
+        to_compute_device = dst.device.type == self.device.type
+
+        def copy(src: torch.Tensor, out: torch.Tensor) -> None:
+            if to_compute_device:
+                self._copy_into_device(src, out)
+            else:
+                out.copy_(src)
+
+        if isinstance(self.interactions, torch.Tensor):
+            copy(self.interactions[(slice(c0, c1), *spatial)], dst)
+            return
+        if to_compute_device and self._blosc2_staging_available():
+            for i, c in enumerate(range(c0, c1)):
+                self._blosc2_channel_to_device(c, valid, out=dst[i])
+            return
+        can_decompress_into = hasattr(self.interactions, "get_slice_numpy")
+        shape = [ub - lb for lb, ub in valid]
+        n = int(np.prod(shape, dtype=np.int64))
+        for i, c in enumerate(range(c0, c1)):
+            key = ((c, *[lb for lb, _ in valid]), (c + 1, *[ub for _, ub in valid]))
+            out = dst[i]
+            if can_decompress_into and out.device.type == "cpu" and out.is_contiguous():
+                self.interactions.get_slice_numpy(out.numpy()[None], key)
+                continue
+            buffer = self._interactions_read_buffer
+            if can_decompress_into and buffer is not None and n <= buffer.size:
+                # a view into the shared read buffer: consumed by the (synchronous) copy before the next channel
+                region = buffer[:n].reshape(1, *shape)
+                self.interactions.get_slice_numpy(region, key)
+                region = region[0]
+            else:
+                region = np.asarray(self.interactions[(c, *spatial)])
+            copy(torch.from_numpy(region), out)
+
+    def _read_interactions_region(self, channel: int, valid: List[List[int]]) -> torch.Tensor:
+        """Interaction channel ``channel`` over the in-image region ``valid`` as a tensor on the compute device,
+        for READ-ONLY use: for the dense backend on a CPU session it is a view of the stored interactions."""
+        if isinstance(self.interactions, torch.Tensor) and self.interactions.device.type == self.device.type:
+            return self.interactions[(channel, *bounding_box_to_slice(valid))]
+        out = torch.empty([ub - lb for lb, ub in valid], dtype=torch.float16, device=self.device)
+        self._interactions_region_into((channel, channel + 1), valid, out[None])
+        return out
+
+    def _paste_interactions(
+        self, channel: int, source: torch.Tensor, bbox: List[List[int]], record_undo: bool = True
+    ) -> None:
+        """Paste ``source`` into interaction channel ``channel`` at ``bbox`` (may extend past the image; the
+        in-image part is written). ``record_undo``: save the pre-image of the written region first. Only pass
+        False when the caller has already recorded a region covering this write."""
+        if record_undo:
+            slicer = self._bbox_to_clipped_slicer(bbox, self.interactions.shape[1:])
+            if slicer is not None:
+                self._record_interactions_region(channel, slicer)
+        paste_tensor(self.interactions, source, bbox, channel_idx=channel)
+
+    def _paste_prediction_to_target_buffer(
+        self, prediction: torch.Tensor, bbox: List[List[int]], record_undo: bool = True
+    ) -> None:
+        """Paste ``prediction`` into the target buffer at ``bbox`` (may extend past the buffer). ``record_undo``:
+        save the pre-image of the written region first. Only pass False when the caller has already recorded a
+        region covering this write."""
+        if record_undo and self.target_buffer is not None:
+            slicer = self._bbox_to_clipped_slicer(bbox, self.target_buffer.shape)
+            if slicer is not None:
+                self._record_target_region(slicer)
         # The target buffer shares the image's coordinate space (no cropping), so the bbox is used directly.
         if isinstance(self.target_buffer, torch.Tensor):
             pred_for_target = prediction.to(self.target_buffer.device)
@@ -585,8 +655,8 @@ class nnInteractiveInferenceSession:
         """Zero only the parts of an uninitialized (torch.empty) cache that lie outside the image.
 
         Refinement bboxes are not clipped to the image, so the cache can extend past the image
-        bounds; those voxels act as zero-padding and are the only ones the
-        crop_and_pad_into_buffer calls in _build_refinement_local_cache do not overwrite.
+        bounds; those voxels act as zero-padding and are the only ones the in-image copies in
+        _build_refinement_local_cache do not overwrite.
         Zeroing just this border instead of the whole cache saves a full memset over the
         (potentially multi-GB) cache.
         """
@@ -610,7 +680,7 @@ class nnInteractiveInferenceSession:
         cache_shape = self._bbox_size(cache_bbox)
 
         # torch.empty + border-only zeroing: the in-image interior is fully overwritten by the
-        # crop_and_pad_into_buffer calls below. No pin_memory for a CPU cache: pinning multiple GB
+        # copies below. No pin_memory for a CPU cache: pinning multiple GB
         # costs seconds (cudaHostAlloc page-pinning) and would not even speed up the per-patch
         # reads, which are non-contiguous slices that cannot DMA directly from pinned memory --
         # they are staged through the small process-wide pinned buffer (utils/staging.py).
@@ -629,30 +699,14 @@ class nnInteractiveInferenceSession:
         crop_and_pad_into_buffer(
             cache_image, cache_bbox, self.preprocessed_image[0], to_device=self._to_device, copy_into=copy_into
         )
-        if isinstance(self.interactions, torch.Tensor):
-            crop_and_pad_into_buffer(
-                cache_interactions, cache_bbox, self.interactions, to_device=self._to_device, copy_into=copy_into
+        # The in-image region goes straight into the cache (for blosc2 one channel at a time; see
+        # _interactions_region_into), so no temporary of the whole region is made on either side.
+        valid = self._clip_bbox_to_shape(cache_bbox, spatial_shape)
+        if valid is not None:
+            tgt = bounding_box_to_slice(self._bbox_to_local(valid, cache_bbox))
+            self._interactions_region_into(
+                (0, self.num_interaction_channels), valid, cache_interactions[(slice(None), *tgt)]
             )
-        elif cache_device.type == self.device.type and self._blosc2_staging_available():
-            # blosc2, cache on the compute device: stream each channel of the in-image region straight from
-            # decompression through the pinned staging buffer into the cache; no host copy of the region.
-            valid = self._clip_bbox_to_shape(cache_bbox, spatial_shape)
-            if valid is not None:
-                tgt = bounding_box_to_slice(self._bbox_to_local(valid, cache_bbox))
-                for c in range(self.num_interaction_channels):
-                    # decompressed straight into the cache region, no device temporary of the channel region
-                    self._blosc2_channel_to_device(c, valid, out=cache_interactions[c][tgt])
-        else:
-            # blosc2, cache on the CPU (or no staging): decompress one channel at a time, so the temporary is one
-            # channel of the region instead of all of them.
-            for c in range(self.num_interaction_channels):
-                crop_and_pad_into_buffer(
-                    cache_interactions[c : c + 1],
-                    cache_bbox,
-                    self.interactions,
-                    source_leading_slice=slice(c, c + 1),
-                    to_device=self._to_device,
-                )
         # .type comparison: torch.device("cuda") != torch.device("cuda:0"), but both mean "the
         # compute device" here (_select_refinement_cache_device only returns self.device or cpu).
         # Must stay consistent with the same check in _refine_coarse_with_local_cache, which
@@ -933,14 +987,15 @@ class nnInteractiveInferenceSession:
     def _new_interactions_read_buffer(self, shape) -> Optional[np.ndarray]:
         """Pre-faulted buffer to decompress blosc2 interaction crops into (Path B), or None.
 
-        Sized for the larger of: all channels of one patch-sized crop (zoom 1), or ONE channel of the largest
-        AutoZoom crop (the patch size scaled by the maximum autozoom factor, capped to the image size). Only
-        allocated for the blosc2 backend that exposes the decompress-into-buffer method; the dense-tensor backend
-        returns views and needs no buffer.
+        Interaction crops are read one channel at a time (_interactions_region_into), so the buffer holds ONE
+        channel of the largest network-input crop: the patch size scaled by the maximum autozoom factor, capped to
+        the image size. Only allocated for the blosc2 backend that exposes the decompress-into-buffer method and
+        cannot decompress straight into pinned staging memory; the dense-tensor backend returns views and needs
+        no buffer.
         """
         if self._interactions_storage_resolved != "blosc2":
             return None
-        if hasattr(self.interactions, "get_slice_numpy") and get_stager(self.device) is not None:
+        if self._blosc2_staging_available():
             # blosc2 crops are decompressed straight into the pinned staging buffer (_blosc2_channel_to_device)
             return None
         if not hasattr(self.interactions, "get_slice_numpy"):
@@ -950,17 +1005,11 @@ class nnInteractiveInferenceSession:
                 "every read (slower). Consider updating blosc2."
             )
             return None
-        # Two users: the zoom-1 path reads all channels of one patch-sized crop; the AutoZoom path reads ONE channel
-        # at a time of a crop up to MAX_AUTOZOOM_FACTOR x the patch (see _build_network_input). Size for the larger.
-        patch = [min(p, s) for p, s in zip(self.configuration_manager.patch_size, shape[1:])]
         max_valid = [
             min(round(p * self.MAX_AUTOZOOM_FACTOR), s)
             for p, s in zip(self.configuration_manager.patch_size, shape[1:])
         ]
-        n = max(
-            self.num_interaction_channels * int(np.prod(patch, dtype=np.int64)),
-            int(np.prod(max_valid, dtype=np.int64)),
-        )
+        n = int(np.prod(max_valid, dtype=np.int64))
         buffer = np.empty(n, dtype=np.float16)
         buffer[:] = 0  # first-touch the pages once, up front
         return buffer
@@ -1082,18 +1131,45 @@ class nnInteractiveInferenceSession:
             "records": [],
         }
 
+    @contextmanager
+    def _undoable_interaction(self):
+        """Scope of one add_*_interaction (entered after its input validation): starts the interaction's undo log
+        and makes the interaction atomic. If it raises (e.g. an OOM during the prediction), everything it
+        already changed is rolled back from its undo log and the previous interaction's undo log, prediction
+        queue and changed-region bbox are reinstated, so the failed call leaves the session as it was. Without
+        undo (enable_undo=False) nothing is recorded and a failed call is not rolled back."""
+        previous_log = self._undo_log
+        queued = (list(self.new_interaction_centers), list(self.new_interaction_zoom_out_factors))
+        last_paste_bbox = self._last_paste_bbox
+        self._begin_undo_log()
+        try:
+            yield
+        except BaseException:
+            if self._undo_log is not None:
+                try:
+                    self.undo()
+                except BaseException:
+                    # The rollback failed as well: the state is inconsistent, so there is nothing safe to undo.
+                    self._undo_log = None
+                    raise
+                self._undo_log = previous_log
+                self.new_interaction_centers, self.new_interaction_zoom_out_factors = queued
+                self._last_paste_bbox = last_paste_bbox
+            raise
+
     def _compress_pre_image(self, region):
-        """Compressed copy of an array region (numpy array or torch view) for the undo log. A CPU region is
-        compressed straight from the (possibly non-contiguous) view; a region on the GPU is cloned there."""
+        """Compressed copy (blosc2, in RAM) of an array region (numpy array or torch view) for the undo log. A CPU
+        region is compressed straight from the (possibly non-contiguous) view,
+        chunk by chunk, so no full-size temporary is made. A region on the GPU is copied to the host and
+        compressed too: a pre-image held in VRAM would stay allocated until the next interaction and eat into the
+        headroom of the next prediction."""
         if isinstance(region, torch.Tensor):
-            if region.device.type != "cpu":
-                return region.clone()
-            region = region.numpy()
+            region = region.cpu().numpy()
         return blosc2.asarray(np.asarray(region), cparams=self._blosc2_cparams(), dparams={"nthreads": 1})
 
     @staticmethod
     def _decompress_pre_image(data):
-        return data if isinstance(data, torch.Tensor) else data[:]
+        return data[:]
 
     @staticmethod
     def _bbox_to_clipped_slicer(bbox: List[List[int]], spatial_shape) -> Optional[tuple]:
@@ -1101,17 +1177,27 @@ class nnInteractiveInferenceSession:
         clipped = nnInteractiveInferenceSession._clip_bbox_to_shape(bbox, spatial_shape)
         return None if clipped is None else bounding_box_to_slice(clipped)
 
-    def _record_interactions_region(self, channel: int, spatial_slicer: tuple) -> None:
+    def _record_interactions_region(self, channel: int, spatial_slicer: tuple, current=None) -> None:
         """Save the pre-image of ``interactions[channel][spatial_slicer]`` before it is written.
-        ``spatial_slicer`` must lie inside the image (as the write sites guarantee)."""
+        ``spatial_slicer`` must lie inside the image (as the write sites guarantee). ``current``: the region's
+        current values if the caller already holds them (a blosc2 read-modify-write), so they are not
+        decompressed a second time."""
         self._dirty_channels.add(channel)
         if self._undo_log is None:
             return
         spatial_slicer = tuple(spatial_slicer)
-        region = self.interactions[(channel, *spatial_slicer)]
-        if 0 in region.shape:
+        if any(len(range(*sl.indices(int(n)))) == 0 for sl, n in zip(spatial_slicer, self.interactions.shape[1:])):
             return  # nothing will be written
-        self._undo_log["records"].append(("interactions", channel, spatial_slicer, self._compress_pre_image(region)))
+        key = (channel, *spatial_slicer)
+        if current is not None:
+            pre_image = self._compress_pre_image(current)
+        elif isinstance(self.interactions, torch.Tensor):
+            pre_image = self._compress_pre_image(self.interactions[key])
+        else:
+            # blosc2: NDArray.slice builds the compressed copy chunk by chunk (whole chunks are copied without
+            # recompression), instead of decompressing the whole region into one host temporary first.
+            pre_image = self.interactions.slice(key, cparams=self._blosc2_cparams(), dparams={"nthreads": 1})
+        self._undo_log["records"].append(("interactions", channel, spatial_slicer, pre_image))
 
     def _record_interactions_channels(self, channels: List[int], array_replaced: bool = False) -> None:
         """Save the pre-image of whole interaction channels before a global operation rewrites them. Channels
@@ -1266,8 +1352,6 @@ class nnInteractiveInferenceSession:
         run_prediction: bool = True,
         override_capability_checks: bool = False,
     ) -> Optional[List[List[int]]]:
-        self._finish_preprocessing_and_initialize_interactions()
-        self._begin_undo_log()
         # sanity check
         raw_bbox_size = [i[1] - i[0] for i in bbox_coords]
         if any([i == 0 for i in raw_bbox_size]):
@@ -1287,6 +1371,15 @@ class nnInteractiveInferenceSession:
         self._check_capability_or_warn(bbox_kind, override_capability_checks)
         bbox_pos_channel, bbox_neg_channel = self._resolve_channel_pair(bbox_kind, override_capability_checks)
 
+        self._finish_preprocessing_and_initialize_interactions()
+        with self._undoable_interaction():
+            return self._add_validated_bbox_interaction(
+                bbox_coords, bbox_pos_channel if include_interaction else bbox_neg_channel, run_prediction
+            )
+
+    def _add_validated_bbox_interaction(
+        self, bbox_coords, channel: int, run_prediction: bool
+    ) -> Optional[List[List[int]]]:
         # Coordinates are already in the image's coordinate space (no cropping).
         transformed_bbox_coordinates = [[round(i[0]), round(i[1])] for i in bbox_coords]
 
@@ -1323,9 +1416,8 @@ class nnInteractiveInferenceSession:
 
         self._prepare_new_interaction_intensity()
 
-        # place bbox
+        # place bbox (clipped to the image above)
         slicer = bounding_box_to_slice(transformed_bbox_coordinates)
-        channel = bbox_pos_channel if include_interaction else bbox_neg_channel
         self._record_interactions_region(channel, slicer)
         self.interactions[(channel, *slicer)] = self.current_interaction_intensity
 
@@ -1343,26 +1435,27 @@ class nnInteractiveInferenceSession:
         self._check_capability_or_warn("points", override_capability_checks)
         point_pos_channel, point_neg_channel = self._resolve_channel_pair("points", override_capability_checks)
         self._finish_preprocessing_and_initialize_interactions()
-        self._begin_undo_log()
+        with self._undoable_interaction():
+            # Coordinates are already in the image's coordinate space (no cropping).
+            rounded_coordinates = [round(i) for i in coordinates]
 
-        # Coordinates are already in the image's coordinate space (no cropping).
-        rounded_coordinates = [round(i) for i in coordinates]
+            self._add_patch_for_point_interaction(rounded_coordinates)
 
-        self._add_patch_for_point_interaction(rounded_coordinates)
+            self._prepare_new_interaction_intensity()
 
-        self._prepare_new_interaction_intensity()
-
-        interaction_channel = point_pos_channel if include_interaction else point_neg_channel
-        self.point_interaction.place_point(
-            rounded_coordinates,
-            self.interactions,
-            channel_idx=interaction_channel,
-            intensity_scale=self.current_interaction_intensity,
-            before_write=lambda target_slices: self._record_interactions_region(target_slices[0], target_slices[1:]),
-        )
-        if run_prediction:
-            return self._predict()
-        return None
+            interaction_channel = point_pos_channel if include_interaction else point_neg_channel
+            self.point_interaction.place_point(
+                rounded_coordinates,
+                self.interactions,
+                channel_idx=interaction_channel,
+                intensity_scale=self.current_interaction_intensity,
+                before_write=lambda target_slices, current: self._record_interactions_region(
+                    target_slices[0], target_slices[1:], current=current
+                ),
+            )
+            if run_prediction:
+                return self._predict()
+            return None
 
     def _add_image_interaction(
         self,
@@ -1392,32 +1485,31 @@ class nnInteractiveInferenceSession:
             )
 
         self._finish_preprocessing_and_initialize_interactions()
-        self._begin_undo_log()
+        with self._undoable_interaction():
+            # interaction_bbox is already in the image's coordinate space (no cropping), and the checks above
+            # guarantee it lies fully within the interaction volume, so we write it directly at its bounds.
+            lbs = [ib[0] for ib in interaction_bbox]
 
-        # interaction_bbox is already in the image's coordinate space (no cropping), and the checks above
-        # guarantee it lies fully within the interaction volume, so we write it directly at its bounds.
-        lbs = [ib[0] for ib in interaction_bbox]
+            image_t = torch.from_numpy(image)
+            self._generic_add_patch_from_image(image_t, offset=lbs)
 
-        image_t = torch.from_numpy(image)
-        self._generic_add_patch_from_image(image_t, offset=lbs)
+            self._prepare_new_interaction_intensity()
 
-        self._prepare_new_interaction_intensity()
+            int_slicer = bounding_box_to_slice(interaction_bbox)
+            # Convert to fp16 before scaling: multiplying the (typically uint8) mask by a Python float
+            # would promote to a full-volume float64 temporary. astype always copies, so the in-place
+            # scale below never mutates the caller's array.
+            new_values = image_t.numpy().astype(np.float16)
+            if self.current_interaction_intensity != 1:
+                new_values *= self.current_interaction_intensity
+            self._interactions_inplace_maximum(interaction_channel, int_slicer, new_values)
+            del new_values
+            del image_t
+            empty_cache(self.device)
 
-        int_slicer = bounding_box_to_slice(interaction_bbox)
-        # Convert to fp16 before scaling: multiplying the (typically uint8) mask by a Python float
-        # would promote to a full-volume float64 temporary. astype always copies, so the in-place
-        # scale below never mutates the caller's array.
-        new_values = image_t.numpy().astype(np.float16)
-        if self.current_interaction_intensity != 1:
-            new_values *= self.current_interaction_intensity
-        self._interactions_inplace_maximum(interaction_channel, int_slicer, new_values)
-        del new_values
-        del image_t
-        empty_cache(self.device)
-
-        if run_prediction:
-            return self._predict()
-        return None
+            if run_prediction:
+                return self._predict()
+            return None
 
     def _add_mask_interaction(
         self,
@@ -1486,36 +1578,35 @@ class nnInteractiveInferenceSession:
             )
 
         self._finish_preprocessing_and_initialize_interactions()
-        self._begin_undo_log()
+        with self._undoable_interaction():
+            # This whole initial-seg op is one undoable step. It zeroes every interaction channel and overwrites
+            # the entire target buffer, so their pre-images are saved whole (only channels that can be nonzero).
+            self._record_interactions_channels(list(range(self.num_interaction_channels)), array_replaced=True)
+            if self.target_buffer is not None:
+                self._record_target_region((slice(None),) * self.target_buffer.ndim)
+            self.reset_interactions(_preserve_undo=True)
 
-        # This whole initial-seg op is one undoable step. It zeroes every interaction channel and overwrites
-        # the entire target buffer, so their pre-images are saved whole (only channels that can be nonzero).
-        self._record_interactions_channels(list(range(self.num_interaction_channels)), array_replaced=True)
-        if self.target_buffer is not None:
-            self._record_target_region((slice(None),) * self.target_buffer.ndim)
-        self.reset_interactions(_preserve_undo=True)
+            if isinstance(self.target_buffer, np.ndarray):
+                self.target_buffer[:] = initial_seg
 
-        if isinstance(self.target_buffer, np.ndarray):
-            self.target_buffer[:] = initial_seg
+            initial_seg = torch.from_numpy(initial_seg)
 
-        initial_seg = torch.from_numpy(initial_seg)
+            if isinstance(self.target_buffer, torch.Tensor):
+                self.target_buffer[:] = initial_seg
 
-        if isinstance(self.target_buffer, torch.Tensor):
-            self.target_buffer[:] = initial_seg
+            # initial seg already matches the image's coordinate space (no cropping)
+            # initial seg is written into initial seg buffer
+            interaction_channel = self._get_prev_seg_channel()
+            self._write_interactions_channel(interaction_channel, initial_seg)
 
-        # initial seg already matches the image's coordinate space (no cropping)
-        # initial seg is written into initial seg buffer
-        interaction_channel = self._get_prev_seg_channel()
-        self._write_interactions_channel(interaction_channel, initial_seg)
-
-        empty_cache(self.device)
-        if run_prediction:
-            self._generic_add_patch_from_image(initial_seg)
-            del initial_seg
-            return self._predict(force_full_refine=True)
-        else:
-            del initial_seg
-            return None
+            empty_cache(self.device)
+            if run_prediction:
+                self._generic_add_patch_from_image(initial_seg)
+                del initial_seg
+                return self._predict(force_full_refine=True)
+            else:
+                del initial_seg
+                return None
 
     @torch.inference_mode()
     def warmup(self) -> None:
@@ -1662,14 +1753,7 @@ class nnInteractiveInferenceSession:
 
             if zoom_out_factor == 1:
                 # simply place pred in the prev_seg channel and target buffer
-                paste_slicer = self._bbox_to_clipped_slicer(scaled_bbox, self.interactions.shape[1:])
-                if paste_slicer is not None:
-                    self._record_interactions_region(prev_seg_channel, paste_slicer)
-                if self.target_buffer is not None:
-                    paste_slicer = self._bbox_to_clipped_slicer(scaled_bbox, self.target_buffer.shape)
-                    if paste_slicer is not None:
-                        self._record_target_region(paste_slicer)
-                paste_tensor(self.interactions, pred.half(), scaled_bbox, channel_idx=prev_seg_channel)
+                self._paste_interactions(prev_seg_channel, pred.half(), scaled_bbox)
                 self._paste_prediction_to_target_buffer(pred, scaled_bbox)
                 print("No refinement necessary")
             else:
@@ -1707,38 +1791,15 @@ class nnInteractiveInferenceSession:
         crop_img, pad_image = crop_to_valid(self.preprocessed_image, scaled_bbox)
         zoomed = not all([i == j for i, j in zip(self.configuration_manager.patch_size, scaled_patch_size)])
 
-        # blosc2 + AutoZoom: decompress ONE channel at a time into the read buffer, which is therefore only sized
-        # for one channel at the largest crop (see _new_interactions_read_buffer). The zoomed path below processes
-        # channels one by one anyway. Dense tensors (crops are free views) and the zoom-1 path (one patch-sized
-        # crop) read all channels at once.
-        # blosc2 with pinned staging available: every channel is decompressed straight into the staging buffer and
-        # transferred as it is decompressed (see _blosc2_channel_to_device), at both zoom levels; no host copy.
-        staged_blosc2 = self._blosc2_staging_available()
+        # Interactions are written straight into a buffer of the full scaled size (zero-filled where the crop extends
+        # past the image) instead of transferring the in-image crop and then padding it into a second tensor, which
+        # would make both coexist on the GPU. Same values as padding with zeros (pad_cropped). The buffer is
+        # never a view of the stored interactions, so they can be normalized in place below.
+        # The interactions share the image's spatial shape, so the padding is identical.
+        pad_interaction = pad_image
         valid = [[max(lb, 0), min(ub, s)] for (lb, ub), s in zip(scaled_bbox, self.interactions.shape[1:])]
-        read_per_channel = staged_blosc2 or (zoomed and not isinstance(self.interactions, torch.Tensor))
-        if read_per_channel:
-            interactions_tensor = None
-            # the interactions share the image's spatial shape, so the padding is identical
-            pad_interaction = pad_image
-        else:
-            interactions_tensor, pad_interaction = crop_to_valid(
-                self.interactions, scaled_bbox, out=self._interactions_read_buffer
-            )
-            # For blosc2, crop_to_valid returns a numpy array; convert to torch (still on CPU).
-            if not isinstance(interactions_tensor, torch.Tensor):
-                interactions_tensor = torch.from_numpy(np.asarray(interactions_tensor))
-            previous_prediction = interactions_tensor[prev_seg_channel : prev_seg_channel + 1]
-
-        def read_channel(c: int, full_crop: torch.Tensor | None = interactions_tensor) -> torch.Tensor:
-            """CPU tensor [1, *crop] of interaction channel c. With read_per_channel it is a view into the shared
-            read buffer, valid only until the next read_channel call: move it to the device first (a contiguous
-            pageable .to() is synchronous w.r.t. the host)."""
-            if full_crop is not None:
-                return full_crop[c : c + 1]
-            sub, _ = crop_to_valid(
-                self.interactions, scaled_bbox, out=self._interactions_read_buffer, channels=(c, c + 1)
-            )
-            return torch.from_numpy(np.asarray(sub))
+        interior = tuple(slice(pl, pl + ub - lb) for (pl, _), (lb, ub) in zip(pad_interaction, valid))
+        needs_padding = any(x for pair in pad_interaction for x in pair)
 
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
@@ -1746,20 +1807,12 @@ class nnInteractiveInferenceSession:
             patch_size = self.configuration_manager.patch_size
             max_pool_ks = round_to_nearest_odd(zoom_out_factor * 2 - 1)
             dilation_channels = set(self._get_dilation_channels_for_resample()) if max_pool_ks > 1 else set()
-            # The in-image part of each channel (and of the image) is written straight into the interior of a
-            # zero-filled buffer of the full scaled size, instead of transferring the crop and then padding it into a
-            # second tensor: at zoom 4 the two would coexist on the GPU. Same values as padding with zeros (pad_cropped).
             # One buffer serves all channels: only its interior is ever written, so its zero border stays valid.
-            interior = tuple(slice(pl, pl + ub - lb) for (pl, _), (lb, ub) in zip(pad_interaction, valid))
             padded = torch.zeros([1, *scaled_patch_size], dtype=torch.float16, device=self.device)
 
             def channel_to_padded(c: int) -> torch.Tensor:
                 """Interaction channel c of the crop on the device, zero-padded to the scaled patch, [1, *scaled]."""
-                dst = padded[(0, *interior)]
-                if staged_blosc2:
-                    self._blosc2_channel_to_device(c, valid, out=dst)
-                else:
-                    self._copy_into_device(read_channel(c)[0], dst)
+                self._interactions_region_into((c, c + 1), valid, padded[(slice(None), *interior)])
                 return padded
 
             previous_prediction = interpolate(channel_to_padded(prev_seg_channel)[None], patch_size, mode="nearest")[
@@ -1769,15 +1822,16 @@ class nnInteractiveInferenceSession:
             # Process interaction channels one at a time to avoid materialising the full
             # [num_ch, scaled_patch_size³] tensor on GPU. Peak VRAM ≈ one channel at scaled size.
             num_interaction_ch = self.num_interaction_channels
-            interactions_out = torch.empty([num_interaction_ch, *patch_size], dtype=torch.float16, device=self.device)
+            interactions_tensor = torch.empty(
+                [num_interaction_ch, *patch_size], dtype=torch.float16, device=self.device
+            )
             for i in range(num_interaction_ch):
                 ch = channel_to_padded(i)
                 if i in dilation_channels:
                     ch = iterative_3x3_same_padding_pool3d(ch[None], max_pool_ks)[0]
-                interactions_out[i : i + 1] = interpolate(ch[None], patch_size, mode="area")[0]
+                interactions_tensor[i : i + 1] = interpolate(ch[None], patch_size, mode="area")[0]
                 del ch
-            del interactions_tensor, padded
-            interactions_tensor = interactions_out
+            del padded
 
             # Keep image and interaction tensors in identical spatial frames before concatenation.
             # Interactions use area downsampling (with selective dilation beforehand), image uses trilinear.
@@ -1791,26 +1845,19 @@ class nnInteractiveInferenceSession:
         else:
             # zoom_out_factor == 1: transfer both tensors to GPU, then pad if needed
             crop_img = self._to_device(crop_img)
-            if staged_blosc2:
-                interactions_tensor = torch.empty(
-                    [self.num_interaction_channels, *[ub - lb for lb, ub in valid]],
-                    dtype=torch.float16,
-                    device=self.device,
-                )
-                for c in range(self.num_interaction_channels):
-                    self._blosc2_channel_to_device(c, valid, out=interactions_tensor[c])
-            else:
-                interactions_tensor = self._to_device(interactions_tensor)
+            if needs_padding:
+                crop_img = pad_cropped(crop_img, pad_image)
+            alloc = torch.zeros if needs_padding else torch.empty
+            interactions_tensor = alloc(
+                [self.num_interaction_channels, *scaled_patch_size], dtype=torch.float16, device=self.device
+            )
+            self._interactions_region_into(
+                (0, self.num_interaction_channels), valid, interactions_tensor[(slice(None), *interior)]
+            )
             # previous_prediction is a channel of the interactions crop that was just transferred: copy it on
             # the device instead of sending the same data over PCIe a second time. A separate tensor (clone,
             # not a view) because the interaction channels are normalized in place below.
-            previous_prediction = interactions_tensor[prev_seg_channel : prev_seg_channel + 1].clone()
-            if any(x for pair in pad_image for x in pair):
-                crop_img = pad_cropped(crop_img, pad_image)
-            if any(x for pair in pad_interaction for x in pair):
-                interactions_tensor = pad_cropped(interactions_tensor, pad_interaction)
-                previous_prediction = pad_cropped(previous_prediction, pad_interaction)
-            previous_prediction = previous_prediction[0]
+            previous_prediction = interactions_tensor[prev_seg_channel].clone()
 
         self._normalize_interaction_channels_for_network_(interactions_tensor)
         input_for_predict = torch.cat((crop_img, interactions_tensor))
@@ -1913,7 +1960,8 @@ class nnInteractiveInferenceSession:
         # individually keeps every un-refined voxel at its previous full-resolution value; the coarse cache is
         # discarded below.
         final_prev_seg = cache_interactions[prev_seg_channel]
-        # Undo: one pre-image of the (in-image part of the) hull covers all the overlapping pastes below.
+        # Undo: one pre-image of the (in-image part of the) hull covers all the overlapping pastes below, which
+        # therefore skip their own (record_undo=False).
         hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, spatial_shape)
         if hull_slicer is not None:
             self._record_interactions_region(prev_seg_channel, hull_slicer)
@@ -1925,8 +1973,8 @@ class nnInteractiveInferenceSession:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
             local_slicer = bounding_box_to_slice(local_bbox)
             refined_patch = final_prev_seg[local_slicer]
-            paste_tensor(self.interactions, refined_patch, refinement_bbox, channel_idx=prev_seg_channel)
-            self._paste_prediction_to_target_buffer(refined_patch, refinement_bbox)
+            self._paste_interactions(prev_seg_channel, refined_patch, refinement_bbox, record_undo=False)
+            self._paste_prediction_to_target_buffer(refined_patch, refinement_bbox, record_undo=False)
 
         # Report the full refined ROI (union hull of all bboxes) as the changed region so remote clients copy
         # every potentially-updated voxel in one shot; the per-bbox pastes above each left _last_paste_bbox at
@@ -2000,11 +2048,10 @@ class nnInteractiveInferenceSession:
         pred_bbox = [[max(0, lb), min(ub, int(pred.shape[dim]))] for dim, (lb, ub) in enumerate(pred_bbox)]
         local_seen_bbox = self._bbox_to_local(seen_bbox, planning_bbox)
 
-        seen_slicer = bounding_box_to_slice(seen_bbox)
         pred_slicer = bounding_box_to_slice(pred_bbox)
         local_slicer = bounding_box_to_slice(local_seen_bbox)
 
-        prev_sub = self._read_interactions_to_device((prev_seg_ch, *seen_slicer), self.device)
+        prev_sub = self._read_interactions_region(prev_seg_ch, seen_bbox)
 
         diff_local[local_slicer] = (pred[pred_slicer] != prev_sub).to(diff_local.dtype)
         del prev_sub
@@ -2022,8 +2069,7 @@ class nnInteractiveInferenceSession:
 
     def _mark_prev_seg_in_local_diff(self, diff_local: torch.Tensor, planning_bbox: List[List[int]]) -> None:
         prev_seg_ch = self._get_prev_seg_channel()
-        planning_slicer = bounding_box_to_slice(planning_bbox)
-        prev_sub = self._read_interactions_to_device((prev_seg_ch, *planning_slicer), self.device)
+        prev_sub = self._read_interactions_region(prev_seg_ch, planning_bbox)
         diff_local[prev_sub > 0.5] = 1
         del prev_sub
 

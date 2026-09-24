@@ -165,7 +165,7 @@ def paste_tensor(target, source, bbox, channel_idx=None):
     return target
 
 
-def crop_to_valid(img, bbox, out=None, channels=None):
+def crop_to_valid(img, bbox, out=None):
     """
     Crops the image to the part of the bounding box that lies within the image.
     Supports a 4D tensor of shape (C, X, Y, Z). The bounding box is specified as
@@ -181,9 +181,6 @@ def crop_to_valid(img, bbox, out=None, channels=None):
                               ``get_slice_numpy`` and the crop fits; otherwise ignored and a fresh
                               array is returned. When used, the returned crop is a VIEW into ``out``
                               and is only valid until the next call that reuses the same buffer.
-        channels (tuple, optional): ``(start, stop)`` range of channels to read, default all. With a blosc2
-                              source only these channels are decompressed, so a buffer sized for ONE channel
-                              suffices when the caller reads channel by channel.
 
     Returns:
         cropped: Cropped data of shape (C, cropped_x, cropped_y, cropped_z).
@@ -212,15 +209,14 @@ def crop_to_valid(img, bbox, out=None, channels=None):
     # per-call allocation + first-touch page-fault cost. get_slice_numpy is blosc2's internal
     # decompress-into-buffer method (what __getitem__ calls under the hood); guarded since it is
     # not a documented public API. Falls back to a fresh allocation if the crop would not fit.
-    c0, c1 = (0, img.shape[0]) if channels is None else channels
     if out is not None and not isinstance(img, torch.Tensor) and hasattr(img, "get_slice_numpy"):
         valid_shape = [ce - cs for cs, ce in crop_indices]
-        output_shape = (c1 - c0, *valid_shape)
+        output_shape = (img.shape[0], *valid_shape)
         n = int(np.prod(output_shape, dtype=np.int64))
         if n <= out.size:
             view = out[:n].reshape(output_shape)
-            start = (c0, *[cs for cs, _ in crop_indices])
-            stop = (c1, *[ce for _, ce in crop_indices])
+            start = (0, *[cs for cs, _ in crop_indices])
+            stop = (img.shape[0], *[ce for _, ce in crop_indices])
             img.get_slice_numpy(view, (start, stop))
             return view, pad
         print(
@@ -231,7 +227,7 @@ def crop_to_valid(img, bbox, out=None, channels=None):
 
     # Crop the image on spatial dimensions, leaving the channel dimension intact.
     cropped = img[
-        c0:c1,
+        :,
         crop_indices[0][0] : crop_indices[0][1],
         crop_indices[1][0] : crop_indices[1][1],
         crop_indices[2][0] : crop_indices[2][1],

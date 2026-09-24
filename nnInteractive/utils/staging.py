@@ -94,36 +94,53 @@ class PinnedStager:
             dst[start:end].copy_(staged, non_blocking=True)  # asynchronous DMA on the current stream
             self._events[b].record()
 
-    def fill_to(self, dst: torch.Tensor, fill: Callable[[np.ndarray, int, int], None]) -> None:
-        """Produce the content of device tensor ``dst`` block by block along dim 0 directly in pinned memory.
+    def fill_to(self, dst: torch.Tensor, fill: Callable[[np.ndarray, tuple, tuple], None]) -> None:
+        """Produce the content of device tensor ``dst`` block by block directly in pinned memory.
 
-        ``fill(view, r0, r1)`` must write rows ``r0:r1`` of the result into ``view``, a contiguous numpy array of
-        shape ``(r1 - r0, *dst.shape[1:])`` backed by one pinned half (e.g. a blosc2 decompression straight into
-        it). Each block is DMA'd asynchronously while the next one is produced in the other half, so the
+        ``fill(view, lo, hi)`` must write the box ``[lo, hi)`` of the result (``lo``/``hi``: one start/stop per
+        dimension of ``dst``) into ``view``, a contiguous numpy array of shape ``[h - l for l, h in zip(lo, hi)]``
+        backed by one pinned half (e.g. a blosc2 decompression straight into it). Blocks are runs of rows along
+        dim 0; a row that does not fit into one half is split one dimension deeper (like ``copy_into``), so any
+        shape works. Each block is DMA'd asynchronously while the next one is produced in the other half, so the
         producer (typically memory-bound decompression) overlaps with the transfer and no intermediate host copy
-        of the whole region is ever made. ``dst`` must be on ``self.device``; one row along dim 0 must fit into
-        one half. ``dst`` may be a strided view (e.g. a region of a larger buffer): each block then lands via a
-        device temporary of one block, never of the whole region.
+        of the whole region is ever made. ``dst`` must be on ``self.device`` and may be a strided view (e.g. a
+        region of a larger buffer): each block then lands via a device temporary of one block, never of the
+        whole region.
         """
         if dst.numel() == 0:
             return
-        row_bytes = dst[0].numel() * dst.element_size()
-        if row_bytes > self.half_bytes:
-            raise ValueError(f"one row of {row_bytes} bytes exceeds the staging half of {self.half_bytes} bytes")
-        rows_per_block = self.half_bytes // row_bytes
         with self._lock, torch.cuda.device(self.device):
             if self._halves is None:
                 self._lazy_init()
-            n = dst.shape[0]
-            for start in range(0, n, rows_per_block):
-                end = min(n, start + rows_per_block)
-                b = self._next
-                self._next = 1 - b
-                self._events[b].synchronize()  # the previous DMA out of this half has finished
-                staged = self._halves[b][: (end - start) * row_bytes].view(dst.dtype).view(end - start, *dst.shape[1:])
-                fill(staged.numpy(), start, end)  # synchronous producer writes straight into pinned memory
-                dst[start:end].copy_(staged, non_blocking=True)  # asynchronous DMA on the current stream
-                self._events[b].record()
+            self._fill_to(dst, fill, ())
+
+    def _fill_to(self, dst: torch.Tensor, fill: Callable[[np.ndarray, tuple, tuple], None], prefix: tuple) -> None:
+        # dst is at least 1D; prefix holds the fixed indices of the dimensions already split off.
+        row_bytes = dst[0].numel() * dst.element_size()
+        if dst.ndim > 1 and row_bytes > self.half_bytes:
+            # A single slice along dim 0 does not fit into one half: recurse one dimension deeper.
+            for i in range(dst.shape[0]):
+                self._fill_to(dst[i], fill, (*prefix, i))
+            return
+        rows_per_block = max(1, self.half_bytes // row_bytes)
+        lo_prefix = prefix
+        hi_prefix = tuple(i + 1 for i in prefix)
+        rest = tuple(dst.shape[1:])
+        box_rest = [0] * len(rest)
+        n = dst.shape[0]
+        for start in range(0, n, rows_per_block):
+            end = min(n, start + rows_per_block)
+            b = self._next
+            self._next = 1 - b
+            self._events[b].synchronize()  # the previous DMA out of this half has finished
+            staged = self._halves[b][: (end - start) * row_bytes].view(dst.dtype).view(end - start, *rest)
+            view = staged.numpy()
+            if prefix:
+                view = view.reshape((1,) * len(prefix) + view.shape)  # a view: staged is contiguous
+            # synchronous producer writes straight into pinned memory
+            fill(view, (*lo_prefix, start, *box_rest), (*hi_prefix, end, *rest))
+            dst[start:end].copy_(staged, non_blocking=True)  # asynchronous DMA on the current stream
+            self._events[b].record()
 
 
 _STAGERS: dict[str, PinnedStager] = {}

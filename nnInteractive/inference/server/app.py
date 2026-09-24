@@ -195,7 +195,7 @@ class SessionRegistry:
         self._interactions_storage = interactions_storage
         self._verbose = verbose
         # Server-wide undo policy, decided once at startup (--no-undo). Every session is created
-        # with this value; clients have no say. When False, no session takes undo snapshots.
+        # with this value; clients have no say. When False, no session records undo pre-images.
         self._enable_undo = bool(enable_undo)
         self._entries: dict[str, SessionEntry] = {}
         self._mu = threading.Lock()
@@ -575,6 +575,10 @@ def make_app(
         entry.mark_active()
         with entry.lock:
             try:
+                # Wait for this session's background image preprocessing HERE, on the request thread: every
+                # add_*_interaction starts by waiting for it, and doing that on the single GPU thread would
+                # stall every other session's predictions for the duration of this session's preprocessing.
+                entry.session._finish_preprocessing_and_initialize_interactions()
                 ran_prediction = gpu_executor.submit(gpu_fn, entry.session).result()
                 return _build_prediction_response(entry.session, ran_prediction=ran_prediction)
             except (ValueError, AssertionError) as e:
