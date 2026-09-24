@@ -4,6 +4,27 @@ import numpy as np
 import torch
 
 
+def _nonzero_bbox_inclusive(mask: torch.Tensor) -> Tuple[List[int], List[int]]:
+    """Inclusive per-axis [min, max] coordinates of the nonzero voxels of a 3D mask (which must contain some).
+
+    Same result as ``torch.nonzero(mask).min(0)`` / ``.max(0)``, but without materializing one int64 index triple per
+    nonzero voxel (24 bytes each: several GB of VRAM when a large first prompt on a big object changes most of the
+    refinement-planning region). Instead two max-projections: collapsing axis 0 gives a small plane from which the
+    extents along axes 1 and 2 follow, and axis 0 gets its own projection. The first/last nonzero entry of each 1D
+    projection is found with argmax (which returns the first maximum) and a single host sync.
+    """
+    if mask.dtype == torch.bool:
+        mask = mask.view(torch.uint8)  # zero-copy; amax on uint8
+    plane = mask.amax(dim=0)  # (Y, Z): nonzero where any voxel along axis 0 is
+    projections = [mask.amax(dim=(1, 2)) != 0, plane.amax(dim=1) != 0, plane.amax(dim=0) != 0]
+    ends = []
+    for p in projections:
+        p = p.to(torch.uint8)
+        ends += [torch.argmax(p), p.numel() - 1 - torch.argmax(p.flip(0))]
+    ends = torch.stack(ends).tolist()  # one host sync
+    return ends[0::2], ends[1::2]
+
+
 def generate_bounding_boxes(
     mask,
     bbox_size=(192, 192, 192),
@@ -43,17 +64,12 @@ def generate_bounding_boxes(
     # Adjust end offsets to ensure full bbox_size (handles odd sizes)
     end_offset = [bs - hs for bs, hs in zip(bbox_size, half_size)]  # e.g., 193 - 96 = 97
 
-    # Step 1: Find all object voxels
-    object_voxels = torch.nonzero(mask, as_tuple=False)
-    if object_voxels.numel() == 0:
-        return []
-
-    # Step 2: Compute the object's bounding box to limit potential centers
-    min_coords = object_voxels.min(dim=0)[0]
-    max_coords = object_voxels.max(dim=0)[0]
+    # Steps 1 + 2: the object's bounding box, to limit potential centers (projections, not torch.nonzero: see
+    # _nonzero_bbox_inclusive)
+    min_coords, max_coords = _nonzero_bbox_inclusive(mask)
 
     if isinstance(stride, str) and stride == "auto":
-        stride = [max(1, round((j.item() - i.item()) / 4)) for i, j in zip(min_coords, max_coords)]
+        stride = [max(1, round((j - i) / 4)) for i, j in zip(min_coords, max_coords)]
 
     stride = list(stride)
     # print('stride', stride)
@@ -64,8 +80,8 @@ def generate_bounding_boxes(
     # a CUDA mask. One advanced-indexing call keeps the same lexicographic candidate order.
     axis_ranges = [
         torch.arange(
-            max(0, min_coords[d].item()),
-            min(mask.shape[d], max_coords[d].item() + 1),
+            max(0, min_coords[d]),
+            min(mask.shape[d], max_coords[d] + 1),
             stride[d],
             device=mask.device,
         )
