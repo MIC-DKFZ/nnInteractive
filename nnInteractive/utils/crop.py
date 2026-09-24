@@ -11,6 +11,7 @@ def crop_and_pad_into_buffer(
     source_tensor,
     source_leading_slice=None,
     to_device: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    copy_into: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     """
     Copies a sub-region from source_tensor into target_tensor based on a bounding box.
@@ -27,6 +28,9 @@ def crop_and_pad_into_buffer(
             without decompressing channel 0.
         to_device: Optional function used to move the (CPU) subregion to the target tensor's device when the
             two differ, e.g. the session's pinned-staging copy. Defaults to ``.to(target_tensor.device)``.
+        copy_into: Optional function ``copy_into(src, dst_view)`` that writes the (CPU) subregion straight into the
+            target region on another device, e.g. the session's slab-wise pinned-staging copy. Takes precedence over
+            ``to_device``; avoids materializing the whole subregion on the target device first.
 
     Behavior:
         For each dimension that the bbox covers (i.e. the last len(bbox) dims of source_tensor):
@@ -80,6 +84,9 @@ def crop_and_pad_into_buffer(
     # Transfer only this subregion to the target tensor's device.
     if not isinstance(target_tensor, torch.Tensor):
         sub_source = sub_source.cpu()
+    elif copy_into is not None and sub_source.device != target_tensor.device:
+        copy_into(sub_source, target_tensor[tuple(target_slices)])
+        return
     elif to_device is not None and sub_source.device != target_tensor.device:
         sub_source = to_device(sub_source)
     else:

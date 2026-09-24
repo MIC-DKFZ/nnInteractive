@@ -474,6 +474,18 @@ class nnInteractiveInferenceSession:
             return tensor.to(self.device)
         return stager.copy_to(tensor)
 
+    def _copy_into_device(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Write CPU tensor ``src`` into ``dst``, a (possibly strided) region of a tensor on the compute device.
+
+        Goes through the pinned staging buffer slab by slab (PinnedStager.copy_into), so the device never holds a
+        temporary copy of the whole region -- for multi-GB regions such as the refinement cache that temporary
+        would otherwise be the VRAM peak. Falls back to a plain copy where pinned staging is unavailable."""
+        stager = get_stager(self.device) if src.device.type == "cpu" else None
+        if stager is None:
+            dst.copy_(src.to(dst.device))
+            return
+        stager.copy_into(src, dst)
+
     def _blosc2_staging_available(self) -> bool:
         """blosc2 crops can be decompressed straight into the pinned staging buffer (CUDA, pinned memory usable,
         blosc2 build with decompress-into-buffer)."""
@@ -489,7 +501,8 @@ class nnInteractiveInferenceSession:
         """Decompress one channel of the blosc2 interactions over the in-image region ``valid`` ([[lb, ub]] * 3)
         directly into the pinned staging buffer and on to the device, slab by slab, overlapping decompression
         with the transfer (utils/staging.py, PinnedStager.fill_to). No host copy of the region is made. Returns a
-        contiguous fp16 tensor of shape [ub - lb for each axis] on self.device (``out`` if given)."""
+        contiguous fp16 tensor of shape [ub - lb for each axis] on self.device, or writes into ``out`` if given
+        (which may be a strided region of a larger tensor, e.g. the refinement cache)."""
         shape = [ub - lb for lb, ub in valid]
         if out is None:
             out = torch.empty(shape, dtype=torch.float16, device=self.device)
@@ -609,9 +622,17 @@ class nnInteractiveInferenceSession:
         self._zero_out_of_image_cache_border_(cache_image, cache_bbox, spatial_shape)
         self._zero_out_of_image_cache_border_(cache_interactions, cache_bbox, spatial_shape)
 
-        crop_and_pad_into_buffer(cache_image, cache_bbox, self.preprocessed_image[0], to_device=self._to_device)
+        # A cache on the compute device is filled region by region straight from the pinned staging buffer
+        # (copy_into): transferring the whole in-image region first and then copying it into the cache would hold
+        # a second, equally large copy on the GPU (the cache-build VRAM peak).
+        copy_into = self._copy_into_device if cache_device.type == self.device.type else None
+        crop_and_pad_into_buffer(
+            cache_image, cache_bbox, self.preprocessed_image[0], to_device=self._to_device, copy_into=copy_into
+        )
         if isinstance(self.interactions, torch.Tensor):
-            crop_and_pad_into_buffer(cache_interactions, cache_bbox, self.interactions, to_device=self._to_device)
+            crop_and_pad_into_buffer(
+                cache_interactions, cache_bbox, self.interactions, to_device=self._to_device, copy_into=copy_into
+            )
         elif cache_device.type == self.device.type and self._blosc2_staging_available():
             # blosc2, cache on the compute device: stream each channel of the in-image region straight from
             # decompression through the pinned staging buffer into the cache; no host copy of the region.
@@ -619,7 +640,8 @@ class nnInteractiveInferenceSession:
             if valid is not None:
                 tgt = bounding_box_to_slice(self._bbox_to_local(valid, cache_bbox))
                 for c in range(self.num_interaction_channels):
-                    cache_interactions[c][tgt] = self._blosc2_channel_to_device(c, valid)
+                    # decompressed straight into the cache region, no device temporary of the channel region
+                    self._blosc2_channel_to_device(c, valid, out=cache_interactions[c][tgt])
         else:
             # blosc2, cache on the CPU (or no staging): decompress one channel at a time, so the temporary is one
             # channel of the region instead of all of them.
@@ -1718,46 +1740,52 @@ class nnInteractiveInferenceSession:
             )
             return torch.from_numpy(np.asarray(sub))
 
-        def channel_to_device(c: int) -> torch.Tensor:
-            """Interaction channel c of the crop on the device, [1, *crop]."""
-            if staged_blosc2:
-                return self._blosc2_channel_to_device(c, valid)[None]
-            return self._to_device(read_channel(c))
-
         # resize input_for_predict (which may be larger than patch size) to patch size
         # this implementation may not seem straightforward but it does save VRAM which is crucial here
         if zoomed:
             patch_size = self.configuration_manager.patch_size
             max_pool_ks = round_to_nearest_odd(zoom_out_factor * 2 - 1)
             dilation_channels = set(self._get_dilation_channels_for_resample()) if max_pool_ks > 1 else set()
-            needs_pad_interaction = any(x for pair in pad_interaction for x in pair)
+            # The in-image part of each channel (and of the image) is written straight into the interior of a
+            # zero-filled buffer of the full scaled size, instead of transferring the crop and then padding it into a
+            # second tensor: at zoom 4 the two would coexist on the GPU. Same values as padding with zeros (pad_cropped).
+            # One buffer serves all channels: only its interior is ever written, so its zero border stays valid.
+            interior = tuple(slice(pl, pl + ub - lb) for (pl, _), (lb, ub) in zip(pad_interaction, valid))
+            padded = torch.zeros([1, *scaled_patch_size], dtype=torch.float16, device=self.device)
 
-            previous_prediction = channel_to_device(prev_seg_channel)
-            if needs_pad_interaction:
-                previous_prediction = pad_cropped(previous_prediction, pad_interaction)
-            previous_prediction = interpolate(previous_prediction[None], patch_size, mode="nearest")[0, 0]
+            def channel_to_padded(c: int) -> torch.Tensor:
+                """Interaction channel c of the crop on the device, zero-padded to the scaled patch, [1, *scaled]."""
+                dst = padded[(0, *interior)]
+                if staged_blosc2:
+                    self._blosc2_channel_to_device(c, valid, out=dst)
+                else:
+                    self._copy_into_device(read_channel(c)[0], dst)
+                return padded
+
+            previous_prediction = interpolate(channel_to_padded(prev_seg_channel)[None], patch_size, mode="nearest")[
+                0, 0
+            ]
 
             # Process interaction channels one at a time to avoid materialising the full
             # [num_ch, scaled_patch_size³] tensor on GPU. Peak VRAM ≈ one channel at scaled size.
             num_interaction_ch = self.num_interaction_channels
             interactions_out = torch.empty([num_interaction_ch, *patch_size], dtype=torch.float16, device=self.device)
             for i in range(num_interaction_ch):
-                ch = channel_to_device(i)
-                if needs_pad_interaction:
-                    ch = pad_cropped(ch, pad_interaction)
+                ch = channel_to_padded(i)
                 if i in dilation_channels:
                     ch = iterative_3x3_same_padding_pool3d(ch[None], max_pool_ks)[0]
                 interactions_out[i : i + 1] = interpolate(ch[None], patch_size, mode="area")[0]
                 del ch
-            del interactions_tensor
+            del interactions_tensor, padded
             interactions_tensor = interactions_out
 
             # Keep image and interaction tensors in identical spatial frames before concatenation.
             # Interactions use area downsampling (with selective dilation beforehand), image uses trilinear.
-            crop_img = self._to_device(crop_img)
-            if any(x for pair in pad_image for x in pair):
-                crop_img = pad_cropped(crop_img, pad_image)
-            crop_img = interpolate(crop_img[None], patch_size, mode="trilinear")[0]
+            # The image crop goes straight into a zero-padded buffer as well (the interactions share its shape).
+            img_padded = torch.zeros([crop_img.shape[0], *scaled_patch_size], dtype=crop_img.dtype, device=self.device)
+            self._copy_into_device(crop_img, img_padded[(slice(None), *interior)])
+            crop_img = interpolate(img_padded[None], patch_size, mode="trilinear")[0]
+            del img_padded
 
             empty_cache(self.device)
         else:

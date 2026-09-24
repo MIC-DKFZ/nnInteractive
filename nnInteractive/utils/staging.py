@@ -58,8 +58,23 @@ class PinnedStager:
             self._copy_into(src, dst)
         return dst
 
+    def copy_into(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Copy CPU tensor ``src`` into the existing device tensor ``dst`` (same shape; may be a strided view,
+        e.g. a region of a larger buffer), slab by slab through the pinned buffer. Unlike ``dst.copy_(src)`` or
+        ``dst[...] = src.to(device)``, no device temporary larger than one slab is created, whatever the size of
+        the region -- also for contiguous sources."""
+        if src.numel() == 0:
+            return
+        if src.ndim == 0:
+            dst.copy_(src)
+            return
+        with self._lock, torch.cuda.device(self.device):
+            if self._halves is None:
+                self._lazy_init()
+            self._copy_into(src, dst)
+
     def _copy_into(self, src: torch.Tensor, dst: torch.Tensor) -> None:
-        # src is non-contiguous, hence at least 1D.
+        # src is at least 1D.
         row_bytes = src[0].numel() * src.element_size()
         if src.ndim > 1 and row_bytes > self.half_bytes:
             # A single slice along dim 0 does not fit into one half: recurse one dimension deeper.
@@ -86,11 +101,10 @@ class PinnedStager:
         shape ``(r1 - r0, *dst.shape[1:])`` backed by one pinned half (e.g. a blosc2 decompression straight into
         it). Each block is DMA'd asynchronously while the next one is produced in the other half, so the
         producer (typically memory-bound decompression) overlaps with the transfer and no intermediate host copy
-        of the whole region is ever made. ``dst`` must be contiguous and on ``self.device``; one row along dim 0
-        must fit into one half.
+        of the whole region is ever made. ``dst`` must be on ``self.device``; one row along dim 0 must fit into
+        one half. ``dst`` may be a strided view (e.g. a region of a larger buffer): each block then lands via a
+        device temporary of one block, never of the whole region.
         """
-        if not dst.is_contiguous():
-            raise ValueError("fill_to requires a contiguous destination")
         if dst.numel() == 0:
             return
         row_bytes = dst[0].numel() * dst.element_size()
