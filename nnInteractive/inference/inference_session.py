@@ -1085,7 +1085,9 @@ class nnInteractiveInferenceSession:
                 self.interactions.zero_()
             else:
                 del self.interactions
-                self.interactions = self._new_interactions_array(self._interactions_shape, os.cpu_count())
+                self.interactions = self._new_interactions_array(
+                    self._interactions_shape, min(self.torch_n_threads, os.cpu_count())
+                )
         self._dirty_channels = set()
         self.current_interaction_intensity = 1.0
 
