@@ -145,7 +145,7 @@ class PointInteraction_stub:
             if before_write is not None:
                 before_write(target_slices, None)
             view = interaction_map[target_slices]
-            torch.maximum(view, strel[structuring_slices].to(view.dtype), out=view)
+            torch.maximum(view, strel[structuring_slices].to(device=view.device, dtype=view.dtype), out=view)
             return interaction_map
         # blosc2 backend: read-modify-write only the structuring element subregion
         # (avoids decompressing the full channel).
