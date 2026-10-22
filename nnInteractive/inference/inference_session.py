@@ -456,14 +456,14 @@ class nnInteractiveInferenceSession:
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
         self._record_interactions_region(channel_idx, (slice(None),) * (self.interactions.ndim - 1))
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
         if isinstance(self.interactions, torch.Tensor):
-            if not isinstance(value, torch.Tensor):
-                value = torch.as_tensor(value)
             self.interactions[channel_idx] = value.to(self.interactions.dtype)
             return
-        if isinstance(value, torch.Tensor):
-            value = value.cpu().numpy().astype(np.float16)
-        self.interactions[channel_idx] = value
+        # Cast with torch (multithreaded), not numpy's astype, which converts to float16 element by element: ~0.45 s
+        # instead of a few tens of ms for a 262 Mvox mask, most of add_initial_seg_interaction. Same values.
+        self.interactions[channel_idx] = value.to(torch.float16).cpu().numpy()
 
     def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
         """Copy a CPU tensor (typically a non-contiguous crop) to the compute device.
