@@ -1629,6 +1629,14 @@ class nnInteractiveInferenceSession:
           ``warmup()`` from the thread that will run the predictions, otherwise that
           thread re-pays the autotuning on its first pass (the server therefore runs both
           on one dedicated GPU thread).
+        * **The ops around the network (CUDA)**: the dummy input is built like
+          ``_build_network_input`` builds a one-patch input (non-contiguous CPU crops
+          through the pinned staging buffer, fp16 interactions, float32 concatenation)
+          and the output goes through ``_predict``'s post-network ops (argmax, border
+          change detection). This allocates the process-wide pinned staging buffer
+          (~20 ms, utils/staging.py) and loads these ops' CUDA kernels, which CUDA loads
+          lazily on first use (``CUDA_MODULE_LOADING=LAZY``, the default; ~15 ms in
+          total). Without it both would land on the first prediction.
 
         Every prediction path — the initial coarse pass, the zoom-out iterations,
         and the refinement patches — feeds the network an input of identical shape
@@ -1649,16 +1657,31 @@ class nnInteractiveInferenceSession:
             raise RuntimeError("warmup() requires an initialized network; call initialize_* first")
         if not isinstance(self.network, OptimizedModule) and self.device.type != "cuda":
             return
-        num_input_channels = (
-            determine_num_input_channels(self.plans_manager, self.configuration_manager, self.dataset_json)
-            + self.num_interaction_channels
+        num_image_channels = determine_num_input_channels(
+            self.plans_manager, self.configuration_manager, self.dataset_json
         )
         patch_size = self.configuration_manager.patch_size
-        dummy = torch.zeros((1, num_input_channels, *patch_size), dtype=torch.float32, device=self.device)
         start = time()
+        # Crops of one voxel larger CPU tensors, so they are non-contiguous like real crops (staging buffer path).
+        crop = (slice(None), *[slice(0, p) for p in patch_size])
+        crop_img = torch.zeros((num_image_channels, *[p + 1 for p in patch_size]), dtype=torch.float32)[crop]
+        crop_img = self._to_device(crop_img)
+        interactions_tensor = torch.empty(
+            [self.num_interaction_channels, *patch_size], dtype=torch.float16, device=self.device
+        )
+        self._copy_into_device(
+            torch.zeros((self.num_interaction_channels, *[p + 1 for p in patch_size]), dtype=torch.float16)[crop],
+            interactions_tensor,
+        )
+        previous_prediction = interactions_tensor[self._get_prev_seg_channel()].clone()
+        dummy = torch.cat((crop_img, interactions_tensor))
+        del crop_img, interactions_tensor
         with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            self.network(dummy)
-        del dummy
+            pred = self.network(dummy[None].contiguous())[0].argmax(0).detach()
+            del dummy
+            self._detect_change_at_border(pred, previous_prediction)
+            pred.half()
+        del pred, previous_prediction
         empty_cache(self.device)
         print(f"warmup forward pass complete in {time() - start:.1f}s; the first prediction will be fast")
 
@@ -2176,7 +2199,8 @@ class nnInteractiveInferenceSession:
         # the user's first real prediction where it is far more noticeable. With torch.compile
         # this triggers the (slow, once) lazy compilation; without it, the dummy forward pass
         # still warms a fresh CUDA device (cuDNN algorithm selection / benchmark, allocator
-        # memory pool, CUDA context). warmup() is a no-op when there is nothing to gain (not
+        # memory pool, CUDA context, pinned staging buffer, lazily loaded kernels of the ops
+        # around the network). warmup() is a no-op when there is nothing to gain (not
         # compiled and not on CUDA). The server takes care of its own warmup explicitly (it
         # shares one network across sessions via initialize_from_loaded_artifacts), so we only
         # do this on the direct, local entry point.
