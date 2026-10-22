@@ -2003,7 +2003,10 @@ class nnInteractiveInferenceSession:
             target_hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, self.target_buffer.shape)
             if target_hull_slicer is not None:
                 undo_steps.append(lambda: self._record_target_region(target_hull_slicer))
-        undo_in_loop = cache_interactions.device.type == "cpu" and self.device.type == "cuda"
+        # A target buffer on the GPU would make its pre-image wait for the GPU (as in _record_paste_pre_images_ahead):
+        # then take all of them after the loop, as with the cache on the compute device.
+        target_on_gpu = isinstance(self.target_buffer, torch.Tensor) and self.target_buffer.device.type != "cpu"
+        undo_in_loop = cache_interactions.device.type == "cpu" and self.device.type == "cuda" and not target_on_gpu
 
         for refinement_bbox in bboxes_ordered:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
