@@ -1954,6 +1954,23 @@ class nnInteractiveInferenceSession:
         # go through the process-wide pinned staging buffer (self._to_device, utils/staging.py), which turns
         # the copy into a true DMA without allocating per patch.
 
+        # Undo: one pre-image of the (in-image part of the) hull for the prev_seg channel and one for the target
+        # buffer cover all the overlapping commit pastes below, which therefore skip their own (record_undo=False).
+        # The loop writes only into the cache, so the pre-images are the same wherever they are taken before the
+        # commit, and they cost CPU time only: take them while the GPU is busy. With the cache on the compute device
+        # nothing in the loop waits for the GPU, so the patches are still running after the loop and the pre-images
+        # are taken there. With a CPU cache every patch waits for its prediction (copied back into the cache), so
+        # the GPU would be idle after the loop: take them during the forward passes instead.
+        undo_steps = []
+        hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, spatial_shape)
+        if hull_slicer is not None:
+            undo_steps.append(lambda: self._record_interactions_region(prev_seg_channel, hull_slicer))
+        if self.target_buffer is not None:
+            target_hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, self.target_buffer.shape)
+            if target_hull_slicer is not None:
+                undo_steps.append(lambda: self._record_target_region(target_hull_slicer))
+        undo_in_loop = cache_interactions.device.type == "cpu" and self.device.type == "cuda"
+
         for refinement_bbox in bboxes_ordered:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
             spatial_slicer = bounding_box_to_slice(local_bbox)
@@ -1982,6 +1999,9 @@ class nnInteractiveInferenceSession:
             # Convert on the compute device before any transfer: fp16 is 4x smaller than the int64
             # argmax output.
             pred = pred.to(dtype=cache_interactions.dtype)
+            # The paste below waits for this forward pass: the time until then is free for the undo pre-images.
+            while undo_in_loop and undo_steps and not torch.cuda.current_stream(self.device).query():
+                undo_steps.pop(0)()
             paste_tensor(
                 cache_interactions, pred.to(cache_interactions.device), local_bbox, channel_idx=prev_seg_channel
             )
@@ -1995,15 +2015,8 @@ class nnInteractiveInferenceSession:
         # individually keeps every un-refined voxel at its previous full-resolution value; the coarse cache is
         # discarded below.
         final_prev_seg = cache_interactions[prev_seg_channel]
-        # Undo: one pre-image of the (in-image part of the) hull covers all the overlapping pastes below, which
-        # therefore skip their own (record_undo=False).
-        hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, spatial_shape)
-        if hull_slicer is not None:
-            self._record_interactions_region(prev_seg_channel, hull_slicer)
-        if self.target_buffer is not None:
-            hull_slicer = self._bbox_to_clipped_slicer(cache_bbox, self.target_buffer.shape)
-            if hull_slicer is not None:
-                self._record_target_region(hull_slicer)
+        for step in undo_steps:  # the undo pre-images not taken during the loop (see above)
+            step()
         for refinement_bbox in bboxes_ordered:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
             local_slicer = bounding_box_to_slice(local_bbox)
