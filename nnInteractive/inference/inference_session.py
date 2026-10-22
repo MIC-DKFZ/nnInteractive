@@ -1785,7 +1785,8 @@ class nnInteractiveInferenceSession:
                 "!!!WE NO LONGER RUN ONE PREDICTION PER CENTER AND ONLY USE THE LAST ADDED INTERACTION AS CENTER!!!"
             )
         prediction_center, zoom_out_factor = self.new_interaction_centers[-1], self.new_interaction_zoom_out_factors[-1]
-        zoom_out_factor = min(self.MAX_AUTOZOOM_FACTOR, zoom_out_factor)
+        max_zoom_out_factor = self._effective_max_autozoom_factor()
+        zoom_out_factor = min(max_zoom_out_factor, zoom_out_factor)
 
         start_predict = time()
         with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
@@ -1814,11 +1815,11 @@ class nnInteractiveInferenceSession:
             while has_change and self.do_autozoom:
                 print(f"AutoZoom zoom out factor {zoom_out_factor}")
                 # we allow a max zoom out of MAX_AUTOZOOM_FACTOR
-                if zoom_out_factor >= self.MAX_AUTOZOOM_FACTOR:
+                if zoom_out_factor >= max_zoom_out_factor:
                     break
                 else:
                     zoom_out_factor *= zoom_out_growth_factor
-                    zoom_out_factor = min(self.MAX_AUTOZOOM_FACTOR, zoom_out_factor)
+                    zoom_out_factor = min(max_zoom_out_factor, zoom_out_factor)
 
                 input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction_resized = (
                     self._build_network_input(prediction_center, zoom_out_factor)
@@ -1866,6 +1867,14 @@ class nnInteractiveInferenceSession:
         empty_cache(self.device)
 
         return self._clipped_last_paste_bbox()
+
+    def _effective_max_autozoom_factor(self) -> float:
+        """MAX_AUTOZOOM_FACTOR (may be overridden per session), capped so that the zoomed-out crop stays below
+        2**31 elements: the coarse prediction is upsampled to that size, and CUDA's upsample kernels fail with
+        'invalid argument' beyond 32-bit indexing (~6.7x for a 192**3 patch)."""
+        patch_voxels = float(np.prod(self.configuration_manager.patch_size, dtype=np.float64))
+        int32_cap = 0.99 * ((2**31 - 1) / patch_voxels) ** (1 / 3)
+        return min(float(self.MAX_AUTOZOOM_FACTOR), int32_cap)
 
     def _build_network_input(self, prediction_center, zoom_out_factor):
         scaled_patch_size = [round(i * zoom_out_factor) for i in self.configuration_manager.patch_size]
