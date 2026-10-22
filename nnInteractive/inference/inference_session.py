@@ -455,7 +455,7 @@ class nnInteractiveInferenceSession:
 
     def _write_interactions_channel(self, channel_idx: int, value) -> None:
         """Write a full channel. Handles torch→numpy for blosc2."""
-        self._record_interactions_channel_overwrite(channel_idx)
+        self._record_interactions_region(channel_idx, (slice(None),) * (self.interactions.ndim - 1))
         if isinstance(self.interactions, torch.Tensor):
             if not isinstance(value, torch.Tensor):
                 value = torch.as_tensor(value)
@@ -1120,7 +1120,8 @@ class nnInteractiveInferenceSession:
     # about to overwrite. undo() restores those pre-images in reverse order, which reproduces the state
     # before the interaction exactly. Compared with snapshotting the whole state after every prediction,
     # the cost scales with the size of the change, not the image. Global operations (renormalization,
-    # initial seg) save whole channels, but only the ones that can be nonzero (_dirty_channels).
+    # initial seg) save whole channels, but only the ones that can be nonzero (_dirty_channels); a write into a
+    # channel that cannot be nonzero saves no copy at all.
 
     def _begin_undo_log(self) -> None:
         """Start the undo log of a new interaction, discarding the previous one. Called at the top of every
@@ -1184,7 +1185,9 @@ class nnInteractiveInferenceSession:
         """Save the pre-image of ``interactions[channel][spatial_slicer]`` before it is written.
         ``spatial_slicer`` must lie inside the image (as the write sites guarantee). ``current``: the region's
         current values if the caller already holds them (a blosc2 read-modify-write), so they are not
-        decompressed a second time."""
+        decompressed a second time. A channel that has not been written since it was last zeroed gets no copy
+        (pre-image None): the region is all zeros, and undo zeroes it."""
+        clean = channel not in self._dirty_channels
         self._dirty_channels.add(channel)
         if self._undo_log is None:
             return
@@ -1192,7 +1195,9 @@ class nnInteractiveInferenceSession:
         if any(len(range(*sl.indices(int(n)))) == 0 for sl, n in zip(spatial_slicer, self.interactions.shape[1:])):
             return  # nothing will be written
         key = (channel, *spatial_slicer)
-        if current is not None:
+        if clean:
+            pre_image = None
+        elif current is not None:
             pre_image = self._compress_pre_image(current)
         elif isinstance(self.interactions, torch.Tensor):
             pre_image = self._compress_pre_image(self.interactions[key])
@@ -1222,15 +1227,6 @@ class nnInteractiveInferenceSession:
         for c in channels:
             self._record_interactions_region(c, (slice(None),) * (self.interactions.ndim - 1))
 
-    def _record_interactions_channel_overwrite(self, channel: int) -> None:
-        """Save the pre-image of a whole channel before it is overwritten. A channel that cannot be nonzero
-        gets a marker instead of a copy (undo zeroes it)."""
-        if self._undo_log is not None and channel not in self._dirty_channels:
-            self._dirty_channels.add(channel)
-            self._undo_log["records"].append(("zero_channel", channel, None, None))
-            return
-        self._record_interactions_region(channel, (slice(None),) * (self.interactions.ndim - 1))
-
     def _record_target_region(self, spatial_slicer: tuple) -> None:
         """Save the pre-image of ``target_buffer[spatial_slicer]`` before it is written."""
         if self._undo_log is None or self.target_buffer is None:
@@ -1246,16 +1242,17 @@ class nnInteractiveInferenceSession:
         if kind == "interactions_array":
             self.interactions = pre_image
             return
-        if kind == "zero_channel":
-            if isinstance(self.interactions, torch.Tensor):
-                self.interactions[channel].zero_()
-            else:
-                self.interactions[channel] = 0
-            return
         if kind == "target":
             dst, slicer = self.target_buffer, spatial_slicer
         else:
             dst, slicer = self.interactions, (channel, *spatial_slicer)
+        if pre_image is None:
+            # the region was all zeros
+            if isinstance(dst, torch.Tensor):
+                dst[slicer].zero_()
+            else:
+                dst[slicer] = 0
+            return
         if not isinstance(dst, torch.Tensor):
             # numpy target buffer or blosc2 interactions
             dst[slicer] = self._decompress_pre_image(pre_image)
