@@ -461,6 +461,10 @@ class nnInteractiveInferenceSession:
         if isinstance(self.interactions, torch.Tensor):
             self.interactions[channel_idx] = value.to(self.interactions.dtype)
             return
+        if value.dtype == torch.float64:
+            # torch converts float64 to float16 through float32 and so rounds twice; numpy rounds once
+            self.interactions[channel_idx] = value.cpu().numpy().astype(np.float16)
+            return
         # Cast with torch (multithreaded), not numpy's astype, which converts to float16 element by element: ~0.45 s
         # instead of a few tens of ms for a 262 Mvox mask, most of add_initial_seg_interaction. Same values.
         self.interactions[channel_idx] = value.to(torch.float16).cpu().numpy()
