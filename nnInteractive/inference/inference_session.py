@@ -611,6 +611,31 @@ class nnInteractiveInferenceSession:
         paste_tensor(self.target_buffer, pred_for_target, bbox)
         self._last_paste_bbox = bbox
 
+    def _record_paste_pre_images_ahead(self, bbox: List[List[int]]) -> Optional[tuple]:
+        """Save the undo pre-images of a later paste of a prediction at ``bbox`` (prev_seg channel and target
+        buffer, as _paste_interactions / _paste_prediction_to_target_buffer would) ahead of time, while the GPU is
+        busy. Returns what _drop_undo_records needs to remove them again if that paste does not happen, or None if
+        nothing was saved (then the pastes must save their own)."""
+        if self._undo_log is None or self.device.type != "cuda":
+            return None
+        if isinstance(self.target_buffer, torch.Tensor) and self.target_buffer.device.type != "cpu":
+            return None  # its pre-image would wait for the GPU
+        undo_state = (len(self._undo_log["records"]), set(self._dirty_channels))
+        slicer = self._bbox_to_clipped_slicer(bbox, self.interactions.shape[1:])
+        if slicer is not None:
+            self._record_interactions_region(self._get_prev_seg_channel(), slicer)
+        if self.target_buffer is not None:
+            slicer = self._bbox_to_clipped_slicer(bbox, self.target_buffer.shape)
+            if slicer is not None:
+                self._record_target_region(slicer)
+        return undo_state
+
+    def _drop_undo_records(self, undo_state: tuple) -> None:
+        """Remove the undo records saved since ``undo_state`` (see _record_paste_pre_images_ahead)."""
+        n_records, dirty_channels = undo_state
+        del self._undo_log["records"][n_records:]
+        self._dirty_channels = dirty_channels
+
     def _clipped_last_paste_bbox(self) -> Optional[List[List[int]]]:
         """Return ``_last_paste_bbox`` clipped to the target buffer's spatial bounds, or None.
 
@@ -1740,6 +1765,9 @@ class nnInteractiveInferenceSession:
             # view (e.g. from the dense-tensor backend), and the compiled graph assumes contiguity.
             pred = self.network(input_for_predict[None].contiguous())[0].argmax(0).detach()
             del input_for_predict
+            # Without AutoZoom this prediction is pasted at scaled_bbox: save the undo pre-images of that paste now,
+            # while the GPU runs the forward pass (the border check below waits for it). Dropped if AutoZoom kicks in.
+            paste_undo = self._record_paste_pre_images_ahead(scaled_bbox) if zoom_out_factor == 1 else None
 
             # detect changes at border. If there are, we enter autozoom
             has_change = self._detect_change_at_border(pred, previous_prediction)
@@ -1783,11 +1811,13 @@ class nnInteractiveInferenceSession:
 
             if zoom_out_factor == 1:
                 # simply place pred in the prev_seg channel and target buffer
-                self._paste_interactions(prev_seg_channel, pred.half(), scaled_bbox)
-                self._paste_prediction_to_target_buffer(pred, scaled_bbox)
+                self._paste_interactions(prev_seg_channel, pred.half(), scaled_bbox, record_undo=paste_undo is None)
+                self._paste_prediction_to_target_buffer(pred, scaled_bbox, record_undo=paste_undo is None)
                 print("No refinement necessary")
             else:
                 # do refinement
+                if paste_undo is not None:
+                    self._drop_undo_records(paste_undo)
 
                 if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
                     pred = (
