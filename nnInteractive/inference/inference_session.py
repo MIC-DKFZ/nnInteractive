@@ -1507,7 +1507,6 @@ class nnInteractiveInferenceSession:
             self._interactions_inplace_maximum(interaction_channel, int_slicer, new_values)
             del new_values
             del image_t
-            empty_cache(self.device)
 
             if run_prediction:
                 return self._predict()
@@ -1705,6 +1704,10 @@ class nnInteractiveInferenceSession:
         zoom_out_factor = min(self.MAX_AUTOZOOM_FACTOR, zoom_out_factor)
 
         start_predict = time()
+        if zoom_out_factor > 1:
+            # Starts zoomed (large lasso/scribble/bbox): do not build on top of the cached one-patch working set or
+            # of what writing the interaction left cached.
+            empty_cache(self.device)
         with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
             # make a prediction at zoom_out_factor, remember max_zoom_out_factor
             start_initial_pred = time()
@@ -1719,7 +1722,10 @@ class nnInteractiveInferenceSession:
             # detect changes at border. If there are, we enter autozoom
             has_change = self._detect_change_at_border(pred, previous_prediction)
             del previous_prediction
-            empty_cache(self.device)
+            if zoom_out_factor > 1 or (has_change and self.do_autozoom):
+                # Zoomed prediction (refinement planning follows) or AutoZoom follows: start those larger, differently
+                # shaped allocations from an empty cache. One-patch predictions keep their working set.
+                empty_cache(self.device)
 
             print(
                 f"Took {round(time() - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}"
@@ -1780,7 +1786,11 @@ class nnInteractiveInferenceSession:
 
         self.new_interaction_centers = []
         self.new_interaction_zoom_out_factors = []
-        empty_cache(self.device)
+        if zoom_out_factor > 1:
+            # After zoomed predictions, hand everything back so their blocks do not pile up under later prompts.
+            # One-patch predictions keep their working set cached: the next one-patch prompt reuses it instead of
+            # re-allocating it from the driver (~13 ms per prompt).
+            empty_cache(self.device)
 
         return self._clipped_last_paste_bbox()
 
@@ -1864,7 +1874,8 @@ class nnInteractiveInferenceSession:
         self._normalize_interaction_channels_for_network_(interactions_tensor)
         input_for_predict = torch.cat((crop_img, interactions_tensor))
         del crop_img, interactions_tensor
-        empty_cache(self.device)
+        if zoom_out_factor > 1:
+            empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction
 
     def _refine_coarse(
