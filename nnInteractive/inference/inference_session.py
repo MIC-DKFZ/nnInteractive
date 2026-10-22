@@ -1641,7 +1641,7 @@ class nnInteractiveInferenceSession:
     def warmup(self) -> None:
         """Run a single dummy forward pass to pay one-off first-pass costs up front.
 
-        This serves two purposes:
+        This serves three purposes:
 
         * **torch.compile**: with compilation enabled the network is compiled
           lazily on its first forward pass, which would otherwise make the user's
@@ -1661,7 +1661,7 @@ class nnInteractiveInferenceSession:
           ``_build_network_input`` builds a one-patch input (non-contiguous CPU crops
           through the pinned staging buffer, fp16 interactions, float32 concatenation)
           and the output goes through ``_predict``'s post-network ops (argmax, border
-          change detection). This allocates the process-wide pinned staging buffer
+          change detection, fp16 cast). This allocates the process-wide pinned staging buffer
           (~20 ms, utils/staging.py) and loads these ops' CUDA kernels, which CUDA loads
           lazily on first use (``CUDA_MODULE_LOADING=LAZY``, the default; ~15 ms in
           total). Without it both would land on the first prediction.
@@ -1708,7 +1708,7 @@ class nnInteractiveInferenceSession:
             pred = self.network(dummy[None].contiguous())[0].argmax(0).detach()
             del dummy
             self._detect_change_at_border(pred, previous_prediction)
-            pred.half()
+            pred.half()  # the cast _predict does to paste a one-patch prediction into the prev_seg channel
         del pred, previous_prediction
         empty_cache(self.device)
         print(f"warmup forward pass complete in {time() - start:.1f}s; the first prediction will be fast")
