@@ -50,6 +50,12 @@ class nnInteractiveInferenceSession:
     # (512*512*1024) use the dense tensor backend; larger ones use blosc2 to bound RAM.
     AUTO_TENSOR_MAX_VOXELS = 2**27
     INTERACTIONS_STORAGE_OPTIONS = ("blosc2", "tensor", "auto")
+    # GPU-resident mode (see ``gpu_resident`` in __init__): VRAM that must stay free after the preprocessed image
+    # and the interactions have been placed on the GPU, for the autozoom crops and the refinement cache.
+    GPU_RESIDENT_HEADROOM_BYTES = 24 * 1024**3
+    # Undo pre-images of interaction regions up to this size stay on the GPU (a device clone) in GPU-resident
+    # mode instead of being copied to the host and blosc2-compressed. Larger ones (whole-channel records) go to RAM.
+    GPU_UNDO_MAX_BYTES = 2 * 1024**3
     # Interactions implemented by this inference session.
     SUPPORTED_INTERACTION_KEYS = ("scribble", "lasso", "points", "bbox2d", "bbox3d")
 
@@ -62,6 +68,7 @@ class nnInteractiveInferenceSession:
         do_autozoom: bool = True,
         interactions_storage: str = "auto",
         enable_undo: bool = True,
+        gpu_resident: Union[bool, str] = False,
     ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
@@ -90,12 +97,22 @@ class nnInteractiveInferenceSession:
         ``nnInteractive.utils.staging``). ``"auto"`` decides per image at initialization from the
         interaction tensor's voxel count: at most ``AUTO_TENSOR_MAX_VOXELS`` (512*512*1024)
         spatial voxels uses ``"tensor"``, larger uses ``"blosc2"``.
+
+        ``gpu_resident``: ``True``, ``False`` (default) or ``"auto"``. When active, the preprocessed
+        image (float32) and the interactions (dense float16) live on the CUDA device for the whole
+        session, so autozoom crops and refinement caches are device-side slices instead of host
+        decompression + PCIe transfers. Needs roughly ``(4 + 2 * num_interaction_channels)`` bytes
+        per voxel of VRAM plus ``GPU_RESIDENT_HEADROOM_BYTES``. ``"auto"`` enables it per image when
+        that fits into the free VRAM; ``True`` enables it whenever the device is CUDA. Overrides
+        ``interactions_storage`` for the images it applies to.
         """
         if interactions_storage not in self.INTERACTIONS_STORAGE_OPTIONS:
             raise ValueError(
                 f"interactions_storage must be one of {self.INTERACTIONS_STORAGE_OPTIONS}, "
                 f"got {interactions_storage!r}."
             )
+        if gpu_resident not in (True, False, "auto"):
+            raise ValueError(f"gpu_resident must be True, False or 'auto', got {gpu_resident!r}.")
         print("session initialized")
 
         self.network = None
@@ -135,6 +152,9 @@ class nnInteractiveInferenceSession:
             use_torch_compile = False
         self.use_torch_compile = use_torch_compile
         self.interactions_storage = interactions_storage
+        self.gpu_resident = gpu_resident if device.type == "cuda" else False
+        # Whether the current image is held on the GPU (resolved per image in _background_set_image).
+        self._gpu_resident_active = False
         # Concrete backend ("blosc2"/"tensor") resolved per image in _initialize_interactions.
         self._interactions_storage_resolved: Optional[str] = None
         self.interaction_decay = None
@@ -350,6 +370,10 @@ class nnInteractiveInferenceSession:
         prev_seg_ch = self._get_prev_seg_channel()
         spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
 
+        if isinstance(self.interactions, torch.Tensor) and self.interactions.device.type != "cpu":
+            # GPU-resident: one device-side projection pass over the channel (np.asarray can't read device memory).
+            return self._nonzero_spatial_bbox(self.interactions[prev_seg_ch] > 0.5)
+
         occupancy_x = np.zeros(spatial_shape[0], dtype=bool)
         occupancy_y = np.zeros(spatial_shape[1], dtype=bool)
         occupancy_z = np.zeros(spatial_shape[2], dtype=bool)
@@ -443,7 +467,7 @@ class nnInteractiveInferenceSession:
             if not isinstance(new_values, torch.Tensor):
                 new_values = torch.as_tensor(new_values)
             view = self.interactions[full_slicer]
-            torch.maximum(view, new_values.to(view.dtype), out=view)
+            torch.maximum(view, new_values.to(device=view.device, dtype=view.dtype), out=view)
             return
         if isinstance(new_values, torch.Tensor):
             new_values = new_values.cpu().numpy().astype(np.float16)
@@ -459,7 +483,8 @@ class nnInteractiveInferenceSession:
         if isinstance(self.interactions, torch.Tensor):
             if not isinstance(value, torch.Tensor):
                 value = torch.as_tensor(value)
-            self.interactions[channel_idx] = value.to(self.interactions.dtype)
+            # move first, then convert: a uint8 mask crosses PCIe at half the bytes of fp16
+            self.interactions[channel_idx] = value.to(self.interactions.device).to(self.interactions.dtype)
             return
         if isinstance(value, torch.Tensor):
             value = value.cpu().numpy().astype(np.float16)
@@ -931,13 +956,17 @@ class nnInteractiveInferenceSession:
         empty_cache(self.device)
         self.original_image_shape = None
         self._last_paste_bbox = None
+        self._gpu_resident_active = False
 
     def _resolve_interactions_storage(self, spatial_shape) -> str:
         """Resolve the configured storage to a concrete backend ("blosc2" or "tensor").
 
         For "auto", pick "tensor" for images with at most AUTO_TENSOR_MAX_VOXELS spatial voxels
         (lower per-access overhead) and "blosc2" for larger ones (to bound RAM).
+        GPU-resident images always use "cuda" (a dense tensor on the compute device).
         """
+        if self._gpu_resident_active:
+            return "cuda"
         if self.interactions_storage != "auto":
             return self.interactions_storage
         n_voxels = int(np.prod(spatial_shape, dtype=np.int64))
@@ -947,8 +976,11 @@ class nnInteractiveInferenceSession:
         """Allocate a zeroed interaction array using the resolved backend.
 
         "tensor" selects a dense CPU float16 torch.Tensor (more RAM, lower per-access
-        overhead); "blosc2" uses a compact blosc2 in-memory NDArray.
+        overhead); "blosc2" uses a compact blosc2 in-memory NDArray; "cuda" a dense float16
+        tensor on the compute device (GPU-resident mode).
         """
+        if self._interactions_storage_resolved == "cuda":
+            return torch.zeros(shape, dtype=torch.float16, device=self.device)
         if self._interactions_storage_resolved == "tensor":
             # Deliberately NOT pinned. Only crops of this tensor ever go to the GPU, and those are
             # non-contiguous views that cannot DMA from pinned memory directly; they are staged through a
@@ -973,11 +1005,10 @@ class nnInteractiveInferenceSession:
         self._interactions_storage_resolved = self._resolve_interactions_storage(shape[1:])
         via_auto = self.interactions_storage == "auto"
         if self.verbose or via_auto:
-            backend = (
-                "dense torch.Tensor"
-                if self._interactions_storage_resolved == "tensor"
-                else "blosc2 in-memory compression"
-            )
+            backend = {
+                "cuda": f"dense torch.Tensor on {self.device} (GPU-resident)",
+                "tensor": "dense torch.Tensor",
+            }.get(self._interactions_storage_resolved, "blosc2 in-memory compression")
             print(f"Initialize interactions with {backend}{' (auto)' if via_auto else ''}")
         self.interactions = self._new_interactions_array(shape, min(self.torch_n_threads, os.cpu_count()))
         self._dirty_channels = set()
@@ -1014,8 +1045,53 @@ class nnInteractiveInferenceSession:
         buffer[:] = 0  # first-touch the pages once, up front
         return buffer
 
+    def _resolve_gpu_resident(self, image: np.ndarray) -> bool:
+        """Decide whether this image is held on the GPU (see ``gpu_resident`` in __init__)."""
+        if not self.gpu_resident:
+            return False
+        if self.gpu_resident is True:
+            return True
+        n_voxels = int(np.prod(image.shape[1:], dtype=np.int64))
+        # float32 image + float16 interactions (+ the raw upload, transient while it is converted)
+        needed = n_voxels * (4 + 2 * self.num_interaction_channels + image.dtype.itemsize)
+        empty_cache(self.device)
+        free_mem, _ = torch.cuda.mem_get_info(self.device)
+        fits = free_mem - needed >= self.GPU_RESIDENT_HEADROOM_BYTES
+        print(
+            f"GPU-resident mode {'enabled' if fits else 'disabled (not enough VRAM)'}: needs "
+            f"{needed / 2**30:.1f} GB + {self.GPU_RESIDENT_HEADROOM_BYTES / 2**30:.0f} GB headroom, "
+            f"{free_mem / 2**30:.1f} GB free"
+        )
+        return fits
+
+    @torch.inference_mode()
+    def _background_set_image_gpu(self, image: np.ndarray):
+        """GPU-resident preprocessing: upload the raw array once (at its native dtype, e.g. uint16 = half the bytes
+        of float32), convert and normalize on the device. Same statistics and result as the CPU path; the caller's
+        array is never modified (the upload is a copy)."""
+        raw = torch.from_numpy(np.ascontiguousarray(image)).to(self.device)
+        image = raw.to(torch.float32)
+        del raw
+        spatial_bbox = self._nonzero_spatial_bbox(image)
+        if spatial_bbox is None:
+            raise ValueError("Input image is entirely zero; cannot determine normalization statistics.")
+        self.interactions_future = self.executor.submit(self._initialize_interactions, image)
+        crop = image[bounding_box_to_slice([[0, 1], *spatial_bbox])]
+        mean = crop.mean()
+        std = crop.std()
+        del crop
+        image -= mean
+        image /= std
+        self.preprocessed_image = image
+        self.interactions_future.result()
+        self.interactions_future = None
+        empty_cache(self.device)
+
     @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
+        self._gpu_resident_active = self._resolve_gpu_resident(image)
+        if self._gpu_resident_active:
+            return self._background_set_image_gpu(image)
         # Convert to a float32 torch tensor with exactly one copy (the in-place normalization
         # below must never mutate the caller's array). ascontiguousarray converts dtype and
         # fixes layout in a single pass; only when it was a no-op (already contiguous float32)
@@ -1163,8 +1239,15 @@ class nnInteractiveInferenceSession:
         region is compressed straight from the (possibly non-contiguous) view,
         chunk by chunk, so no full-size temporary is made. A region on the GPU is copied to the host and
         compressed too: a pre-image held in VRAM would stay allocated until the next interaction and eat into the
-        headroom of the next prediction."""
+        headroom of the next prediction. Exception: in GPU-resident mode a device region up to GPU_UNDO_MAX_BYTES is
+        kept as a device clone -- there is VRAM to spare, and it skips the D2H copy + compression on every prompt."""
         if isinstance(region, torch.Tensor):
+            if (
+                self._gpu_resident_active
+                and region.device.type != "cpu"
+                and region.numel() * region.element_size() <= self.GPU_UNDO_MAX_BYTES
+            ):
+                return region.clone()
             region = region.cpu().numpy()
         return blosc2.asarray(np.asarray(region), cparams=self._blosc2_cparams(), dparams={"nthreads": 1})
 
