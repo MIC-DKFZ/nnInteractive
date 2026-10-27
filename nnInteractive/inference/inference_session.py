@@ -609,10 +609,16 @@ class nnInteractiveInferenceSession:
                 self._record_target_region(slicer)
         # The target buffer shares the image's coordinate space (no cropping), so the bbox is used directly.
         if isinstance(self.target_buffer, torch.Tensor):
-            pred_for_target = prediction.to(self.target_buffer.device)
+            target_device = self.target_buffer.device
         else:
-            pred_for_target = prediction.to("cpu")
-        paste_tensor(self.target_buffer, pred_for_target, bbox)
+            target_device = torch.device("cpu")
+        if prediction.device != target_device:
+            # Narrow the 0/1 labels to uint8 on the source device before the transfer: the one-patch prediction is the
+            # int64 argmax. Moving those 57 MB into fresh pageable host memory costs ~30 ms of page faults per prompt
+            # on hosts without transparent huge pages (uint8: <1 ms). The paste casts to the buffer's dtype anyway.
+            # .to("cpu", dtype=torch.uint8) would not help: blocking copies convert on the destination.
+            prediction = prediction.to(torch.uint8)
+        paste_tensor(self.target_buffer, prediction.to(target_device), bbox)
         self._last_paste_bbox = bbox
 
     def _record_paste_pre_images_ahead(self, bbox: List[List[int]]) -> Optional[tuple]:
