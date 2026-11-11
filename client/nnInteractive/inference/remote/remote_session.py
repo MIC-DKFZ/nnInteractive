@@ -61,6 +61,16 @@ def _compression_threads() -> int:
     return max(1, os.cpu_count() or 1)
 
 
+def _decompression_threads() -> int:
+    """blosc2 thread count for decompressing prediction responses.
+
+    Explicit, so blosc2.set_nthreads() elsewhere in the process (e.g. 1) does not apply. 8 decompressed
+    responses, masks and images at least as fast as blosc2's default (core count minus a few) on a
+    16-core workstation.
+    """
+    return max(1, min(8, os.cpu_count() or 1))
+
+
 class SessionExpiredError(RuntimeError):
     """Raised when the server reports the client's lease no longer exists.
 
@@ -325,7 +335,7 @@ class nnInteractiveRemoteInferenceSession:
         body = resp.content
         if len(body) == 0:
             return ran
-        diff = unpack_array(body)
+        diff = unpack_array(body, nthreads=_decompression_threads())
         self._write_bbox_into_target_buffer(diff, bbox)
         return ran
 

@@ -36,6 +36,16 @@ from nnInteractive.utils.rounding import round_to_nearest_odd
 from nnInteractive.utils.staging import get_stager
 
 
+def _blosc2_slice_reads_use_threads() -> bool:
+    """Whether blosc2 decompresses array slices faster with ``dparams`` nthreads > 1.
+
+    Since c-blosc2 3.5.0 the decompression threads write their blocks straight into the destination. Before, they
+    decompressed into a chunk scratch that one thread then copied out, and more threads made interaction crops
+    1.2-2x slower than one (python-blosc2 4.14.1, which bundles c-blosc2 3.3.5)."""
+    lib_version = getattr(blosc2, "blosclib_version", "")
+    return bool(lib_version) and version_to_tuple(lib_version.split()[0])[:3] >= (3, 5, 0)
+
+
 class nnInteractiveInferenceSession:
     # The session version IS the installed nnInteractive package version (used for
     # checkpoint compatibility checks and reported to remote clients). `nnInteractive`
@@ -186,6 +196,11 @@ class nnInteractiveInferenceSession:
 
         torch.set_num_threads(min(torch_n_threads, cpu_count()))
         self.torch_n_threads = torch_n_threads
+        # Decompression threads of every blosc2 array the session reads (interactions, undo pre-images); see
+        # _blosc2_dparams.
+        self._blosc2_decompression_nthreads = (
+            min(torch_n_threads, cpu_count()) if _blosc2_slice_reads_use_threads() else 1
+        )
 
         self.original_image_shape = None
 
@@ -997,10 +1012,7 @@ class nnInteractiveInferenceSession:
             chunks=(1, *[min(64, s) for s in shape[1:]]),
             blocks=(1, *[min(32, s) for s in shape[1:]]),
             cparams=self._blosc2_cparams(compression_nthreads),
-            # Decompression of this sparse interaction tensor is fastest single-threaded:
-            # blosc2's per-chunk thread sync costs more than it saves here, badly so on
-            # many-core/many-CCD servers (see benchmarks). Multithreading only hurts.
-            dparams={"nthreads": 1},
+            dparams=self._blosc2_dparams(),
         )
 
     def _initialize_interactions(self, image_torch: torch.Tensor):
@@ -1149,6 +1161,15 @@ class nnInteractiveInferenceSession:
             "nthreads": min(self.torch_n_threads, os.cpu_count()) if nthreads is None else nthreads,
         }
 
+    def _blosc2_dparams(self) -> dict:
+        """Decompression params of the blosc2 interaction array and its undo pre-images.
+
+        ``torch_n_threads`` threads where blosc2 decompresses slices faster with threads
+        (_blosc2_slice_reads_use_threads), else 1. Given explicitly per array, so neither ``blosc2.set_nthreads()``
+        (e.g. from nnU-Net's data loading in the same process) nor ``OMP_NUM_THREADS`` changes it. Only
+        ``BLOSC_NTHREADS`` does: c-blosc2 applies it to every (de)compression context."""
+        return {"nthreads": self._blosc2_decompression_nthreads}
+
     # ------------------------------- undo --------------------------------- #
     # Single-level undo via an undo log: every add_*_interaction starts a fresh log (_begin_undo_log), and
     # each write to the interactions or the target buffer first saves the pre-image of the region it is
@@ -1204,7 +1225,10 @@ class nnInteractiveInferenceSession:
         headroom of the next prediction."""
         if isinstance(region, torch.Tensor):
             region = region.cpu().numpy()
-        return blosc2.asarray(np.asarray(region), cparams=self._blosc2_cparams(), dparams={"nthreads": 1})
+        # Decompression threads only with blosc2 interactions. With the dense backend, undo alternates these
+        # decompressions with torch copies, and threads made undo ~1 ms slower there (measured) instead of faster.
+        dparams = self._blosc2_dparams() if self._interactions_storage_resolved == "blosc2" else {"nthreads": 1}
+        return blosc2.asarray(np.asarray(region), cparams=self._blosc2_cparams(), dparams=dparams)
 
     @staticmethod
     def _decompress_pre_image(data):
@@ -1239,7 +1263,7 @@ class nnInteractiveInferenceSession:
         else:
             # blosc2: NDArray.slice builds the compressed copy chunk by chunk (whole chunks are copied without
             # recompression), instead of decompressing the whole region into one host temporary first.
-            pre_image = self.interactions.slice(key, cparams=self._blosc2_cparams(), dparams={"nthreads": 1})
+            pre_image = self.interactions.slice(key, cparams=self._blosc2_cparams(), dparams=self._blosc2_dparams())
         self._undo_log["records"].append(("interactions", channel, spatial_slicer, pre_image))
 
     def _record_interactions_channels(self, channels: List[int], array_replaced: bool = False) -> None:

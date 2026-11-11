@@ -172,8 +172,14 @@ def pack_array(
     return b"".join(parts)
 
 
-def unpack_array(buf: bytes) -> np.ndarray:
-    """Inverse of pack_array. Raises ValueError on malformed input."""
+def unpack_array(buf: bytes, nthreads: Optional[int] = None) -> np.ndarray:
+    """Inverse of pack_array. Raises ValueError on malformed input.
+
+    ``nthreads`` is the per-call blosc2 thread count for decompression. ``None`` (the default)
+    inherits blosc2's global ``nthreads``, which ``blosc2.set_nthreads()`` anywhere in the
+    process changes (e.g. to 1: a 577 MB image then takes 5x longer). Pass an explicit value
+    to be independent of that.
+    """
     if len(buf) < 8:
         raise ValueError("packed array too short")
     magic, version, codec_id, ndim, name_len = struct.unpack_from("<4sBBBB", buf, 0)
@@ -202,6 +208,7 @@ def unpack_array(buf: bytes) -> np.ndarray:
     for d in shape:
         nelem *= d
     out = np.empty(nelem, dtype=dtype)
+    extra = {} if nthreads is None else {"nthreads": nthreads}
     itemsize = dtype.itemsize
     total_bytes = nelem * itemsize
     mv = memoryview(buf)
@@ -217,7 +224,7 @@ def unpack_array(buf: bytes) -> np.ndarray:
         nbytes, _, _ = blosc2.get_cbuffer_sizes(src)
         if nbytes != ulen:
             raise ValueError(f"chunk size mismatch: header says {ulen} bytes, frame says {nbytes}")
-        blosc2.decompress2(src, dst=out[written // itemsize : (written + ulen) // itemsize])
+        blosc2.decompress2(src, dst=out[written // itemsize : (written + ulen) // itemsize], **extra)
         written += ulen
         offset += clen
     if written != total_bytes:

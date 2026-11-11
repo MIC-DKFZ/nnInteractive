@@ -379,6 +379,9 @@ def make_app(
     )
     if gpu_executor is None:
         gpu_executor = make_gpu_executor(device)
+    # Explicit decompression threads for uploads: blosc2's global default (core count minus a few) is no faster, and
+    # blosc2.set_nthreads() anywhere in the process would change it.
+    upload_nthreads = min(torch_n_threads, os.cpu_count())
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -649,7 +652,7 @@ def make_app(
         # for many seconds on a large image. Run them in a worker thread so the
         # event loop keeps servicing heartbeats/healthz and the reaper.
         def _work():
-            image = unpack_array(body)
+            image = unpack_array(body, nthreads=upload_nthreads)
 
             def _do(session):
                 # set_image kicks off preprocessing in the session's background thread and sets
@@ -764,7 +767,7 @@ def make_app(
         # Decompression + prediction + response compression are CPU/GPU-bound;
         # run them off the event loop (see set_image).
         def _work():
-            mask = unpack_array(body)
+            mask = unpack_array(body, nthreads=upload_nthreads)
 
             def _gpu(session):
                 method = session.add_scribble_interaction if kind == "scribble" else session.add_lasso_interaction
@@ -790,7 +793,7 @@ def make_app(
         # Decompression + (optional) prediction are CPU/GPU-bound; run them off
         # the event loop (see set_image).
         def _work():
-            initial_seg = unpack_array(body)
+            initial_seg = unpack_array(body, nthreads=upload_nthreads)
 
             def _gpu(session):
                 session.add_initial_seg_interaction(
