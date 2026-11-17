@@ -20,7 +20,7 @@ from nnunetv2.utilities.label_handling.label_handling import determine_num_input
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from torch import nn
 from torch._dynamo import OptimizedModule
-from torch.nn.functional import interpolate
+from torch.nn.functional import interpolate as _torch_interpolate
 
 from nnInteractive.interaction.point import PointInteraction_stub
 from nnInteractive.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
@@ -34,6 +34,18 @@ from nnInteractive.utils.inference_helpers import (
 )
 from nnInteractive.utils.rounding import round_to_nearest_odd
 from nnInteractive.utils.staging import get_stager
+
+
+def interpolate(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """``torch.nn.functional.interpolate`` that also works for float16 tensors on CPU.
+
+    Several interpolation kernels (e.g. ``nearest``) have no float16 implementation on CPU in older PyTorch
+    versions and raise ``"compute_indices_weights_nearest" not implemented for 'Half'``. The computation is then
+    done in float32 and cast back, so the output dtype is unchanged. GPU/other dtypes are untouched.
+    """
+    if x.dtype == torch.float16 and x.device.type == "cpu":
+        return _torch_interpolate(x.to(torch.float32), *args, **kwargs).to(torch.float16)
+    return _torch_interpolate(x, *args, **kwargs)
 
 
 def _blosc2_slice_reads_use_threads() -> bool:
