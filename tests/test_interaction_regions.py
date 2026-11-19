@@ -280,6 +280,53 @@ def test_scribble_write_is_limited_to_its_nonzero_bbox():
     assert s._interaction_regions.boxes(5) == [[[169, 172], [139, 142], [109, 112]]]
 
 
+def _awkward_masks():
+    """Full-size masks whose nonzero bbox is easy to get wrong."""
+    base = np.zeros(SHAPE, dtype=np.int16)
+    base[60:70, 50:60, 40:45] = 1
+    cancelling = base.copy()
+    cancelling[150, 20, 20], cancelling[150, 20, 21] = 1, -1  # projection sums over x-slice 150 are exactly 0
+    floating = base.astype(np.float32) * 0.7
+    floating[10, 10, 10] = -2.5
+    return {
+        "uint8": base.astype(np.uint8),
+        "bool": base.astype(bool),
+        "labels": (base * 3).astype(np.uint8),
+        "float with a negative voxel": floating,
+        "int16 with cancelling projections": cancelling,
+        "empty": np.zeros(SHAPE, dtype=np.uint8),
+    }
+
+
+def _nonzero_bbox(mask):
+    nz = np.nonzero(mask != 0)
+    return [[int(i.min()), int(i.max()) + 1] for i in nz] if nz[0].size else None
+
+
+@pytest.mark.parametrize("storage", ["tensor", "blosc2"])
+@pytest.mark.parametrize("kind", list(_awkward_masks()))
+def test_restricted_mask_writes_equal_whole_mask_writes(storage, kind):
+    """Initial seg and scribbles write only the bbox of the mask's nonzero voxels. The channel must still be exactly
+    what writing the whole mask gives (initial seg: the mask as fp16; scribble: max(0, fp16(mask) * intensity)), and
+    the tracked region must be exactly that bbox."""
+    mask = _awkward_masks()[kind]
+    bbox = _nonzero_bbox(mask)
+    s = make_session(storage, True, "cpu")
+    s.set_image(make_image())
+    s.set_target_buffer(np.zeros(SHAPE, dtype=np.uint8))
+
+    s.add_initial_seg_interaction(mask, run_prediction=False)
+    expected = torch.from_numpy(mask).to(torch.float16).numpy()
+    assert np.array_equal(interactions_numpy(s)[0], expected)
+    assert s._interaction_regions.boxes(0) == ([bbox] if bbox else [])
+
+    s.add_scribble_interaction(mask, True, run_prediction=False)
+    new_values = mask.astype(np.float16)
+    new_values *= s.current_interaction_intensity
+    assert np.array_equal(interactions_numpy(s)[5], np.maximum(np.zeros_like(new_values), new_values))
+    assert s._interaction_regions.boxes(5) == ([bbox] if bbox else [])
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # 3. A write that bypasses _record_interactions_region is caught
 # ----------------------------------------------------------------------------------------------------------------------

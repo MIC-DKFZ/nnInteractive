@@ -503,21 +503,24 @@ class nnInteractiveInferenceSession:
         np.maximum(current_sub, new_values, out=current_sub)
         self.interactions[full_slicer] = current_sub
 
-    def _write_interactions_channel(self, channel_idx: int, value) -> None:
-        """Write a full channel. Handles torch→numpy for blosc2."""
-        self._record_interactions_region(channel_idx, (slice(None),) * (self.interactions.ndim - 1))
+    def _write_interactions_channel(self, channel_idx: int, value, bbox: Optional[List[List[int]]] = None) -> None:
+        """Write ``value`` into interaction channel ``channel_idx`` over ``bbox`` (``value`` has the bbox's shape;
+        default: the whole channel). Handles torch→numpy for blosc2."""
+        spatial = (slice(None),) * (self.interactions.ndim - 1) if bbox is None else bounding_box_to_slice(bbox)
+        self._record_interactions_region(channel_idx, spatial)
+        key = channel_idx if bbox is None else (channel_idx, *spatial)
         if not isinstance(value, torch.Tensor):
             value = torch.as_tensor(value)
         if isinstance(self.interactions, torch.Tensor):
-            self.interactions[channel_idx] = value.to(self.interactions.dtype)
+            self.interactions[key] = value.to(self.interactions.dtype)
             return
         if value.dtype == torch.float64:
             # torch converts float64 to float16 through float32 and so rounds twice; numpy rounds once
-            self.interactions[channel_idx] = value.cpu().numpy().astype(np.float16)
+            self.interactions[key] = value.cpu().numpy().astype(np.float16)
             return
         # Cast with torch (multithreaded), not numpy's astype, which converts to float16 element by element: ~0.45 s
         # instead of a few tens of ms for a 262 Mvox mask, most of add_initial_seg_interaction. Same values.
-        self.interactions[channel_idx] = value.to(torch.float16).cpu().numpy()
+        self.interactions[key] = value.to(torch.float16).cpu().numpy()
 
     def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
         """Copy a CPU tensor (typically a non-contiguous crop) to the compute device.
@@ -1786,11 +1789,22 @@ class nnInteractiveInferenceSession:
             # initial seg already matches the image's coordinate space (no cropping)
             # initial seg is written into initial seg buffer
             interaction_channel = self._get_prev_seg_channel()
-            self._write_interactions_channel(interaction_channel, initial_seg)
+            # The channel was just zeroed (reset above), so writing only the bbox of the mask's nonzero voxels gives the
+            # same channel. That keeps the channel's tracked region (_interaction_regions), i.e. what later network
+            # inputs copy, as small as the segmentation, and skips converting and writing the zeros. Projection sums
+            # (_nonzero_spatial_bbox) are exact for unsigned/bool masks; signed/float masks are compared to 0 first.
+            seg_bbox = self._nonzero_spatial_bbox(initial_seg if not initial_seg.dtype.is_signed else initial_seg != 0)
+            if seg_bbox is not None:
+                self._write_interactions_channel(
+                    interaction_channel, initial_seg[bounding_box_to_slice(seg_bbox)], bbox=seg_bbox
+                )
 
             empty_cache(self.device)
             if run_prediction:
-                self._generic_add_patch_from_image(initial_seg)
+                # For unsigned/bool masks seg_bbox is what it would compute: do not scan the mask a second time.
+                self._generic_add_patch_from_image(
+                    initial_seg, nonzero_bbox=None if initial_seg.dtype.is_signed else seg_bbox
+                )
                 del initial_seg
                 return self._predict(force_full_refine=True)
             else:
@@ -2384,13 +2398,17 @@ class nnInteractiveInferenceSession:
         )
 
     def _generic_add_patch_from_image(
-        self, image: torch.Tensor, offset: Optional[List[int]] = None
+        self,
+        image: torch.Tensor,
+        offset: Optional[List[int]] = None,
+        nonzero_bbox: Optional[List[List[int]]] = None,
     ) -> Optional[List[List[int]]]:
         """Queue a prediction centered on the nonzero region of ``image`` (placed at ``offset``). Returns that
-        region's bbox local to ``image`` (exact for non-negative values, see _nonzero_spatial_bbox), None if empty."""
+        region's bbox local to ``image`` (exact for non-negative values, see _nonzero_spatial_bbox), None if empty.
+        ``nonzero_bbox``: that bbox if the caller already computed it with _nonzero_spatial_bbox(image)."""
         # _nonzero_spatial_bbox doubles as the emptiness check (returns None) and avoids materializing the
         # full torch.nonzero index list, which matters for full-image prompts (initial seg, full scribbles).
-        local_bbox = self._nonzero_spatial_bbox(image)
+        local_bbox = nonzero_bbox if nonzero_bbox is not None else self._nonzero_spatial_bbox(image)
         if local_bbox is None:
             print("Received empty image prompt. Cannot add patches for prediction")
             return None
