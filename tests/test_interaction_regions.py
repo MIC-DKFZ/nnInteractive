@@ -450,3 +450,19 @@ def test_regions_are_created_and_cleared_only_where_channels_are_zeroed():
     assert src.count("self._interaction_regions.clear()") == 1  # reset_interactions, right after zeroing
     assert src.count("self._interaction_regions = InteractionRegions(") == 1  # _initialize_interactions
     assert box_volume([[0, 2], [0, 3], [0, 4]]) == 24
+
+
+def test_mask_nonzero_bbox_is_exact_for_every_dtype():
+    """_mask_nonzero_bbox (fast uint8 max projections) must equal the exact bbox of mask != 0 for every dtype,
+    including signed masks whose float sums would cancel."""
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        shape = tuple(int(x) for x in rng.integers(1, 12, 3))
+        dtype = rng.choice(["uint8", "bool", "int16", "int32", "float32"])
+        mask = np.zeros(shape, dtype=dtype)
+        for _ in range(int(rng.integers(0, 4))):
+            idx = tuple(int(rng.integers(0, s)) for s in shape)
+            mask[idx] = True if dtype == "bool" else rng.choice([1, 2, -1, -3, 0.5]) if dtype != "uint8" else 7
+        if dtype in ("int16", "int32") and shape[1] > 1 and rng.random() < 0.3:
+            mask[0, 0, 0], mask[0, 1, 0] = 2, -2  # cancels in a float sum over x-slice 0
+        assert nnInteractiveInferenceSession._mask_nonzero_bbox(torch.from_numpy(mask)) == _nonzero_bbox(mask)

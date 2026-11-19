@@ -394,6 +394,32 @@ class nnInteractiveInferenceSession:
             bbox.append([int(nonzero.min()), int(nonzero.max()) + 1])
         return bbox
 
+    @staticmethod
+    def _mask_nonzero_bbox(mask: torch.Tensor) -> Optional[List[List[int]]]:
+        """Exact half-open bbox of the nonzero voxels of a 3D mask of any dtype, or None if it is all zeros.
+
+        For prompt masks (scribble, lasso, initial seg): max projections on uint8 instead of _nonzero_spatial_bbox's
+        float sums. uint8 masks are projected as they are and bool masks as a uint8 view, so there is no float
+        conversion: ~26 ms instead of ~350 ms for a 779 Mvox mask (8 threads). Other dtypes are compared to 0 first,
+        which also makes the result exact where float sums of signed values could cancel. Same two-pass layout as
+        _nonzero_spatial_bbox: the [Y, Z] plane gives the Y and Z extents, X gets its own pass."""
+        if mask.dtype == torch.uint8:
+            m = mask
+        elif mask.dtype == torch.bool:
+            m = mask.view(torch.uint8)
+        else:
+            m = (mask != 0).view(torch.uint8)
+        yz_plane = m.amax(dim=0)
+        projections = [None, yz_plane.amax(dim=1), yz_plane.amax(dim=0)]
+        if not bool(projections[1].any()):
+            return None
+        projections[0] = m.amax(dim=(1, 2))
+        bbox = []
+        for p in projections:
+            nonzero = torch.nonzero(p).flatten()
+            bbox.append([int(nonzero[0]), int(nonzero[-1]) + 1])
+        return bbox
+
     def _compute_prev_seg_positive_bbox(self) -> Optional[List[List[int]]]:
         prev_seg_ch = self._get_prev_seg_channel()
         spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
@@ -1676,10 +1702,12 @@ class nnInteractiveInferenceSession:
             lbs = [ib[0] for ib in interaction_bbox]
 
             image_t = torch.from_numpy(image)
-            local_bbox = self._generic_add_patch_from_image(image_t, offset=lbs)
-            if image_t.dtype.is_signed:
-                # signed/float values: the projection sums of _nonzero_spatial_bbox could cancel, locate them exactly
-                local_bbox = self._nonzero_spatial_bbox(image_t != 0)
+            # Exact bbox of the mask's nonzero voxels (fast max projections, see _mask_nonzero_bbox). For unsigned/bool
+            # masks it is what _generic_add_patch_from_image would compute with its float sums, so it is passed on.
+            local_bbox = self._mask_nonzero_bbox(image_t)
+            self._generic_add_patch_from_image(
+                image_t, offset=lbs, nonzero_bbox=None if image_t.dtype.is_signed else local_bbox
+            )
 
             self._prepare_new_interaction_intensity()
 
@@ -1791,9 +1819,9 @@ class nnInteractiveInferenceSession:
             interaction_channel = self._get_prev_seg_channel()
             # The channel was just zeroed (reset above), so writing only the bbox of the mask's nonzero voxels gives the
             # same channel. That keeps the channel's tracked region (_interaction_regions), i.e. what later network
-            # inputs copy, as small as the segmentation, and skips converting and writing the zeros. Projection sums
-            # (_nonzero_spatial_bbox) are exact for unsigned/bool masks; signed/float masks are compared to 0 first.
-            seg_bbox = self._nonzero_spatial_bbox(initial_seg if not initial_seg.dtype.is_signed else initial_seg != 0)
+            # inputs copy, as small as the segmentation, and skips converting and writing the zeros. Finding the bbox
+            # (_mask_nonzero_bbox, ~26 ms at 779 Mvox) costs less than the full-channel write it replaces (~150 ms).
+            seg_bbox = self._mask_nonzero_bbox(initial_seg)
             if seg_bbox is not None:
                 self._write_interactions_channel(
                     interaction_channel, initial_seg[bounding_box_to_slice(seg_bbox)], bbox=seg_bbox
@@ -2405,7 +2433,8 @@ class nnInteractiveInferenceSession:
     ) -> Optional[List[List[int]]]:
         """Queue a prediction centered on the nonzero region of ``image`` (placed at ``offset``). Returns that
         region's bbox local to ``image`` (exact for non-negative values, see _nonzero_spatial_bbox), None if empty.
-        ``nonzero_bbox``: that bbox if the caller already computed it with _nonzero_spatial_bbox(image)."""
+        ``nonzero_bbox``: that bbox if the caller already has it (only exact for non-negative values: for those it
+        equals _nonzero_spatial_bbox(image))."""
         # _nonzero_spatial_bbox doubles as the emptiness check (returns None) and avoids materializing the
         # full torch.nonzero index list, which matters for full-image prompts (initial seg, full scribbles).
         local_bbox = nonzero_bbox if nonzero_bbox is not None else self._nonzero_spatial_bbox(image)
