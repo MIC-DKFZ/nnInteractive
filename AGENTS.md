@@ -27,7 +27,7 @@ For supervoxel work, install both layers: `cd nnInteractive/supervoxel/src/sam2 
 Use Python 3.10+ for the main package and Python 3.9+ in `nnInteractive/supervoxel/`. Follow Black formatting with 4-space indentation and 120-character lines. Prefer typed, explicit public inference/session APIs. Use `snake_case` for modules, functions, and variables; `PascalCase` for classes; and `UPPER_SNAKE_CASE` for constants.
 
 ## Testing Guidelines
-There is no dedicated automated test suite. Validate changes with the narrowest reproducible smoke path:
+`pytest tests/` runs the automated tests (CPU, no model download): so far the interaction-region tracking, which must be run after touching anything that writes `session.interactions` or reads interaction crops (every write must call `_record_interactions_region` first, see `nnInteractive/utils/interaction_regions.py`). Otherwise validate changes with the narrowest reproducible smoke path:
 - local inference through `nnInteractiveInferenceSession` using the `readme.md` flow
 - remote inference by starting `nninteractive-server`, checking `/healthz`, and exercising `nnInteractiveRemoteInferenceSession`
 - supervoxel CLI execution on a small sample volume when touching `nnInteractive/supervoxel/`

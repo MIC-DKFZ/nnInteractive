@@ -32,6 +32,7 @@ from nnInteractive.utils.inference_helpers import (
     parse_channel_pair,
     version_to_tuple,
 )
+from nnInteractive.utils.interaction_regions import InteractionRegions
 from nnInteractive.utils.rounding import round_to_nearest_odd
 from nnInteractive.utils.staging import get_stager
 
@@ -72,6 +73,13 @@ class nnInteractiveInferenceSession:
     # (512*512*1024) use the dense tensor backend; larger ones use blosc2 to bound RAM.
     AUTO_TENSOR_MAX_VOXELS = 2**27
     INTERACTIONS_STORAGE_OPTIONS = ("blosc2", "tensor", "auto")
+    # Reads of interaction crops copy only the parts that can be nonzero (self._interaction_regions) and zero-fill the
+    # rest on the destination device. False copies whole crops (the behaviour before; for A/B comparisons and tests).
+    SKIP_ZERO_INTERACTION_REGIONS = True
+    # Debugging/tests: every read that skips regions also reads the whole region and asserts that the skipped voxels
+    # are zero, i.e. that the region tracking missed no write. Slow (doubles every read). Enable with
+    # NNINTERACTIVE_VALIDATE_INTERACTION_REGIONS=1.
+    VALIDATE_INTERACTION_REGIONS = os.environ.get("NNINTERACTIVE_VALIDATE_INTERACTION_REGIONS", "0") == "1"
     # Interactions implemented by this inference session.
     SUPPORTED_INTERACTION_KEYS = ("scribble", "lasso", "points", "bbox2d", "bbox3d")
 
@@ -176,7 +184,20 @@ class nnInteractiveInferenceSession:
         self.license: Optional[str] = None
 
         # image specific
-        self.interactions = None  # blosc2.NDArray or dense torch.Tensor (see interactions_storage)
+        # blosc2.NDArray or dense torch.Tensor (see interactions_storage).
+        #
+        # !!! EVERY WRITE TO self.interactions MUST CALL self._record_interactions_region(channel, region) FIRST !!!
+        # (or be covered by an earlier call for a region containing it, within the same interaction). It does two
+        # things: saves the pre-image for undo, and adds the region to self._interaction_regions. Network inputs
+        # and the refinement cache copy ONLY the parts of a crop inside those regions and zero the rest
+        # (_interactions_region_into). A write without that call is therefore not just un-undoable: the network
+        # silently gets zeros instead of the written interaction, and nothing raises. Writes that only scale
+        # existing values or zero them (renormalization, reset, undo) cannot add nonzero voxels and are covered
+        # anyway. Run tests/test_interaction_regions.py after changing anything that writes interactions.
+        self.interactions = None
+        # Per channel, boxes covering every voxel that can be nonzero (utils/interaction_regions.py). Grows in
+        # _record_interactions_region, cleared only where the channels are zeroed. Created per image.
+        self._interaction_regions: Optional[InteractionRegions] = None
         # Reusable, pre-faulted float16 buffer to decompress blosc2 interaction crops into (Path B).
         # Allocated per image in _initialize_interactions; None for the dense-tensor backend.
         self._interactions_read_buffer = None
@@ -455,7 +476,9 @@ class nnInteractiveInferenceSession:
             )
             return
         scale = self._interaction_renorm_target / self.current_interaction_intensity
-        # fp16 scaling is not exactly invertible, so undo needs the channels' pre-image.
+        # fp16 scaling is not exactly invertible, so undo needs the channels' pre-image. Scaling cannot turn a zero
+        # nonzero, so it needs no new interaction regions; with undo on, recording whole channels marks them whole
+        # anyway (conservative, and this fires only every few hundred prompts).
         self._record_interactions_channels(channels_to_scale)
         for ch in channels_to_scale:
             self.interactions[ch] *= scale
@@ -555,9 +578,77 @@ class nnInteractiveInferenceSession:
     def _interactions_region_into(self, channels: Tuple[int, int], valid: List[List[int]], dst: torch.Tensor) -> None:
         """Copy interaction channels ``channels[0]:channels[1]`` over the in-image region ``valid`` ([[lb, ub]] * 3)
         into ``dst`` (shape ``[n_channels, *region]``, on the compute device or the CPU, possibly a strided view
-        such as the interior of a zero-padded buffer or a region of the refinement cache).
+        such as the interior of a zero-padded buffer or a region of the refinement cache). ``dst``'s prior content
+        does not matter: every voxel is written. ``dst`` never aliases the stored interactions, so callers may
+        modify it in place.
 
-        The one place that reads interaction regions, for every backend:
+        The one place that reads interaction regions (network inputs, refinement cache, refinement planning).
+        Only the parts of ``valid`` that can be nonzero (``self._interaction_regions``) are copied; the rest of
+        ``dst`` is zero-filled where it lives. The interactions are mostly zeros, so this moves a fraction of the
+        bytes (and, for blosc2, decompresses a fraction). Channels whose regions cover all of ``valid`` are
+        copied in one go as before.
+        """
+        if dst.numel() == 0:
+            return
+        c0, c1 = channels
+        if not self.SKIP_ZERO_INTERACTION_REGIONS:
+            self._copy_interactions_region_into(channels, valid, dst)
+            return
+        valid = [[int(lb), int(ub)] for lb, ub in valid]
+        parts = [self._interaction_regions.parts_in(c, valid) for c in range(c0, c1)]
+        full = [len(p) == 1 and p[0] == valid for p in parts]
+        i = 0
+        while i < c1 - c0:
+            if full[i]:
+                # a run of fully covered channels: one copy, as without region skipping
+                j = i
+                while j < c1 - c0 and full[j]:
+                    j += 1
+                self._copy_interactions_region_into((c0 + i, c0 + j), valid, dst[i:j])
+                i = j
+                continue
+            out = dst[i]
+            out.zero_()
+            for part in parts[i]:
+                local = bounding_box_to_slice(self._bbox_to_local(part, valid))
+                self._copy_interactions_region_into((c0 + i, c0 + i + 1), part, out[local][None])
+            i += 1
+        if self.VALIDATE_INTERACTION_REGIONS:
+            self._validate_skipped_interaction_regions(channels, valid, dst)
+
+    def _interactions_region_is_zero(self, channel: int, valid: List[List[int]]) -> bool:
+        """True if ``channel`` is zero everywhere in ``valid`` according to the tracked regions, so a caller can skip
+        reading and processing it. Validated like _interactions_region_into when VALIDATE_INTERACTION_REGIONS."""
+        if not self.SKIP_ZERO_INTERACTION_REGIONS or self._interaction_regions.parts_in(channel, valid):
+            return False
+        if self.VALIDATE_INTERACTION_REGIONS:
+            zeros = torch.zeros([1, *self._bbox_size(valid)], dtype=torch.float16, device=self.device)
+            self._validate_skipped_interaction_regions((channel, channel + 1), valid, zeros)
+        return True
+
+    def _validate_skipped_interaction_regions(
+        self, channels: Tuple[int, int], valid: List[List[int]], result: torch.Tensor
+    ) -> None:
+        """Debug check (VALIDATE_INTERACTION_REGIONS): ``result`` must equal a full copy of the region. If not, some
+        write to the interactions did not call _record_interactions_region and the network would have seen zeros."""
+        expected = torch.empty(result.shape, dtype=torch.float16, device=result.device)
+        self._copy_interactions_region_into(channels, valid, expected)
+        if not torch.equal(expected, result):
+            for i, c in enumerate(range(*channels)):
+                if not torch.equal(expected[i], result[i]):
+                    raise AssertionError(
+                        f"Interaction channel {c} is nonzero outside its tracked regions within {valid} "
+                        f"(regions: {self._interaction_regions.boxes(c)}). A write to self.interactions did not call "
+                        f"_record_interactions_region first; the network would have seen zeros there."
+                    )
+
+    def _copy_interactions_region_into(
+        self, channels: Tuple[int, int], valid: List[List[int]], dst: torch.Tensor
+    ) -> None:
+        """Copy interaction channels ``channels[0]:channels[1]`` over ``valid`` into ``dst`` as they are stored,
+        without looking at the tracked regions (see _interactions_region_into, which callers should use).
+
+        For every backend:
         - dense tensor: the CPU view is copied into ``dst`` (through the pinned staging buffer for the device).
         - blosc2 to the device with pinned staging: each channel is decompressed straight into pinned memory and
           on to ``dst`` (_blosc2_channel_to_device), no host copy of the region.
@@ -989,6 +1080,7 @@ class nnInteractiveInferenceSession:
         self.preprocessed_image = None
         self.target_buffer = None
         self.interactions = None
+        self._interaction_regions = None
         self.current_interaction_intensity = 1.0
         empty_cache(self.device)
         self.original_image_shape = None
@@ -1040,6 +1132,7 @@ class nnInteractiveInferenceSession:
             print(f"Initialize interactions with {backend}{' (auto)' if via_auto else ''}")
         self.interactions = self._new_interactions_array(shape, min(self.torch_n_threads, os.cpu_count()))
         self._dirty_channels = set()
+        self._interaction_regions = InteractionRegions(shape[0])  # all channels are zero
         self._interactions_shape = shape
         self._interactions_read_buffer = self._new_interactions_read_buffer(shape)
 
@@ -1148,6 +1241,8 @@ class nnInteractiveInferenceSession:
                     self._interactions_shape, min(self.torch_n_threads, os.cpu_count())
                 )
         self._dirty_channels = set()
+        if self._interaction_regions is not None:
+            self._interaction_regions.clear()  # every channel was just zeroed
         self.current_interaction_intensity = 1.0
 
         if self.target_buffer is not None:
@@ -1201,6 +1296,9 @@ class nnInteractiveInferenceSession:
         self._undo_log = {
             "current_interaction_intensity": self.current_interaction_intensity,
             "dirty_channels": set(self._dirty_channels),
+            # undo() can bring back interactions that were zeroed meanwhile (reset by add_initial_seg_interaction):
+            # their regions must come back too (see undo).
+            "interaction_regions": self._interaction_regions.copy(),
             "queued": (list(self.new_interaction_centers), list(self.new_interaction_zoom_out_factors)),
             "records": [],
         }
@@ -1253,13 +1351,21 @@ class nnInteractiveInferenceSession:
         return None if clipped is None else bounding_box_to_slice(clipped)
 
     def _record_interactions_region(self, channel: int, spatial_slicer: tuple, current=None) -> None:
-        """Save the pre-image of ``interactions[channel][spatial_slicer]`` before it is written.
+        """MUST be called before every write to ``interactions[channel][spatial_slicer]`` (see the comment at
+        ``self.interactions`` in __init__). Does two things, also when undo is disabled:
+
+        - adds the region to ``self._interaction_regions``, the record of where each channel can be nonzero. Network
+          inputs copy only those regions (_interactions_region_into); a write that skips this call is invisible to
+          the network.
+        - saves the pre-image of the region for undo (only with an undo log).
+
         ``spatial_slicer`` must lie inside the image (as the write sites guarantee). ``current``: the region's
         current values if the caller already holds them (a blosc2 read-modify-write), so they are not
         decompressed a second time. A channel that has not been written since it was last zeroed gets no copy
         (pre-image None): the region is all zeros, and undo zeroes it."""
         clean = channel not in self._dirty_channels
         self._dirty_channels.add(channel)
+        self._interaction_regions.add(channel, self._slicer_to_bbox(spatial_slicer, self.interactions.shape[1:]))
         if self._undo_log is None:
             return
         spatial_slicer = tuple(spatial_slicer)
@@ -1409,6 +1515,10 @@ class nnInteractiveInferenceSession:
         self.current_interaction_intensity = log["current_interaction_intensity"]
         # A superset is safe: restored channels may be nonzero again.
         self._dirty_channels |= log["dirty_channels"]
+        # Same for the regions: the restored interactions were covered by the regions at the start of the undone
+        # interaction (which may have been cleared since, e.g. by the reset in add_initial_seg_interaction), and
+        # everything else by the current ones. The union covers both.
+        self._interaction_regions.update(log["interaction_regions"])
         # Predictions still pending before the undone interaction stay pending (their prompts are still there).
         centers, zoom_out_factors = log["queued"]
         self.new_interaction_centers, self.new_interaction_zoom_out_factors = list(centers), list(zoom_out_factors)
@@ -1563,19 +1673,27 @@ class nnInteractiveInferenceSession:
             lbs = [ib[0] for ib in interaction_bbox]
 
             image_t = torch.from_numpy(image)
-            self._generic_add_patch_from_image(image_t, offset=lbs)
+            local_bbox = self._generic_add_patch_from_image(image_t, offset=lbs)
+            if image_t.dtype.is_signed:
+                # signed/float values: the projection sums of _nonzero_spatial_bbox could cancel, locate them exactly
+                local_bbox = self._nonzero_spatial_bbox(image_t != 0)
 
             self._prepare_new_interaction_intensity()
 
-            int_slicer = bounding_box_to_slice(interaction_bbox)
-            # Convert to fp16 before scaling: multiplying the (typically uint8) mask by a Python float
-            # would promote to a full-volume float64 temporary. astype always copies, so the in-place
-            # scale below never mutates the caller's array.
-            new_values = image_t.numpy().astype(np.float16)
-            if self.current_interaction_intensity != 1:
-                new_values *= self.current_interaction_intensity
-            self._interactions_inplace_maximum(interaction_channel, int_slicer, new_values)
-            del new_values
+            # Write only the bbox of the mask's nonzero voxels, not all of interaction_bbox (often the whole image):
+            # outside it the mask is zero and max(current, 0) == current, so the result is the same. This keeps the
+            # written region -- and with it the tracked region the network inputs read (_interaction_regions) and
+            # the undo pre-image -- as small as the scribble/lasso itself.
+            if local_bbox is not None:
+                write_bbox = [[lb + off, ub + off] for (lb, ub), off in zip(local_bbox, lbs)]
+                # Convert to fp16 before scaling: multiplying the (typically uint8) mask by a Python float
+                # would promote to a full-volume float64 temporary. astype always copies, so the in-place
+                # scale below never mutates the caller's array.
+                new_values = image_t.numpy()[bounding_box_to_slice(local_bbox)].astype(np.float16)
+                if self.current_interaction_intensity != 1:
+                    new_values *= self.current_interaction_intensity
+                self._interactions_inplace_maximum(interaction_channel, bounding_box_to_slice(write_bbox), new_values)
+                del new_values
             del image_t
 
             if run_prediction:
@@ -1925,9 +2043,14 @@ class nnInteractiveInferenceSession:
                 self._interactions_region_into((c, c + 1), valid, padded[(slice(None), *interior)])
                 return padded
 
-            previous_prediction = interpolate(channel_to_padded(prev_seg_channel)[None], patch_size, mode="nearest")[
-                0, 0
-            ]
+            # A channel that is zero in the whole crop (most of them, typically) is neither read nor resampled:
+            # nearest/area resampling and max-pool dilation of zeros are exactly zero.
+            if self._interactions_region_is_zero(prev_seg_channel, valid):
+                previous_prediction = torch.zeros(patch_size, dtype=torch.float16, device=self.device)
+            else:
+                previous_prediction = interpolate(
+                    channel_to_padded(prev_seg_channel)[None], patch_size, mode="nearest"
+                )[0, 0]
 
             # Process interaction channels one at a time to avoid materialising the full
             # [num_ch, scaled_patch_size³] tensor on GPU. Peak VRAM ≈ one channel at scaled size.
@@ -1936,6 +2059,9 @@ class nnInteractiveInferenceSession:
                 [num_interaction_ch, *patch_size], dtype=torch.float16, device=self.device
             )
             for i in range(num_interaction_ch):
+                if self._interactions_region_is_zero(i, valid):
+                    interactions_tensor[i].zero_()
+                    continue
                 ch = channel_to_padded(i)
                 if i in dilation_channels:
                     ch = iterative_3x3_same_padding_pool3d(ch[None], max_pool_ks)[0]
@@ -2257,13 +2383,17 @@ class nnInteractiveInferenceSession:
             f"zoom-out factor {self.new_interaction_zoom_out_factors[-1]}"
         )
 
-    def _generic_add_patch_from_image(self, image: torch.Tensor, offset: Optional[List[int]] = None):
+    def _generic_add_patch_from_image(
+        self, image: torch.Tensor, offset: Optional[List[int]] = None
+    ) -> Optional[List[List[int]]]:
+        """Queue a prediction centered on the nonzero region of ``image`` (placed at ``offset``). Returns that
+        region's bbox local to ``image`` (exact for non-negative values, see _nonzero_spatial_bbox), None if empty."""
         # _nonzero_spatial_bbox doubles as the emptiness check (returns None) and avoids materializing the
         # full torch.nonzero index list, which matters for full-image prompts (initial seg, full scribbles).
         local_bbox = self._nonzero_spatial_bbox(image)
         if local_bbox is None:
             print("Received empty image prompt. Cannot add patches for prediction")
-            return
+            return None
         if offset is None:
             offset = [0] * image.ndim
         roi = [[lb + off, ub + off] for (lb, ub), off in zip(local_bbox, offset)]
@@ -2274,6 +2404,7 @@ class nnInteractiveInferenceSession:
         self.new_interaction_zoom_out_factors.append(zoom_out_factor)
         self.new_interaction_centers.append(roi_center)
         print(f"Added new image interaction: center {roi_center}, zoom-out factor {zoom_out_factor}")
+        return local_bbox
 
     def initialize_from_trained_model_folder(
         self,

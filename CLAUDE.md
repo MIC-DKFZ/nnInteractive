@@ -31,7 +31,9 @@ codespell --skip='.git,*.pdf,*.svg'
 pre-commit run --all-files
 ```
 
-There is no test suite in this repository.
+Tests: `pytest tests/` (CPU, no model download; also runs on CUDA when available). So far they cover the
+interaction-region tracking (`tests/test_interaction_regions.py`); run them after touching anything that writes
+`session.interactions` or reads interaction crops.
 
 ## Architecture
 
@@ -127,6 +129,7 @@ Official weights are hosted on HuggingFace at `MIC-DKFZ/nnInteractive`. The sele
 - **`nnInteractive/trainer/nnInteractiveTrainer.py`**: Minimal stub extending nnUNetv2. Used only for architecture reconstruction from checkpoints. Adds 7 extra input channels (`num_input_channels + 7`) on top of image channels.
 - **`nnInteractive/utils/crop.py`**: Tensor cropping/padding with boundary handling (`crop_and_pad_into_buffer`, `paste_tensor`, `crop_to_valid`, `pad_cropped`)
 - **`nnInteractive/utils/staging.py`**: `PinnedStager` — one 128 MB pinned buffer per process and device, double-buffered, streams crops of any size to the GPU in slabs (`copy_to` / `copy_into`; `fill_to` decompresses blosc2 straight into it). `get_stager()` returns `None` when staging is unavailable (non-CUDA device, Linux 6.11)
+- **`nnInteractive/utils/interaction_regions.py`**: `InteractionRegions` — per interaction channel, a short list of boxes covering every voxel that can be nonzero. `_interactions_region_into` copies only those parts of a crop to the GPU and zero-fills the rest (the channels are mostly zeros). **Invariant: every write to `session.interactions` must call `_record_interactions_region` for its region first** (the same call that saves the undo pre-image); a write that skips it is silently invisible to the network. `NNINTERACTIVE_VALIDATE_INTERACTION_REGIONS=1` checks every skipped read
 - **`nnInteractive/utils/bboxes.py`**: Greedy set cover algorithm for generating refinement patch bounding boxes from difference maps; falls back to random sampling when recursion depth exceeds `max_depth`
 - **`nnInteractive/utils/erosion_dilation.py`**: `iterative_3x3_same_padding_pool3d` — used for dilation of point/scribble channels before downsampling (zoom-out) and for morphological opening of the diff map
 - **`nnInteractive/utils/checkpoint_cleansing.py`**: Utility to strip optimizer state and trainer class from checkpoints before release

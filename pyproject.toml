@@ -58,7 +58,8 @@ homepage = "https://github.com/MIC-DKFZ/nnInteractive"
 dev = [
     "black",
     "ruff",
-    "pre-commit"
+    "pre-commit",
+    "pytest"
 ]
 
 [project.scripts]
