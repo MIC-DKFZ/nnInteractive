@@ -425,6 +425,42 @@ Release model folders ship their own `LICENSE` file whose **first line is the li
 <details>
 <summary>Click to expand the full version history</summary>
 
+### 2.7.1 - 2026-11-23
+
+- **Faster AutoZoom**: the session tracks, per interaction channel, a few bounding boxes that cover every voxel that can be nonzero. Crops sent to the GPU copy only those parts and zero-fill the rest on the GPU. Prompts that trigger AutoZoom on large images are 1.1–1.5× faster (RTX 4090, 1727×670×673 CT: a box zooming out 4× 2.1 → 1.4 s), with identical outputs and unchanged VRAM.
+- Scribble, lasso and initial-segmentation masks are written only over the bounding box of their nonzero voxels instead of the whole prompt region (often the whole image): a full-size scribble mask on the same CT 7.5 → 2.3 s, an initial segmentation 1.1–4× faster depending on its size and the prompt storage backend.
+- Fixed a crash in the AutoZoom zoom-out path on CPU with older PyTorch versions that lack float16 CPU interpolation; zoom-out on CPU is also faster ([#43](https://github.com/MIC-DKFZ/nnInteractive/pull/43), thanks to muschellij2).
+- Added a `pytest` test suite (`tests/`).
+
+### 2.7.0 - 2026-11-11
+
+- blosc2 prompt storage decompresses with multiple threads (`torch_n_threads`) when c-blosc2 >= 3.5.0 is installed: crops of densely filled channels ~2× faster. Requires `nninteractive-client` 2.7.0 (pinned).
+- Lower latency per prompt: predictions without AutoZoom keep their GPU working set cached between prompts; the warmup also covers the operations around the network, so the first prediction is no longer slower than later ones; the prediction is narrowed to uint8 before it is moved to the target buffer's device (up to ~30 ms less per prompt on hosts without transparent huge pages).
+- Cheaper undo: no pre-image copies for interaction channels that are still empty, and refinement pre-images are taken while the forward passes run.
+- Faster initial segmentation on the blosc2 backend (multithreaded float16 cast).
+- `reset_interactions` recreates the blosc2 store with the same number of threads as `set_image` (it used one per CPU core, which slowed writes on many-core machines).
+
+### 2.6.0 - 2026-09-26
+
+- **Undo log**: undo now records compressed pre-images of the regions each interaction overwrites instead of snapshotting the whole state, which costs far less time and memory per interaction. Undo also restores the prediction queue.
+- **Less VRAM**: full AutoZoom fits on ~6 GB GPUs (index-free dilation, in-place crop and cache fills); refinement planning no longer materializes `torch.nonzero` indices (several GB less at the peak for large objects).
+- **Less host RAM**: transfers to the GPU go through one fixed pinned staging buffer instead of pinning the interactions tensor (pinned blocks used to accumulate with every new image size). blosc2 decompresses straight into that buffer, overlapped with the transfer, and AutoZoom crops are decompressed one channel at a time.
+- Server: all GPU work runs on one dedicated thread, so the cuDNN warmup sticks (no ~1.3 s re-autotuning on fresh worker threads); shutdown waits for queued GPU jobs.
+- `add_*_interaction` is atomic: a call that fails (e.g. out of memory during the prediction) leaves the session unchanged.
+
+### 2.5.2 - 2026-09-23
+
+- Fixed `set_image` overwriting the caller's array with the normalized image for `np.memmap` inputs or non-canonical float32 dtypes (in napari-nninteractive the image layer turned grey in local mode).
+- Undo snapshots are compressed with LZ4 level 1 instead of 5: same size, ~3.4× faster.
+- The server turns `torch.compile` off on Windows.
+
+### 2.5.1 - 2026-07-07
+
+- Fixed coarse AutoZoom predictions leaking into the segmentation where the refinement patches did not cover the changed region (the segmentation could look coarse there and affect the next prompt).
+- Faster refinement when the refinement cache falls back to host RAM (no multi-GB pinning, no full memset).
+- The warmup also runs without `torch.compile` (cuDNN benchmark).
+- Server: exposes `run_prediction`, undo can be configured at startup, the GPU lock is released before responses are compressed (one client's large response no longer stalls other sessions); code cleanup.
+
 ### 2.5.0 - 2026-06-26
 
 - **Lightweight, torch-free `nninteractive-client` package**: the remote client now ships as its own distribution so GUIs / thin clients can drive a remote server without pulling in torch or nnU-Net. It shares the `nnInteractive` import namespace with the full package; the full package depends on it and pins it in lockstep.
